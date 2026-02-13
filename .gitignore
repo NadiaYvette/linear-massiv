@@ -1,0 +1,4 @@
+dist-newstyle/
+*.pdf
+bench-results/
+.claude/
