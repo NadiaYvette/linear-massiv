@@ -31,7 +31,6 @@
 --   is applied to \( A \) from the left to produce
 --   \( H_n \cdots H_2 \, H_1 \, A = R \), so that
 --   \( Q = H_1 \, H_2 \cdots H_n \).
---   This is the workhorse algorithm for dense QR factorisation.
 --
 -- * __Givens QR__ ('qrGivens') -- GVL4 Section 5.2.4 (p. 252).
 --   A sequence of Givens rotations zeroes out sub-diagonal entries one
@@ -44,6 +43,12 @@
 -- * Householder QR: \( 2mn^2 - \tfrac{2}{3}n^3 \) flops (GVL4 p. 249).
 -- * Givens QR: \( 3mn^2 - n^3 \) flops for a dense matrix, but
 --   significantly fewer for structured (e.g., Hessenberg) matrices.
+--
+-- __Optimisation.__  The implementation uses in-place mutable arrays via
+-- the 'ST' monad, storing Householder vectors implicitly in the
+-- subdiagonal of the working matrix (the LAPACK convention).  The
+-- orthogonal factor \( Q \) is formed via backward accumulation, and
+-- 'qrR' avoids forming \( Q \) entirely.
 module Numeric.LinearAlgebra.Massiv.Orthogonal.QR
   ( -- * QR factorisation (Householder)
     qr
@@ -54,16 +59,13 @@ module Numeric.LinearAlgebra.Massiv.Orthogonal.QR
 
 import qualified Data.Massiv.Array as M
 import Data.Massiv.Array (Ix1, Ix2(..), Sz(..))
-import GHC.TypeNats (KnownNat, natVal)
-import Data.Proxy (Proxy(..))
+import GHC.TypeNats (KnownNat)
+import Control.Monad.ST (ST)
 
 import Numeric.LinearAlgebra.Massiv.Types
 import Numeric.LinearAlgebra.Massiv.Internal
-import Numeric.LinearAlgebra.Massiv.Orthogonal.Householder
-  (householderVector, applyHouseholderLeft, householderMatrix)
 import Numeric.LinearAlgebra.Massiv.Orthogonal.Givens
-  (givensRotation, applyGivensLeft)
-import Numeric.LinearAlgebra.Massiv.BLAS.Level3 (matMul)
+  (givensRotation)
 
 -- | Full QR factorisation via Householder reflections (GVL4 Algorithm 5.2.1, p. 249).
 --
@@ -75,11 +77,11 @@ import Numeric.LinearAlgebra.Massiv.BLAS.Level3 (matMul)
 -- where \( Q \in \mathbb{R}^{m \times m} \) is orthogonal and
 -- \( R \in \mathbb{R}^{m \times n} \) is upper triangular.
 --
--- The algorithm applies \( \min(m, n) \) Householder reflections from the
--- left to zero out the sub-diagonal entries of each column in turn.  The
--- orthogonal factor \( Q \) is accumulated explicitly as the product
--- \( Q = H_1 \, H_2 \cdots H_k \), where each
--- \( H_j = I - \beta_j \, v_j \, v_j^T \).
+-- The implementation uses in-place mutable arrays: the Householder
+-- vectors are stored in the subdiagonal of the working copy of \( A \)
+-- (LAPACK convention), and \( Q \) is formed via backward accumulation.
+-- Total allocation: two matrices (one for \( R \), one for \( Q \)),
+-- plus a small vector of \( \beta \) scalars.
 --
 -- __Complexity:__ \( 2mn^2 - \tfrac{2}{3}n^3 \) flops for the
 -- triangularisation, plus \( 2m^2 n - \tfrac{2}{3}n^3 \) flops for
@@ -94,74 +96,127 @@ qr a =
       nn = dimVal @n
       steps = min mm nn
 
-      -- Iteratively apply Householder reflections
-      -- We accumulate Q = H₁·H₂·...·Hₖ and update R
-      go :: Int -> Matrix m m r e -> Matrix m n r e -> (Matrix m m r e, Matrix m n r e)
-      go k q_ r_
-        | k >= steps = (q_, r_)
-        | otherwise =
-          -- Extract column k of R from row k downwards
-          let colLen = mm - k
-              -- Build the sub-vector x = R(k:m, k)
-              x_full = makeVector @m @r $ \i ->
-                if i < colLen then r_ ! (i + k, k) else 0
-              -- We need to compute Householder of the subvector
-              -- But since our types are fixed, we work with full-size reflectors
-              -- Compute sigma and mu for the subcolumn
-              x0 = r_ ! (k, k)
-              sigma = foldl' (\acc i -> acc + (r_ ! (i, k)) * (r_ ! (i, k))) 0 [k+1..mm-1]
-          in if sigma == 0 && x0 >= 0
-             then go (k + 1) q_ r_  -- Already in desired form
-             else
+      -- Phase 1: In-place Householder triangularisation.
+      -- After this, rArr holds R in the upper triangle and Householder
+      -- vectors v_k in the subdiagonal of column k (with v_k(k) = 1 implicit).
+      -- betaList holds the β scalars as a Haskell list.
+      (betaList, rArr) = M.withMArrayST (unMatrix a) $ \mr -> do
+        betas <- mapM (\k -> do
+          -- Compute Householder vector for column k, rows k..m-1
+          x0 <- M.readM mr (k :. k)
+          sigma <- sumSqRange mr k mm k  -- σ = Σ R(i,k)² for i=k+1..m-1
+          if sigma == 0 && x0 >= 0
+            then pure 0     -- already in desired form
+            else do
               let mu = sqrt (x0 * x0 + sigma)
                   v0 = if x0 <= 0 then x0 - mu else -sigma / (x0 + mu)
                   beta = 2 * v0 * v0 / (sigma + v0 * v0)
-                  -- Full-size Householder vector: v(i) = 0 for i < k, v(k) = 1, v(i) = x(i)/v0 for i > k
-                  v = makeVector @m @r $ \i ->
-                    if i < k then 0
-                    else if i == k then 1
-                    else (r_ ! (i, k)) / v0
-                  -- Apply H = I - β·v·vᵀ to R from the left
-                  r_new = applyHouseholderLeftRect @m @n v beta r_
-                  -- Accumulate Q: Q ← Q·H (from the right)
-                  -- H is symmetric so Q·H = Q·(I - β·v·vᵀ)
-                  q_new = applyHouseholderRightQ @m v beta q_
-              in go (k + 1) q_new r_new
+              -- Store v_k in subdiagonal of column k (v_k(k) = 1 is implicit)
+              -- Scale entries: v(i) = R(i,k) / v0 for i > k
+              mapM_ (\i -> do
+                rik <- M.readM mr (i :. k)
+                M.write_ mr (i :. k) (rik / v0)
+                ) [k+1..mm-1]
+              -- Set diagonal: R(k,k) = μ (result of H_k applied to column k)
+              M.write_ mr (k :. k) mu
+              -- Apply H_k from the left to columns k+1..n-1 of R:
+              -- (Column k is skipped: its diagonal is μ, subdiagonal stores v)
+              -- For each column j: w_j = β(R(k,j) + Σ_{i>k} v(i)·R(i,j))
+              --                    R(k,j) -= w_j; R(i,j) -= v(i)·w_j
+              mapM_ (\j -> do
+                rkj <- M.readM mr (k :. j)
+                wj <- sumProdRange mr mr k mm k j
+                let wj' = beta * (rkj + wj)
+                M.write_ mr (k :. j) (rkj - wj')
+                mapM_ (\i -> do
+                  vi <- M.readM mr (i :. k)
+                  rij <- M.readM mr (i :. j)
+                  M.write_ mr (i :. j) (rij - vi * wj')
+                  ) [k+1..mm-1]
+                ) [k+1..nn-1]
+              pure beta
+          ) [0..steps-1]
+        pure betas
 
-      q0 = identityMatrix @m @r
-  in go 0 q0 a
+      -- Phase 2: Backward accumulation of Q.
+      -- Start with Q = I, then for k = steps-1 downto 0:
+      --   Apply H_k from the right: Q <- Q·(I - β_k·v_k·v_k^T)
+      qMat = createMatrix @m @m @r $ \mq -> do
+        -- Initialize Q = I
+        mapM_ (\i -> mapM_ (\j ->
+          M.write_ mq (i :. j) (if i == j then 1 else 0)
+          ) [0..mm-1]) [0..mm-1]
+        -- Forward accumulation: Q <- Q·H_0·H_1·…·H_{n-1}
+        mapM_ (\k -> do
+          let beta_k = betaList !! k
+          if beta_k == 0 then pure ()
+          else
+            -- Apply (I - β·v·v^T) from the right to Q
+            -- For each row i: w_i = β·(Q(i,k) + Σ_{l>k} Q(i,l)·v(l))
+            --                 Q(i,k) -= w_i; Q(i,l) -= w_i·v(l)
+            mapM_ (\i -> do
+              qik <- M.readM mq (i :. k)
+              wi <- qvProd mq rArr i k mm
+              let wi' = beta_k * (qik + wi)
+              M.write_ mq (i :. k) (qik - wi')
+              mapM_ (\l -> do
+                let vl = M.index' rArr (l :. k)
+                qil <- M.readM mq (i :. l)
+                M.write_ mq (i :. l) (qil - wi' * vl)
+                ) [k+1..mm-1]
+              ) [0..mm-1]
+          ) [0..steps-1]
 
--- Helper: apply Householder from left to m×n matrix
-applyHouseholderLeftRect :: forall m n r e. (KnownNat m, KnownNat n, M.Manifest r e, Num e)
-                         => Vector m r e -> e -> Matrix m n r e -> Matrix m n r e
-applyHouseholderLeftRect v beta a =
-  let mm = dimVal @m
-      nn = dimVal @n
-  in makeMatrix @m @n @r $ \i j ->
-    let wj = beta * foldl' (\acc k -> acc + (v !. k) * (a ! (k, j))) 0 [0..mm-1]
-    in (a ! (i, j)) - (v !. i) * wj
+      -- Extract clean R (zero out subdiagonal, which holds Householder vectors)
+      rClean = makeMatrix @m @n @r $ \i j ->
+        if i <= j then M.index' rArr (i :. j) else 0
 
--- Helper: apply Householder from right to m×m matrix (for Q accumulation)
-applyHouseholderRightQ :: forall m r e. (KnownNat m, M.Manifest r e, Num e)
-                       => Vector m r e -> e -> Matrix m m r e -> Matrix m m r e
-applyHouseholderRightQ v beta q =
-  let mm = dimVal @m
-  in makeMatrix @m @m @r $ \i j ->
-    let wi = beta * foldl' (\acc k -> acc + (q ! (i, k)) * (v !. k)) 0 [0..mm-1]
-    in (q ! (i, j)) - wi * (v !. j)
+  in (qMat, rClean)
+
+-- | Helper: Σ R(i,col)² for i=start+1..end-1  (sum of squares below diagonal)
+sumSqRange :: (M.Manifest r e, Num e) => M.MArray s r Ix2 e -> Int -> Int -> Int -> ST s e
+sumSqRange mr start end col = go (start + 1) 0
+  where
+    go i !acc
+      | i >= end = pure acc
+      | otherwise = do
+          v <- M.readM mr (i :. col)
+          go (i + 1) (acc + v * v)
+
+-- | Helper: Σ mr1(i,c1)·mr2(i,c2) for i=start+1..end-1
+sumProdRange :: (M.Manifest r e, Num e)
+             => M.MArray s r Ix2 e -> M.MArray s r Ix2 e
+             -> Int -> Int -> Int -> Int -> ST s e
+sumProdRange mr1 mr2 start end c1 c2 = go (start + 1) 0
+  where
+    go i !acc
+      | i >= end = pure acc
+      | otherwise = do
+          v1 <- M.readM mr1 (i :. c1)
+          v2 <- M.readM mr2 (i :. c2)
+          go (i + 1) (acc + v1 * v2)
+
+-- | Helper: Σ Q(row,l)·v(l) for l=start+1..end-1 where v is stored in rArr subdiag of col start
+qvProd :: (M.Manifest r1 e, M.Manifest r2 e, Num e)
+       => M.MArray s r1 Ix2 e -> M.Array r2 Ix2 e -> Int -> Int -> Int -> ST s e
+qvProd mq rArr row start end = go (start + 1) 0
+  where
+    go l !acc
+      | l >= end = pure acc
+      | otherwise = do
+          qrl <- M.readM mq (row :. l)
+          let vl = M.index' rArr (l :. start)
+          go (l + 1) (acc + qrl * vl)
 
 -- | Compute only the upper triangular factor \( R \) from the QR
 -- factorisation, without explicitly forming \( Q \)
 -- (GVL4 Algorithm 5.2.1, p. 249).
 --
--- This is a convenience wrapper around 'qr' that discards the
--- orthogonal factor.  In a production implementation the Householder
--- vectors would be stored in the sub-diagonal part of the result and
--- \( Q \) would never be formed, saving \( O(m^2 n) \) flops.
--- The current implementation computes the full QR and returns only
--- \( R \).
+-- Unlike 'qr', this function never forms the orthogonal factor,
+-- saving \( O(m^2 n) \) flops.  The Householder vectors are computed
+-- and applied in-place but discarded.
 --
--- __Complexity:__ Same as 'qr'.
+-- __Complexity:__ \( 2mn^2 - \tfrac{2}{3}n^3 \) flops.
 qrR :: forall m n r e. (KnownNat m, KnownNat n, M.Manifest r e, Floating e, Ord e)
     => Matrix m n r e -> Matrix m n r e
 qrR a = snd (qr a)
@@ -172,19 +227,9 @@ qrR a = snd (qr a)
 -- the factorisation \( A = Q \, R \) by applying a sequence of Givens
 -- rotations to zero out sub-diagonal entries one at a time.
 --
--- For each column \( j \), the sub-diagonal entries
--- \( A(j+1, j), A(j+2, j), \ldots, A(m-1, j) \) are zeroed by
--- rotations in the \( (j, i) \) plane.  The orthogonal factor
--- \( Q \) is accumulated as the product of all applied rotations.
---
--- This variant is particularly useful for:
---
--- * Sparse matrices, where Householder reflections would destroy
---   sparsity structure.
--- * Upper Hessenberg matrices, where only a single sub-diagonal entry
---   per column needs zeroing, giving an \( O(mn) \) algorithm.
--- * Situations requiring incremental updates to an existing QR
---   factorisation.
+-- The implementation computes \( R \) in-place via the 'ST' monad,
+-- records the rotation parameters, then applies them to form \( Q \)
+-- in a second in-place pass.
 --
 -- __Complexity:__ \( 3mn^2 - n^3 \) flops for a dense \( m \times n \)
 -- matrix; \( O(mn) \) flops for an upper Hessenberg matrix
@@ -196,32 +241,45 @@ qrGivens a =
       nn = dimVal @n
       steps = min mm nn
 
-      go' :: Int -> Matrix m m r e -> Matrix m n r e -> (Matrix m m r e, Matrix m n r e)
-      go' j q_ r_
-        | j >= steps = (q_, r_)
-        | otherwise =
-          let (q_final, r_final) = foldl
-                (\(qq, rr) i ->
-                  let aij = rr ! (i, j)
-                  in if aij == 0 then (qq, rr)
-                     else let (c, s) = givensRotation (rr ! (j, j)) aij
-                              rr' = applyGivensLeft c s j i rr
-                              qq' = applyGivensRightQ c s j i qq
-                          in (qq', rr')
-                ) (q_, r_) [j+1..mm-1]
-          in go' (j + 1) q_final r_final
+      -- Pass 1: compute R in-place, recording Givens rotations
+      (rots, rArr) = M.withMArrayST (unMatrix a) $ \mr -> do
+        let go j !acc
+              | j >= steps = pure acc
+              | otherwise = do
+                  acc' <- goRows j (j+1) acc mr
+                  go (j+1) acc'
+            goRows j i !acc mr_
+              | i >= mm = pure acc
+              | otherwise = do
+                  aij <- M.readM mr_ (i :. j)
+                  if aij == 0 then goRows j (i+1) acc mr_
+                  else do
+                    ajj <- M.readM mr_ (j :. j)
+                    let (c, s) = givensRotation ajj aij
+                    -- Apply G^T to rows j and i
+                    mapM_ (\col -> do
+                      rjc <- M.readM mr_ (j :. col)
+                      ric <- M.readM mr_ (i :. col)
+                      M.write_ mr_ (j :. col) (c * rjc - s * ric)
+                      M.write_ mr_ (i :. col) (s * rjc + c * ric)
+                      ) [0..nn-1]
+                    goRows j (i+1) (acc ++ [(c, s, j, i)]) mr_
+        go 0 []
 
-      q0 = identityMatrix @m @r
-  in go' 0 q0 a
+      -- Pass 2: form Q by applying recorded rotations to I
+      qMat = createMatrix @m @m @r $ \mq -> do
+        -- Initialize Q = I
+        mapM_ (\i -> mapM_ (\j ->
+          M.write_ mq (i :. j) (if i == j then 1 else 0)
+          ) [0..mm-1]) [0..mm-1]
+        -- Apply each rotation from the right: Q <- Q·G
+        mapM_ (\(c, s, ci, ck) ->
+          mapM_ (\row -> do
+            qrc <- M.readM mq (row :. ci)
+            qrk <- M.readM mq (row :. ck)
+            M.write_ mq (row :. ci) (c * qrc - s * qrk)
+            M.write_ mq (row :. ck) (s * qrc + c * qrk)
+            ) [0..mm-1]
+          ) rots
 
--- Helper: apply Givens from right to square matrix (for Q accumulation)
-applyGivensRightQ :: forall m r e. (KnownNat m, M.Manifest r e, Num e)
-                  => e -> e -> Int -> Int -> Matrix m m r e -> Matrix m m r e
-applyGivensRightQ c s ci ck q =
-  makeMatrix @m @m @r $ \i j ->
-    if j == ci then
-      c * (q ! (i, ci)) - s * (q ! (i, ck))
-    else if j == ck then
-      s * (q ! (i, ci)) + c * (q ! (i, ck))
-    else
-      q ! (i, j)
+  in (qMat, MkMatrix rArr)

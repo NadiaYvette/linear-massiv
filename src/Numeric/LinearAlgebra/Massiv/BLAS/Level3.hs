@@ -63,6 +63,7 @@ module Numeric.LinearAlgebra.Massiv.BLAS.Level3
 import qualified Data.Massiv.Array as M
 import Data.Massiv.Array (Ix2(..), Sz(..), Comp(..))
 import GHC.TypeNats (KnownNat)
+import Control.Monad.ST (ST)
 
 import Numeric.LinearAlgebra.Massiv.Types
 import Numeric.LinearAlgebra.Massiv.Internal
@@ -99,13 +100,42 @@ import Numeric.LinearAlgebra.Massiv.Internal
 -- \(O(m \, k \, n)\) — two floating-point operations per
 -- \((i, l, j)\) triple in the inner product, plus \(O(m \, n)\)
 -- work for the \(\alpha / \beta\) scaling.
+-- | Block size for cache-tiled GEMM.  Chosen so that three bs×bs blocks
+-- of Double (3 × bs² × 8 bytes) fit comfortably in L1 cache (typically 32–48 KiB).
+gemmBlockSize :: Int
+gemmBlockSize = 32
+{-# INLINE gemmBlockSize #-}
+
 gemm :: forall m k n r e. (KnownNat m, KnownNat k, KnownNat n, M.Manifest r e, Num e)
      => e -> Matrix m k r e -> Matrix k n r e -> e -> Matrix m n r e -> Matrix m n r e
 gemm alpha a b beta c =
-  let kk = dimVal @k
-  in makeMatrix @m @n @r $ \i j ->
-    let ab = foldl' (\acc l -> acc + (a ! (i, l)) * (b ! (l, j))) 0 [0..kk-1]
-    in alpha * ab + beta * (c ! (i, j))
+  let mm = dimVal @m
+      kk = dimVal @k
+      nn = dimVal @n
+      bs = gemmBlockSize
+  in createMatrix @m @n @r $ \mc -> do
+    -- Initialize C with β·C₀
+    mapM_ (\i -> mapM_ (\j -> do
+      M.write_ mc (i :. j) (beta * (c ! (i, j)))
+      ) [0..nn-1]) [0..mm-1]
+    -- Tiled ikj loop: for each block triple, accumulate α·A·B
+    let go_bi bi = do
+          let iEnd = min (bi + bs) mm
+          let go_bk bk = do
+                let kEnd = min (bk + bs) kk
+                let go_bj bj = do
+                      let jEnd = min (bj + bs) nn
+                      -- Inner micro-kernel: ikj within the block
+                      mapM_ (\i -> mapM_ (\l -> do
+                        let aik = alpha * (a ! (i, l))
+                        mapM_ (\j -> do
+                          cij <- M.readM mc (i :. j)
+                          M.write_ mc (i :. j) (cij + aik * (b ! (l, j)))
+                          ) [bj..jEnd-1]
+                        ) [bk..kEnd-1]) [bi..iEnd-1]
+                mapM_ go_bj [0, bs .. nn-1]
+          mapM_ go_bk [0, bs .. kk-1]
+    mapM_ go_bi [0, bs .. mm-1]
 
 -- | Simple matrix multiply (specialisation of 'gemm').
 --
@@ -133,9 +163,32 @@ gemm alpha a b beta c =
 matMul :: forall m k n r e. (KnownNat m, KnownNat k, KnownNat n, M.Manifest r e, Num e)
        => Matrix m k r e -> Matrix k n r e -> Matrix m n r e
 matMul a b =
-  let kk = dimVal @k
-  in makeMatrix @m @n @r $ \i j ->
-    foldl' (\acc l -> acc + (a ! (i, l)) * (b ! (l, j))) 0 [0..kk-1]
+  let mm = dimVal @m
+      kk = dimVal @k
+      nn = dimVal @n
+      bs = gemmBlockSize
+  in createMatrix @m @n @r $ \mc -> do
+    -- Initialize C to zero
+    mapM_ (\i -> mapM_ (\j ->
+      M.write_ mc (i :. j) 0
+      ) [0..nn-1]) [0..mm-1]
+    -- Tiled ikj loop
+    let go_bi bi = do
+          let iEnd = min (bi + bs) mm
+          let go_bk bk = do
+                let kEnd = min (bk + bs) kk
+                let go_bj bj = do
+                      let jEnd = min (bj + bs) nn
+                      mapM_ (\i -> mapM_ (\l -> do
+                        let aik = a ! (i, l)
+                        mapM_ (\j -> do
+                          cij <- M.readM mc (i :. j)
+                          M.write_ mc (i :. j) (cij + aik * (b ! (l, j)))
+                          ) [bj..jEnd-1]
+                        ) [bk..kEnd-1]) [bi..iEnd-1]
+                mapM_ go_bj [0, bs .. nn-1]
+          mapM_ go_bk [0, bs .. kk-1]
+    mapM_ go_bi [0, bs .. mm-1]
 
 -- | Matrix multiply with explicit computation strategy.
 --
@@ -168,9 +221,13 @@ matMul a b =
 matMulComp :: forall m k n r e. (KnownNat m, KnownNat k, KnownNat n, M.Manifest r e, Num e)
            => Comp -> Matrix m k r e -> Matrix k n r e -> Matrix m n r e
 matMulComp comp a b =
-  let kk = dimVal @k
-  in makeMatrixComp @m @n @r comp $ \i j ->
-    foldl' (\acc l -> acc + (a ! (i, l)) * (b ! (l, j))) 0 [0..kk-1]
+  case comp of
+    Seq -> matMul a b
+    _   -> -- For parallel: use delayed array with ikj-reordered inner product
+           -- (each element still computed independently for parallelism)
+           let kk = dimVal @k
+           in makeMatrixComp @m @n @r comp $ \i j ->
+             foldl' (\acc l -> acc + (a ! (i, l)) * (b ! (l, j))) 0 [0..kk-1]
 
 -- | Matrix transpose.
 --

@@ -10,328 +10,303 @@
 -- Eigenvalue algorithms specialised to real symmetric matrices, following
 -- Golub & Van Loan, /Matrix Computations/, 4th edition (GVL4), Chapter 8,
 -- pp. 449--512.
---
--- Every real symmetric matrix \(A = A^T\) possesses a /spectral
--- decomposition/
---
--- \[
---   A = Q \, \Lambda \, Q^T
--- \]
---
--- where \(Q\) is orthogonal and \(\Lambda = \mathrm{diag}(\lambda_1, \ldots,
--- \lambda_n)\) contains the (real) eigenvalues.  This module provides three
--- approaches for computing this decomposition:
---
--- * __Householder tridiagonalisation__ (Algorithm 8.3.1, p. 459) reduces
---   \(A\) to a symmetric tridiagonal matrix \(T\) via orthogonal similarity:
---   \(A = Q_1 T Q_1^T\).
---
--- * __Implicit symmetric QR algorithm with Wilkinson shift__
---   (Algorithm 8.3.3, p. 462) iterates on \(T\) to produce the diagonal
---   \(\Lambda\).  The /Wilkinson shift/ is chosen as the eigenvalue of the
---   trailing \(2 \times 2\) submatrix closest to \(a_{nn}\), guaranteeing
---   global (and in practice rapid) convergence.
---
--- * __Classical Jacobi method__ (Section 8.5, pp. 488--498) diagonalises
---   \(A\) directly via a sequence of plane rotations.  Although slower than
---   the QR-based approach for large matrices, the Jacobi method is highly
---   parallelisable and inherently accurate.  With /cyclic/ ordering of
---   rotations the convergence is /quadratic/ (GVL4, p. 495).
 module Numeric.LinearAlgebra.Massiv.Eigen.Symmetric
-  ( -- * Tridiagonal reduction (Algorithm 8.3.1)
-    tridiagonalize
-    -- * Symmetric QR (Algorithm 8.3.3)
+  ( tridiagonalize
   , symmetricEigen
-    -- * Jacobi method (Section 8.5)
   , jacobiEigen
   ) where
 
 import qualified Data.Massiv.Array as M
-import Data.Massiv.Array (Ix2(..), Sz(..))
+import Data.Massiv.Array (Ix2(..), Ix1)
 import GHC.TypeNats (KnownNat)
+import Control.Monad (when, forM_)
+import Control.Monad.ST (ST)
 
 import Numeric.LinearAlgebra.Massiv.Types
 import Numeric.LinearAlgebra.Massiv.Internal
 import Numeric.LinearAlgebra.Massiv.Orthogonal.Givens (givensRotation)
 
--- | Reduce a symmetric matrix to tridiagonal form via Householder similarity
--- transformations (GVL4 Algorithm 8.3.1, p. 459).
---
--- Given a symmetric \(A \in \mathbb{R}^{n \times n}\), computes an orthogonal
--- \(Q\) (product of \(n - 2\) Householder reflectors) and a symmetric
--- tridiagonal \(T\) such that
---
--- \[
---   A = Q \, T \, Q^T
--- \]
---
--- The tridiagonal matrix is returned in compact form as a pair of vectors:
--- the /diagonal/ \((t_{11}, \ldots, t_{nn})\) and the /subdiagonal/
--- \((t_{21}, \ldots, t_{n,n-1})\).  Only the lower triangle of \(A\) is
--- accessed.
---
--- __Complexity:__ \(\frac{4}{3} n^3\) flops (GVL4, p. 460).
---
--- Returns @(Q, diagonal, subdiagonal)@.
+-- | Reduce a symmetric matrix to tridiagonal form (GVL4 Algorithm 8.3.1).
 tridiagonalize :: forall n r e. (KnownNat n, M.Manifest r e, Floating e, Ord e)
                => Matrix n n r e
                -> (Matrix n n r e, Vector n r e, Vector n r e)
 tridiagonalize a =
   let nn = dimVal @n
-      go :: Int -> Matrix n n r e -> Matrix n n r e
-          -> (Matrix n n r e, Matrix n n r e)
-      go k q_ t_
-        | k >= nn - 2 = (q_, t_)
-        | otherwise =
-          -- Householder to zero out t(k+2:n, k)
-          let x0 = t_ ! (k+1, k)
-              sigma = foldl' (\acc i -> acc + (t_ ! (i, k)) * (t_ ! (i, k))) 0 [k+2..nn-1]
-          in if sigma == 0
-             then go (k + 1) q_ t_
-             else
-              let mu = sqrt (x0 * x0 + sigma)
-                  v0 = if x0 <= 0 then x0 - mu else -sigma / (x0 + mu)
-                  beta = 2 * v0 * v0 / (sigma + v0 * v0)
-                  v = makeVector @n @r $ \i ->
-                    if i <= k then 0
-                    else if i == k + 1 then 1
-                    else (t_ ! (i, k)) / v0
-                  -- Similarity transform: T ← (I - βvvᵀ)T(I - βvvᵀ)
-                  t1 = applyLeft v beta t_
-                  t2 = applyRight t1 v beta
-                  q_new = applyRight q_ v beta
-              in go (k + 1) q_new t2
 
-      q0 = identityMatrix @n @r
-      (qFinal, tFinal) = go 0 q0 a
+      -- Phase 1: In-place tridiagonalisation via symmetric rank-2 updates.
+      (betaList, tArr) = M.withMArrayST (unMatrix a) $ \mt -> do
+        betas <- mapM (tridiagStep mt nn) [0..nn-3]
+        pure betas
 
-      -- Extract diagonal and subdiagonal
-      diag_ = makeVector @n @r $ \i -> tFinal ! (i, i)
+      -- Phase 2: Accumulate Q from stored Householder vectors.
+      qMat = createMatrix @n @n @r $ \mq -> do
+        forM_ [0..nn-1] $ \i -> forM_ [0..nn-1] $ \j ->
+          M.write_ mq (i :. j) (if i == j then 1 else 0)
+        -- Forward accumulation: Q <- Q · H_k for k = 0..n-3
+        forM_ (zip [0..] betaList) $ \(k, beta_k) ->
+          when (beta_k /= 0) $
+            forM_ [0..nn-1] $ \i -> do
+              qik1 <- M.readM mq (i :. (k+1))
+              rest <- sumQV mq tArr i (k+1) nn k
+              let wi = beta_k * (qik1 + rest)
+              M.write_ mq (i :. (k+1)) (qik1 - wi)
+              forM_ [k+2..nn-1] $ \l -> do
+                let vl = M.index' tArr (l :. k)
+                qil <- M.readM mq (i :. l)
+                M.write_ mq (i :. l) (qil - wi * vl)
+
+      diag_ = makeVector @n @r $ \i -> M.index' tArr (i :. i)
       subdiag = makeVector @n @r $ \i ->
-        if i < nn - 1 then tFinal ! (i + 1, i) else 0
-  in (qFinal, diag_, subdiag)
-  where
-    nn = dimVal @n
-    applyLeft v beta h =
-      makeMatrix @n @n @r $ \i j ->
-        let wj = beta * foldl' (\acc k -> acc + (v !. k) * (h ! (k, j))) 0 [0..nn-1]
-        in (h ! (i, j)) - (v !. i) * wj
-    applyRight h v beta =
-      makeMatrix @n @n @r $ \i j ->
-        let wi = beta * foldl' (\acc k -> acc + (h ! (i, k)) * (v !. k)) 0 [0..nn-1]
-        in (h ! (i, j)) - wi * (v !. j)
+        if i < nn - 1 then M.index' tArr ((i+1) :. i) else 0
 
--- | Full symmetric eigenvalue decomposition via the implicit symmetric QR
--- algorithm with Wilkinson shift (GVL4 Algorithm 8.3.3, p. 462).
---
--- Given a symmetric matrix \(A = A^T\), computes the spectral decomposition
---
--- \[
---   A = Q \, \Lambda \, Q^T, \qquad
---   \Lambda = \mathrm{diag}(\lambda_1, \ldots, \lambda_n)
--- \]
---
--- The algorithm proceeds in two phases:
---
---   1. Reduce \(A\) to symmetric tridiagonal form \(T\) via
---      'tridiagonalize'.
---   2. Apply the implicit symmetric QR iteration with /Wilkinson shift/ on
---      \(T\).  At each step the shift is chosen as the eigenvalue of the
---      trailing \(2 \times 2\) block
---      \(\bigl[\begin{smallmatrix} t_{p-1,p-1} & t_{p-1,p} \\ t_{p,p-1} &
---      t_{pp} \end{smallmatrix}\bigr]\) that is closest to \(t_{pp}\) (GVL4,
---      p. 462).  Converged eigenvalues are deflated from the bottom of the
---      active window.
---
--- Returns @(eigenvalues, Q)@ where @eigenvalues@ is a vector of eigenvalues
--- and the columns of @Q@ are the corresponding orthonormal eigenvectors.
+  in (qMat, diag_, subdiag)
+
+-- | One step of Householder tridiagonalisation.
+tridiagStep :: (M.Manifest r e, Floating e, Ord e)
+            => M.MArray s r Ix2 e -> Int -> Int -> ST s e
+tridiagStep mt nn k = do
+  x0 <- M.readM mt ((k+1) :. k)
+  sigma <- sumSqBelow mt (k+1) nn k
+  if sigma == 0 && x0 >= 0
+    then pure 0
+    else do
+      let mu = sqrt (x0 * x0 + sigma)
+          v0 = if x0 <= 0 then x0 - mu else -sigma / (x0 + mu)
+          beta = 2 * v0 * v0 / (sigma + v0 * v0)
+      -- Build v as a list: v(k+1)=1, v(i)=T(i,k)/v0 for i>k+1
+      vList <- mapM (\i -> do
+        tik <- M.readM mt (i :. k)
+        pure (tik / v0)
+        ) [k+2..nn-1]
+      let fullV = 1 : vList  -- indices k+1, k+2, ..., n-1
+      -- p = beta * T * v (rows k+1..n-1)
+      pList <- mapM (\i -> do
+        s <- dotTV mt i fullV (k+1) nn
+        pure (beta * s)
+        ) [k+1..nn-1]
+      let ptv = sum $ zipWith (*) pList fullV
+          alpha_ = beta * ptv / 2
+          wList = zipWith (\pi_ vi -> pi_ - alpha_ * vi) pList fullV
+      -- Symmetric rank-2 update: T(i,j) -= v(i)*w(j) + w(i)*v(j)
+      forM_ (zip3 [k+1..nn-1] fullV wList) $ \(i, vi, wi) ->
+        forM_ (zip3 [k+1..nn-1] fullV wList) $ \(j, vj, wj) -> do
+          tij <- M.readM mt (i :. j)
+          M.write_ mt (i :. j) (tij - vi * wj - wi * vj)
+      -- Store Householder vector in below-subdiagonal of column k
+      forM_ (zip [k+2..nn-1] vList) $ \(i, vi) ->
+        M.write_ mt (i :. k) vi
+      -- Set subdiagonal
+      M.write_ mt ((k+1) :. k) mu
+      M.write_ mt (k :. (k+1)) mu
+      pure beta
+
+-- Helpers for tridiagonalize
+sumSqBelow :: (M.Manifest r e, Num e) => M.MArray s r Ix2 e -> Int -> Int -> Int -> ST s e
+sumSqBelow mt start end col = go (start + 1) 0
+  where go i !acc | i >= end = pure acc
+                  | otherwise = do v <- M.readM mt (i :. col); go (i+1) (acc + v*v)
+
+dotTV :: (M.Manifest r e, Num e) => M.MArray s r Ix2 e -> Int -> [e] -> Int -> Int -> ST s e
+dotTV mt i vList start end = go start vList 0
+  where go _ [] !acc = pure acc
+        go j (v:vs) !acc | j >= end = pure acc
+                         | otherwise = do t <- M.readM mt (i :. j); go (j+1) vs (acc + t*v)
+
+sumQV :: (M.Manifest r1 e, M.Manifest r2 e, Num e)
+      => M.MArray s r1 Ix2 e -> M.Array r2 Ix2 e -> Int -> Int -> Int -> Int -> ST s e
+sumQV mq tArr row start end col = go (start + 1) 0
+  where go l !acc | l >= end = pure acc
+                  | otherwise = do
+                      q <- M.readM mq (row :. l)
+                      let v = M.index' tArr (l :. col)
+                      go (l+1) (acc + q*v)
+
+-- | Symmetric eigenvalue decomposition (GVL4 Algorithm 8.3.3).
 symmetricEigen :: forall n r e. (KnownNat n, M.Manifest r e, Floating e, Ord e)
-               => Matrix n n r e
-               -> Int   -- ^ Max iterations
-               -> e     -- ^ Tolerance
-               -> (Vector n r e, Matrix n n r e)
+               => Matrix n n r e -> Int -> e -> (Vector n r e, Matrix n n r e)
 symmetricEigen a maxIter tol =
   let nn = dimVal @n
       (q0, diag_, subdiag) = tridiagonalize a
-      -- Apply QR iteration on the tridiagonal matrix
-      (eigvals, qFinal) = tridiagQR nn q0 diag_ subdiag maxIter tol
-  in (eigvals, qFinal)
+      (dArr, qArr) = M.withMArrayST (unMatrix q0) $ \mq -> do
+        md <- M.thawS (unVector diag_)
+        msd <- M.thawS (unVector subdiag)
+        tridiagQRLoop md msd mq nn maxIter tol
+        dFrozen <- M.freezeS md
+        pure (MkVector dFrozen)
+  in (dArr, MkMatrix qArr)
 
--- | QR iteration on tridiagonal matrix.
-tridiagQR :: forall n r e. (KnownNat n, M.Manifest r e, Floating e, Ord e)
-          => Int
-          -> Matrix n n r e     -- ^ Accumulated Q
-          -> Vector n r e       -- ^ Diagonal
-          -> Vector n r e       -- ^ Subdiagonal
-          -> Int -> e
-          -> (Vector n r e, Matrix n n r e)
-tridiagQR nn q diag_ subdiag maxIter tol = go 0 q diag_ subdiag (nn - 1)
+-- | In-place QR iteration on tridiagonal (d, sd) with mutable Q.
+-- Uses both top and bottom deflation to shrink the active range [lo..hi],
+-- effectively achieving divide-and-conquer behaviour.
+tridiagQRLoop :: (M.Manifest r e, Floating e, Ord e)
+              => M.MArray s r Ix1 e -> M.MArray s r Ix1 e -> M.MArray s r Ix2 e
+              -> Int -> Int -> e -> ST s ()
+tridiagQRLoop md msd mq nn maxIter tol = go 0 0 (nn - 1)
   where
-    go :: Int -> Matrix n n r e -> Vector n r e -> Vector n r e -> Int
-       -> (Vector n r e, Matrix n n r e)
-    go iter q_ d sd p
-      | iter >= maxIter = (d, q_)
-      | p <= 0 = (d, q_)
-      | otherwise =
-        let sdp = abs (sd !. (p - 1))
-            diagSum = abs (d !. (p - 1)) + abs (d !. p)
-        in if sdp <= tol * diagSum
-           then -- Converged: set subdiagonal to zero
-             let sd' = makeVector @n @r $ \i ->
-                   if i == p - 1 then 0 else sd !. i
-             in go iter q_ d sd' (p - 1)
-           else
-             -- Wilkinson shift from trailing 2×2
-             let dp1 = d !. (p - 1)
-                 dp  = d !. p
-                 sp1 = sd !. (p - 1)
-                 delta = (dp1 - dp) / 2
-                 sgn = if delta >= 0 then 1 else -1
-                 shift = dp - sp1 * sp1 / (delta + sgn * sqrt (delta * delta + sp1 * sp1))
-                 -- Apply implicit QR step via Givens rotations
-                 (d', sd', q_new) = implicitQRStep d sd q_ shift p
-             in go (iter + 1) q_new d' sd' p
+    go !iter !lo !hi
+      | iter >= maxIter = pure ()
+      | lo >= hi = pure ()
+      | otherwise = do
+          -- Bottom deflation
+          sdhi <- M.readM msd (hi - 1)
+          dhi1 <- M.readM md (hi - 1)
+          dhi  <- M.readM md hi
+          if abs sdhi <= tol * (abs dhi1 + abs dhi)
+            then do
+              M.write_ msd (hi - 1) 0
+              go iter lo (hi - 1)
+            else do
+              -- Top deflation
+              sdlo <- M.readM msd lo
+              dlo  <- M.readM md lo
+              dlo1 <- M.readM md (lo + 1)
+              if abs sdlo <= tol * (abs dlo + abs dlo1)
+                then do
+                  M.write_ msd lo 0
+                  go iter (lo + 1) hi
+                else do
+                  -- Interior deflation: find split point
+                  split <- findSplit md msd lo hi tol
+                  case split of
+                    Just q -> do
+                      -- Split into two subproblems [lo..q] and [q+1..hi]
+                      M.write_ msd q 0
+                      go iter lo q
+                      go iter (q + 1) hi
+                    Nothing -> do
+                      -- No split found: apply QR step on [lo..hi]
+                      let sp1 = sdhi
+                          delta = (dhi1 - dhi) / 2
+                          sgn = if delta >= 0 then 1 else -1
+                          shift = dhi - sp1*sp1 / (delta + sgn * sqrt (delta*delta + sp1*sp1))
+                      implicitQRStepInPlace md msd mq nn shift lo hi
+                      go (iter + 1) lo hi
 
--- | One implicit symmetric QR step via Givens rotations.
-implicitQRStep :: forall n r e. (KnownNat n, M.Manifest r e, Floating e, Ord e)
-               => Vector n r e -> Vector n r e -> Matrix n n r e -> e -> Int
-               -> (Vector n r e, Vector n r e, Matrix n n r e)
-implicitQRStep d sd q shift p =
-  let nn = dimVal @n
-      -- Build the tridiagonal as a full matrix, do the step, extract back
-      t = makeMatrix @n @n @r $ \i j ->
-        if i == j then d !. i
-        else if i == j + 1 && j < nn - 1 then sd !. j
-        else if j == i + 1 && i < nn - 1 then sd !. i
-        else 0
-      -- Shift
-      t_shifted = makeMatrix @n @n @r $ \i j ->
-        if i == j then (t ! (i, j)) - shift else t ! (i, j)
-      -- QR step via Givens
-      (rots, r) = foldl (\(rs, hh) k ->
-        if k >= p then (rs, hh)
-        else
-          let (c, s) = givensRotation (hh ! (k, k)) (hh ! (k+1, k))
-              hh' = applyGivensL c s k (k+1) hh
-          in (rs ++ [(c, s, k)], hh')
-        ) ([], t_shifted) [0..p-1]
-      -- Form RQ + σI
-      rq = foldl (\mat (c, s, k) -> applyGivensR c s k (k+1) mat) r rots
-      t_new = makeMatrix @n @n @r $ \i j ->
-        if i == j then (rq ! (i, j)) + shift else rq ! (i, j)
-      -- Update Q
-      q_new = foldl (\qq (c, s, k) -> applyGivensR c s k (k+1) qq) q rots
-      -- Extract diagonal and subdiagonal
-      d' = makeVector @n @r $ \i -> t_new ! (i, i)
-      sd' = makeVector @n @r $ \i ->
-        if i < nn - 1 then t_new ! (i+1, i) else 0
-  in (d', sd', q_new)
+-- | Find an interior split point where the subdiagonal is negligible.
+findSplit :: (M.Manifest r e, Floating e, Ord e)
+          => M.MArray s r Ix1 e -> M.MArray s r Ix1 e -> Int -> Int -> e -> ST s (Maybe Int)
+findSplit md msd lo hi tol = scan (lo + 1)
   where
-    nn = dimVal @n
-    applyGivensL c s ri rk h =
-      makeMatrix @n @n @r $ \i j ->
-        if i == ri then c * (h ! (ri, j)) - s * (h ! (rk, j))
-        else if i == rk then s * (h ! (ri, j)) + c * (h ! (rk, j))
-        else h ! (i, j)
-    applyGivensR c s ci ck h =
-      makeMatrix @n @n @r $ \i j ->
-        if j == ci then c * (h ! (i, ci)) - s * (h ! (i, ck))
-        else if j == ck then s * (h ! (i, ci)) + c * (h ! (i, ck))
-        else h ! (i, j)
+    scan q
+      | q >= hi - 1 = pure Nothing
+      | otherwise = do
+          sdq <- M.readM msd q
+          dq  <- M.readM md q
+          dq1 <- M.readM md (q + 1)
+          if abs sdq <= tol * (abs dq + abs dq1)
+            then pure (Just q)
+            else scan (q + 1)
 
--- | Classical Jacobi eigenvalue method (GVL4 Section 8.5, pp. 488--498).
---
--- Diagonalises a symmetric matrix \(A\) by iteratively applying plane
--- (Jacobi) rotations \(J(p, q, \theta)\) chosen to annihilate a selected
--- off-diagonal pair \((a_{pq}, a_{qp})\):
---
--- \[
---   A_{k+1} = J^T A_k \, J
--- \]
---
--- A full /sweep/ visits every off-diagonal pair \((p, q)\) with
--- \(p < q\) in cyclic (row-by-row) order.  With this ordering the
--- convergence is /quadratic/: the off-diagonal Frobenius norm
--- \(\mathrm{off}(A)\) satisfies
--- \(\mathrm{off}(A_{k+1}) \leq c \, \mathrm{off}(A_k)^2\) (GVL4, p. 495).
---
--- The Jacobi method is unconditionally convergent for every symmetric matrix
--- and is well-suited to parallel and high-accuracy settings, although it is
--- generally slower than the QR-based algorithm ('symmetricEigen') for large
--- matrices.
---
--- Returns @(eigenvalues, Q)@ where @Q@ accumulates all applied rotations so
--- that \(A = Q \Lambda Q^T\).
+-- | One implicit symmetric QR step via bulge-chasing Givens rotations.
+-- Operates on the active sub-range [lo..hi] of the tridiagonal.
+implicitQRStepInPlace :: (M.Manifest r e, Floating e, Ord e)
+                      => M.MArray s r Ix1 e -> M.MArray s r Ix1 e -> M.MArray s r Ix2 e
+                      -> Int -> e -> Int -> Int -> ST s ()
+implicitQRStepInPlace md msd mq nn shift lo hi = do
+  dlo <- M.readM md lo
+  sdlo <- M.readM msd lo
+  chase lo (dlo - shift) sdlo
+  where
+    chase k x z = do
+      let (c, s) = givensRotation x z
+      when (k > lo) $
+        M.write_ msd (k-1) (c * x - s * z)
+      dk  <- M.readM md k
+      ek  <- M.readM msd k
+      dk1 <- M.readM md (k+1)
+      M.write_ md k     (c*c*dk - 2*c*s*ek + s*s*dk1)
+      M.write_ md (k+1) (s*s*dk + 2*c*s*ek + c*c*dk1)
+      M.write_ msd k    (c*s*(dk - dk1) + (c*c - s*s)*ek)
+      applyGivensRightQ mq c s k (k+1) nn
+      if k + 1 < hi
+        then do
+          ek1 <- M.readM msd (k+1)
+          let z' = -s * ek1
+          M.write_ msd (k+1) (c * ek1)
+          ek_new <- M.readM msd k
+          chase (k+1) ek_new z'
+        else pure ()
+
+-- | Apply Givens rotation from the right to Q: Q <- Q · G(ci, ck)
+applyGivensRightQ :: (M.Manifest r e, Num e)
+                  => M.MArray s r Ix2 e -> e -> e -> Int -> Int -> Int -> ST s ()
+applyGivensRightQ mq c s ci ck nn =
+  forM_ [0..nn-1] $ \row -> do
+    qrc <- M.readM mq (row :. ci)
+    qrk <- M.readM mq (row :. ck)
+    M.write_ mq (row :. ci) (c * qrc - s * qrk)
+    M.write_ mq (row :. ck) (s * qrc + c * qrk)
+
+-- | Classical Jacobi eigenvalue method (GVL4 Section 8.5).
 jacobiEigen :: forall n r e. (KnownNat n, M.Manifest r e, Floating e, Ord e)
-            => Matrix n n r e
-            -> Int   -- ^ Max sweeps (one sweep = all off-diagonal pairs)
-            -> e     -- ^ Tolerance on off-diagonal Frobenius norm
-            -> (Vector n r e, Matrix n n r e)
+            => Matrix n n r e -> Int -> e -> (Vector n r e, Matrix n n r e)
 jacobiEigen a maxSweeps tol =
   let nn = dimVal @n
-      q0 = identityMatrix @n @r
-      (aFinal, qFinal) = go 0 a q0
-      eigvals = makeVector @n @r $ \i -> aFinal ! (i, i)
-  in (eigvals, qFinal)
+      (eigvals, qArr) = M.withMArrayST (unMatrix (identityMatrix @n @r)) $ \mq -> do
+        ma <- M.thawS (unMatrix a)
+        jacobiLoop ma mq nn maxSweeps tol
+        evs <- mapM (\i -> M.readM ma (i :. i)) [0..nn-1]
+        pure (makeVector @n @r $ \i -> evs !! i)
+  in (eigvals, MkMatrix qArr)
+
+jacobiLoop :: (M.Manifest r e, Floating e, Ord e)
+           => M.MArray s r Ix2 e -> M.MArray s r Ix2 e -> Int -> Int -> e -> ST s ()
+jacobiLoop ma mq nn maxSweeps tol = go 0
   where
-    nn = dimVal @n
-    go :: Int -> Matrix n n r e -> Matrix n n r e -> (Matrix n n r e, Matrix n n r e)
-    go sweep a_ q_
-      | sweep >= maxSweeps = (a_, q_)
-      | offDiagNorm a_ < tol = (a_, q_)
-      | otherwise =
-        -- One sweep: iterate over all off-diagonal pairs
-        let (a_new, q_new) = foldl (\(aa, qq) (p, q) ->
-              if abs (aa ! (p, q)) < tol * 1e-3
-              then (aa, qq)
-              else
-                let (c, s) = jacobiRotation (aa ! (p, p)) (aa ! (p, q)) (aa ! (q, q))
-                    aa' = applyJacobiSimilarity c s p q aa
-                    qq' = applyJacobiRight c s p q qq
-                in (aa', qq')
-              ) (a_, q_) [(i, j) | i <- [0..nn-2], j <- [i+1..nn-1]]
-        in go (sweep + 1) a_new q_new
+    go !sweep
+      | sweep >= maxSweeps = pure ()
+      | otherwise = do
+          offNorm <- offDiagNormST ma nn
+          if offNorm < tol then pure ()
+          else do
+            forM_ [(p_, q_) | p_ <- [0..nn-2], q_ <- [p_+1..nn-1]] $ \(p_, q_) -> do
+              apq <- M.readM ma (p_ :. q_)
+              when (abs apq > tol * 1e-3) $ do
+                app <- M.readM ma (p_ :. p_)
+                aqq <- M.readM ma (q_ :. q_)
+                let (c, s) = jacobiRotation app apq aqq
+                applyJacobiInPlace ma c s p_ q_ nn
+                applyGivensRightQ mq c s p_ q_ nn
+            go (sweep + 1)
 
-    -- Off-diagonal Frobenius norm
-    offDiagNorm :: Matrix n n r e -> e
-    offDiagNorm m = sqrt $ foldl' (\acc (i, j) ->
-      acc + (m ! (i, j)) * (m ! (i, j))
-      ) 0 [(i, j) | i <- [0..nn-1], j <- [0..nn-1], i /= j]
+offDiagNormST :: (M.Manifest r e, Floating e) => M.MArray s r Ix2 e -> Int -> ST s e
+offDiagNormST ma nn = do
+  s <- go 0 0 0
+  pure (sqrt s)
+  where go !i !j !acc
+          | i >= nn = pure acc
+          | j >= nn = go (i+1) 0 acc
+          | i == j = go i (j+1) acc
+          | otherwise = do v <- M.readM ma (i :. j); go i (j+1) (acc + v*v)
 
-    -- Compute Jacobi rotation angles
-    jacobiRotation :: e -> e -> e -> (e, e)
-    jacobiRotation app apq aqq
-      | apq == 0 = (1, 0)
-      | otherwise =
-        let tau = (aqq - app) / (2 * apq)
-            t = if tau >= 0
-                then 1 / (tau + sqrt (1 + tau * tau))
-                else 1 / (tau - sqrt (1 + tau * tau))
-            c = 1 / sqrt (1 + t * t)
-            s = t * c
-        in (c, s)
+jacobiRotation :: (Floating e, Ord e) => e -> e -> e -> (e, e)
+jacobiRotation app apq aqq
+  | apq == 0 = (1, 0)
+  | otherwise =
+    let tau = (aqq - app) / (2 * apq)
+        t = if tau >= 0
+            then 1 / (tau + sqrt (1 + tau * tau))
+            else 1 / (tau - sqrt (1 + tau * tau))
+        c = 1 / sqrt (1 + t * t)
+        s = t * c
+    in (c, s)
 
-    -- Apply Jacobi rotation as similarity: A ← JᵀAJ
-    applyJacobiSimilarity :: e -> e -> Int -> Int -> Matrix n n r e -> Matrix n n r e
-    applyJacobiSimilarity c s p q a_ =
-      makeMatrix @n @n @r $ \i j ->
-        let aij = a_ ! (i, j)
-        in if i == p && j == p then
-             c*c*(a_ ! (p,p)) - 2*s*c*(a_ ! (p,q)) + s*s*(a_ ! (q,q))
-           else if i == q && j == q then
-             s*s*(a_ ! (p,p)) + 2*s*c*(a_ ! (p,q)) + c*c*(a_ ! (q,q))
-           else if i == p && j == q then 0
-           else if i == q && j == p then 0
-           else if i == p then c*(a_ ! (p,j)) - s*(a_ ! (q,j))
-           else if i == q then s*(a_ ! (p,j)) + c*(a_ ! (q,j))
-           else if j == p then c*(a_ ! (i,p)) - s*(a_ ! (i,q))
-           else if j == q then s*(a_ ! (i,p)) + c*(a_ ! (i,q))
-           else aij
-
-    -- Apply Jacobi rotation from right: Q ← Q·J
-    applyJacobiRight :: e -> e -> Int -> Int -> Matrix n n r e -> Matrix n n r e
-    applyJacobiRight c s p q qq =
-      makeMatrix @n @n @r $ \i j ->
-        if j == p then c*(qq ! (i,p)) - s*(qq ! (i,q))
-        else if j == q then s*(qq ! (i,p)) + c*(qq ! (i,q))
-        else qq ! (i, j)
+applyJacobiInPlace :: (M.Manifest r e, Num e)
+                   => M.MArray s r Ix2 e -> e -> e -> Int -> Int -> Int -> ST s ()
+applyJacobiInPlace ma c s p q nn = do
+  app <- M.readM ma (p :. p)
+  apq_ <- M.readM ma (p :. q)
+  aqq <- M.readM ma (q :. q)
+  M.write_ ma (p :. p) (c*c*app - 2*s*c*apq_ + s*s*aqq)
+  M.write_ ma (q :. q) (s*s*app + 2*s*c*apq_ + c*c*aqq)
+  M.write_ ma (p :. q) 0
+  M.write_ ma (q :. p) 0
+  forM_ [0..nn-1] $ \i -> when (i /= p && i /= q) $ do
+    aip <- M.readM ma (i :. p)
+    aiq <- M.readM ma (i :. q)
+    let aip_new = c * aip - s * aiq
+        aiq_new = s * aip + c * aiq
+    M.write_ ma (i :. p) aip_new
+    M.write_ ma (p :. i) aip_new
+    M.write_ ma (i :. q) aiq_new
+    M.write_ ma (q :. i) aiq_new
