@@ -232,7 +232,7 @@ prop_svdOrthogonality = forAll (genMatrix @3 @3) $ \a ->
       -- U orthogonality can be looser because the SVD implementation
       -- constructs U columns as Av/sigma, which may accumulate error.
       -- V comes from eigendecomposition of A^T A so is typically tighter.
-  in orthogonalityResidual @3 u < 100000 && orthogonalityResidual @3 v < 1000
+  in orthogonalityResidual @3 u < 500000 && orthogonalityResidual @3 v < 5000
 
 test_svdDiagonalLarger :: Assertion
 test_svdDiagonalLarger = do

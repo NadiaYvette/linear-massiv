@@ -33,9 +33,11 @@ library
     Numeric.LinearAlgebra.Massiv.Eigen.Schur
     Numeric.LinearAlgebra.Massiv.Eigen.Symmetric
     Numeric.LinearAlgebra.Massiv.Eigen.SVD
+    Numeric.LinearAlgebra.Massiv.Internal.Kernel
     Numeric.LinearAlgebra.Massiv.Linear
   build-depends:
     base >= 4.16 && < 5,
+    ghc-prim,
     massiv >= 1.0 && < 2,
     linear >= 1.21 && < 2,
     vector >= 0.12 && < 1,

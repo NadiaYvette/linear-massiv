@@ -45,6 +45,7 @@
 module Numeric.LinearAlgebra.Massiv.BLAS.Level1
   ( -- * Dot product (Algorithm 1.1.1, GVL4 p. 4)
     dot
+  , dotP
     -- * Scalar–vector operations (Algorithm 1.1.2, GVL4 p. 4)
   , scal
   , axpy
@@ -54,10 +55,12 @@ module Numeric.LinearAlgebra.Massiv.BLAS.Level1
   ) where
 
 import qualified Data.Massiv.Array as M
+import Data.Massiv.Array (unwrapByteArray, unwrapByteArrayOffset)
 import GHC.TypeNats (KnownNat)
 
 import Numeric.LinearAlgebra.Massiv.Types
 import Numeric.LinearAlgebra.Massiv.Internal
+import Numeric.LinearAlgebra.Massiv.Internal.Kernel (rawDot)
 
 -- | Inner (dot) product of two vectors.
 --
@@ -82,6 +85,19 @@ dot :: (KnownNat n, M.Manifest r e, Num e)
     => Vector n r e -> Vector n r e -> e
 dot (MkVector x) (MkVector y) =
   M.foldlS (+) 0 $ M.zipWith (*) x y
+{-# NOINLINE [1] dot #-}
+
+-- | Specialised raw-array dot product for P Double.
+dotP :: forall n. KnownNat n => Vector n M.P Double -> Vector n M.P Double -> Double
+dotP (MkVector x) (MkVector y) =
+  rawDot (unwrapByteArray x) (unwrapByteArrayOffset x)
+         (unwrapByteArray y) (unwrapByteArrayOffset y)
+         (dimVal @n)
+{-# NOINLINE dotP #-}
+
+{-# RULES "dot/P/Double" forall (x :: Vector n M.P Double)
+                                (y :: Vector n M.P Double).
+    dot x y = dotP x y #-}
 
 -- | Scale every element of a vector by a scalar.
 --

@@ -47,16 +47,19 @@ module Numeric.LinearAlgebra.Massiv.BLAS.Level2
   ( -- * Matrix–vector multiply — Gaxpy (Algorithms 1.1.3–1.1.4, GVL4 pp. 8–9)
     gemv
   , matvec
+  , matvecP
     -- * Rank-1 update (GVL4 Section 1.1.4, p. 10)
   , ger
   ) where
 
 import qualified Data.Massiv.Array as M
-import Data.Massiv.Array (Ix2(..), Sz(..), Comp(..))
+import Data.Massiv.Array (Ix2(..), Sz(..), Comp(..), unwrapByteArray, unwrapByteArrayOffset,
+                          unwrapMutableByteArray, unwrapMutableByteArrayOffset)
 import GHC.TypeNats (KnownNat)
 
 import Numeric.LinearAlgebra.Massiv.Types
 import Numeric.LinearAlgebra.Massiv.Internal
+import Numeric.LinearAlgebra.Massiv.Internal.Kernel (rawGemv)
 
 -- | General matrix–vector multiply (BLAS @GEMV@).
 --
@@ -124,6 +127,22 @@ matvec mat x =
   let c = dimVal @n
   in makeVector @m @r $ \i ->
     foldl (\acc j -> acc + (mat ! (i, j)) * (x !. j)) 0 [0..c-1]
+{-# NOINLINE [1] matvec #-}
+
+-- | Specialised raw-array matvec for P Double.
+matvecP :: forall m n. (KnownNat m, KnownNat n)
+              => Matrix m n M.P Double -> Vector n M.P Double -> Vector m M.P Double
+matvecP (MkMatrix a) (MkVector x) =
+  createVector @m @M.P $ \mc ->
+    rawGemv (unwrapByteArray a) (unwrapByteArrayOffset a) (dimVal @n)
+            (unwrapByteArray x) (unwrapByteArrayOffset x)
+            (unwrapMutableByteArray mc) (unwrapMutableByteArrayOffset mc)
+            (dimVal @m)
+{-# NOINLINE matvecP #-}
+
+{-# RULES "matvec/P/Double" forall (a :: Matrix m n M.P Double)
+                                   (x :: Vector n M.P Double).
+    matvec a x = matvecP a x #-}
 
 -- | Rank-1 update — outer product (BLAS @GER@).
 --

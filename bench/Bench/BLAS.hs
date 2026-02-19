@@ -10,9 +10,9 @@ import GHC.TypeNats (KnownNat)
 
 import Numeric.LinearAlgebra.Massiv.Types
 import Numeric.LinearAlgebra.Massiv.Internal
-import Numeric.LinearAlgebra.Massiv.BLAS.Level1 (dot)
-import Numeric.LinearAlgebra.Massiv.BLAS.Level2 (matvec)
-import Numeric.LinearAlgebra.Massiv.BLAS.Level3 (matMul, matMulComp)
+import Numeric.LinearAlgebra.Massiv.BLAS.Level1 (dotP)
+import Numeric.LinearAlgebra.Massiv.BLAS.Level2 (matvecP)
+import Numeric.LinearAlgebra.Massiv.BLAS.Level3 (matMulP, matMulComp)
 
 -- linear library imports for comparison
 import Linear.V4 (V4(..))
@@ -52,53 +52,53 @@ blasBenchmarks =
     [ -- Small sizes: compare linear vs massiv
       bgroup "4x4"
         [ bench "linear-V4" $ nf (linearM44 !*!) linearM44b
-        , bench "massiv-P"  $ nf (uncurry (matMul @4 @4 @4)) (mkMatP @4 @4, mkMatP @4 @4)
+        , bench "massiv-P"  $ nf (uncurry (matMulP @4 @4 @4)) (mkMatP @4 @4, mkMatP @4 @4)
         ]
     , bgroup "10x10"
-        [ bench "P/Seq" $ nf (uncurry (matMul @10 @10 @10)) (mkMatP @10 @10, mkMatP @10 @10)
+        [ bench "P/Seq" $ nf (uncurry (matMulP @10 @10 @10)) (mkMatP @10 @10, mkMatP @10 @10)
         ]
     , bgroup "50x50"
-        [ bench "P/Seq" $ nf (uncurry (matMul @50 @50 @50)) (mkMatP @50 @50, mkMatP @50 @50)
+        [ bench "P/Seq" $ nf (uncurry (matMulP @50 @50 @50)) (mkMatP @50 @50, mkMatP @50 @50)
         , bench "P/Par" $ nf (uncurry (matMulComp @50 @50 @50 Par)) (mkMatP @50 @50, mkMatP @50 @50)
         ]
     , bgroup "100x100"
-        [ bench "P/Seq" $ nf (uncurry (matMul @100 @100 @100)) (mkMatP @100 @100, mkMatP @100 @100)
+        [ bench "P/Seq" $ nf (uncurry (matMulP @100 @100 @100)) (mkMatP @100 @100, mkMatP @100 @100)
         , bench "P/Par" $ nf (uncurry (matMulComp @100 @100 @100 Par)) (mkMatP @100 @100, mkMatP @100 @100)
         ]
     , bgroup "200x200"
-        [ bench "P/Seq" $ nf (uncurry (matMul @200 @200 @200)) (mkMatP @200 @200, mkMatP @200 @200)
+        [ bench "P/Seq" $ nf (uncurry (matMulP @200 @200 @200)) (mkMatP @200 @200, mkMatP @200 @200)
         , bench "P/Par" $ nf (uncurry (matMulComp @200 @200 @200 Par)) (mkMatP @200 @200, mkMatP @200 @200)
         ]
     -- Representation comparison at 100x100
     , bgroup "repr-100x100"
-        [ bench "P" $ nf (uncurry (matMul @100 @100 @100)) (mkMatP @100 @100, mkMatP @100 @100)
+        [ bench "P" $ nf (uncurry (matMulP @100 @100 @100)) (mkMatP @100 @100, mkMatP @100 @100)
         ]
     ]
   , bgroup "dot"
     [ bgroup "4"
         [ bench "linear-V4" $ nf (LM.dot linearV4) linearV4b
-        , bench "massiv-P"  $ nf (uncurry dot) (mkVecP @4, mkVecP @4)
+        , bench "massiv-P"  $ nf (uncurry (dotP @4)) (mkVecP @4, mkVecP @4)
         ]
     , bgroup "100"
-        [ bench "P" $ nf (uncurry dot) (mkVecP @100, mkVecP @100)
+        [ bench "P" $ nf (uncurry (dotP @100)) (mkVecP @100, mkVecP @100)
         ]
     , bgroup "1000"
-        [ bench "P" $ nf (uncurry dot) (mkVecP @1000, mkVecP @1000)
+        [ bench "P" $ nf (uncurry (dotP @1000)) (mkVecP @1000, mkVecP @1000)
         ]
     , bgroup "10000"
-        [ bench "P" $ nf (uncurry dot) (mkVecP @10000, mkVecP @10000)
+        [ bench "P" $ nf (uncurry (dotP @10000)) (mkVecP @10000, mkVecP @10000)
         ]
     ]
   , bgroup "matvec"
     [ bgroup "4"
         [ bench "linear-V4" $ nf (linearM44 !*) linearV4
-        , bench "massiv-P"  $ nf (uncurry (matvec @4 @4)) (mkMatP @4 @4, mkVecP @4)
+        , bench "massiv-P"  $ nf (uncurry (matvecP @4 @4)) (mkMatP @4 @4, mkVecP @4)
         ]
     , bgroup "50"
-        [ bench "P" $ nf (uncurry (matvec @50 @50)) (mkMatP @50 @50, mkVecP @50)
+        [ bench "P" $ nf (uncurry (matvecP @50 @50)) (mkMatP @50 @50, mkVecP @50)
         ]
     , bgroup "100"
-        [ bench "P" $ nf (uncurry (matvec @100 @100)) (mkMatP @100 @100, mkVecP @100)
+        [ bench "P" $ nf (uncurry (matvecP @100 @100)) (mkMatP @100 @100, mkVecP @100)
         ]
     ]
   ]

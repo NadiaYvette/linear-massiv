@@ -19,9 +19,9 @@ import GHC.TypeNats (KnownNat)
 -- linear-massiv
 import Numeric.LinearAlgebra.Massiv.Types
 import Numeric.LinearAlgebra.Massiv.Internal
-import Numeric.LinearAlgebra.Massiv.BLAS.Level1 (dot)
-import Numeric.LinearAlgebra.Massiv.BLAS.Level2 (matvec)
-import Numeric.LinearAlgebra.Massiv.BLAS.Level3 (matMul)
+import Numeric.LinearAlgebra.Massiv.BLAS.Level1 (dotP)
+import Numeric.LinearAlgebra.Massiv.BLAS.Level2 (matvecP)
+import Numeric.LinearAlgebra.Massiv.BLAS.Level3 (matMulP)
 import Numeric.LinearAlgebra.Massiv.Solve.LU (luSolve)
 import Numeric.LinearAlgebra.Massiv.Solve.Cholesky (choleskySolve)
 import Numeric.LinearAlgebra.Massiv.Orthogonal.QR (qr)
@@ -150,53 +150,53 @@ main = do
       [ bgroup "4x4"
         [ bench "linear"        $ nf (linM44a LM.!*!) linM44b
         , bench "hmatrix"       $ nf (hmGemm hm4) hm4
-        , bench "linear-massiv" $ nf (matMul (mkMatLM @4 @4)) (mkMatLM @4 @4)
+        , bench "linear-massiv" $ nf (matMulP (mkMatLM @4 @4)) (mkMatLM @4 @4)
         ]
       , bgroup "10x10"
         [ bench "hmatrix"       $ nf (hmGemm hm10) hm10
-        , bench "linear-massiv" $ nf (matMul (mkMatLM @10 @10)) (mkMatLM @10 @10)
+        , bench "linear-massiv" $ nf (matMulP (mkMatLM @10 @10)) (mkMatLM @10 @10)
         ]
       , bgroup "50x50"
         [ bench "hmatrix"       $ nf (hmGemm hm50) hm50
-        , bench "linear-massiv" $ nf (matMul (mkMatLM @50 @50)) (mkMatLM @50 @50)
+        , bench "linear-massiv" $ nf (matMulP (mkMatLM @50 @50)) (mkMatLM @50 @50)
         ]
       , bgroup "100x100"
         [ bench "hmatrix"       $ nf (hmGemm hm100) hm100
-        , bench "linear-massiv" $ nf (matMul (mkMatLM @100 @100)) (mkMatLM @100 @100)
+        , bench "linear-massiv" $ nf (matMulP (mkMatLM @100 @100)) (mkMatLM @100 @100)
         ]
       , bgroup "200x200"
         [ bench "hmatrix"       $ nf (hmGemm hm200) hm200
-        , bench "linear-massiv" $ nf (matMul (mkMatLM @200 @200)) (mkMatLM @200 @200)
+        , bench "linear-massiv" $ nf (matMulP (mkMatLM @200 @200)) (mkMatLM @200 @200)
         ]
       ]
     , bgroup "dot"
       [ bgroup "4"
         [ bench "linear"        $ nf (LMet.dot linV4a) linV4b
         , bench "hmatrix"       $ nf (hmDot hv4) hv4
-        , bench "linear-massiv" $ nf (dot (mkVecLM @4)) (mkVecLM @4)
+        , bench "linear-massiv" $ nf (dotP (mkVecLM @4)) (mkVecLM @4)
         ]
       , bgroup "100"
         [ bench "hmatrix"       $ nf (hmDot hv100) hv100
-        , bench "linear-massiv" $ nf (dot (mkVecLM @100)) (mkVecLM @100)
+        , bench "linear-massiv" $ nf (dotP (mkVecLM @100)) (mkVecLM @100)
         ]
       , bgroup "1000"
         [ bench "hmatrix"       $ nf (hmDot hv1000) hv1000
-        , bench "linear-massiv" $ nf (dot (mkVecLM @1000)) (mkVecLM @1000)
+        , bench "linear-massiv" $ nf (dotP (mkVecLM @1000)) (mkVecLM @1000)
         ]
       ]
     , bgroup "matvec"
       [ bgroup "4"
         [ bench "linear"        $ nf (linM44a LM.!*) linV4a
         , bench "hmatrix"       $ nf (hmMatvec hm4) hv4
-        , bench "linear-massiv" $ nf (matvec (mkMatLM @4 @4)) (mkVecLM @4)
+        , bench "linear-massiv" $ nf (matvecP (mkMatLM @4 @4)) (mkVecLM @4)
         ]
       , bgroup "50"
         [ bench "hmatrix"       $ nf (hmMatvec hm50) hv50
-        , bench "linear-massiv" $ nf (matvec (mkMatLM @50 @50)) (mkVecLM @50)
+        , bench "linear-massiv" $ nf (matvecP (mkMatLM @50 @50)) (mkVecLM @50)
         ]
       , bgroup "100"
         [ bench "hmatrix"       $ nf (hmMatvec hm100) hv100
-        , bench "linear-massiv" $ nf (matvec (mkMatLM @100 @100)) (mkVecLM @100)
+        , bench "linear-massiv" $ nf (matvecP (mkMatLM @100 @100)) (mkVecLM @100)
         ]
       ]
     , bgroup "luSolve"
