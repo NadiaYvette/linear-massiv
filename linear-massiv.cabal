@@ -63,6 +63,7 @@ test-suite linear-massiv-test
   hs-source-dirs: test
   other-modules:
     Test.Types
+    Test.Residuals
     Test.BLAS
     Test.Solve
     Test.Orthogonal

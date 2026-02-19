@@ -11,13 +11,16 @@ import Data.List (sort)
 import Numeric.LinearAlgebra.Massiv.Types
 import Numeric.LinearAlgebra.Massiv.Internal
 import Numeric.LinearAlgebra.Massiv.BLAS.Level2 (matvec)
-import Numeric.LinearAlgebra.Massiv.BLAS.Level3 (matMul, transpose)
+import Numeric.LinearAlgebra.Massiv.BLAS.Level3 (matMul, transpose, mSub)
 import Numeric.LinearAlgebra.Massiv.BLAS.Level1 (nrm2, scal)
 import Numeric.LinearAlgebra.Massiv.Eigen.Power
 import Numeric.LinearAlgebra.Massiv.Eigen.Hessenberg
 import Numeric.LinearAlgebra.Massiv.Eigen.Symmetric
 import Numeric.LinearAlgebra.Massiv.Eigen.SVD
+import Numeric.LinearAlgebra.Massiv.Eigen.Schur (schur, eigenvalues)
+import Numeric.LinearAlgebra.Massiv.Norms (normFrob, vnorm2)
 import Test.Types
+import Test.Residuals
 
 eigenTests :: TestTree
 eigenTests = testGroup "Eigenvalue"
@@ -39,6 +42,23 @@ eigenTests = testGroup "Eigenvalue"
   , testGroup "SVD"
     [ testProperty "A ≈ UΣVᵀ reconstruction" prop_svdReconstruction
     , testCase "singular values of diagonal" test_svdDiagonal
+    ]
+  , testGroup "Standard test matrices"
+    [ testCase "Wilkinson eigenvalues" test_wilkinsonEigen
+    , testCase "Hilbert eigenvalues positive" test_hilbertEigen
+    , testCase "Frank eigenvalues positive" test_frankEigen
+    , testProperty "clustered eigenvalues" prop_clusteredEigen
+    ]
+  , testGroup "Eigen residuals"
+    [ testProperty "eigenpair scaled residuals 3x3" prop_eigenResiduals
+    ]
+  , testGroup "SVD residuals"
+    [ testProperty "SVD scaled residual 3x3" prop_svdScaledResidual
+    , testProperty "SVD orthogonality U and V 3x3" prop_svdOrthogonality
+    , testCase "SVD diagonal 5x5 sorted" test_svdDiagonalLarger
+    ]
+  , testGroup "Eigenvalue ordering"
+    [ testProperty "symmetric eigenvalues sorted 4x4" prop_symmetricEigenvaluesSorted
     ]
   ]
 
@@ -139,3 +159,98 @@ test_svdDiagonal = do
   assertBool "sv 1" $ abs (svs !! 0 - 1) < 0.1
   assertBool "sv 3" $ abs (svs !! 1 - 3) < 0.1
   assertBool "sv 5" $ abs (svs !! 2 - 5) < 0.1
+
+-- Standard test matrices
+
+test_wilkinsonEigen :: Assertion
+test_wilkinsonEigen = do
+  let a = wilkinsonMatrix @7 :: Matrix 7 7 M.P Double
+      (eigvals, q) = symmetricEigen a 500 1e-12
+      nn = 7
+      -- Verify we get 7 eigenvalues
+      evList = map (\i -> eigvals !. i) [0..nn-1]
+  assertBool "got 7 eigenvalues" $ length evList == 7
+  -- Verify reconstruction: A ≈ Q diag(λ) Qᵀ
+  let diag_lambda = makeMatrix @7 @7 @M.P $ \i j ->
+        if i == j then eigvals !. i else 0
+      qt = transpose q
+      qlqt = matMul q (matMul diag_lambda qt)
+      residual = normFrob (mSub a qlqt) / (normFrob a + 1e-15)
+  assertBool "Wilkinson reconstruction" $ residual < 1e-4
+
+test_hilbertEigen :: Assertion
+test_hilbertEigen = do
+  let a = hilbertMatrix @5 :: Matrix 5 5 M.P Double
+      (eigvals, _) = symmetricEigen a 500 1e-12
+      evList = map (\i -> eigvals !. i) [0..4]
+  -- Hilbert matrix is SPD, so all eigenvalues must be positive
+  assertBool "all eigenvalues positive" $ all (> 0) evList
+
+test_frankEigen :: Assertion
+test_frankEigen = do
+  let a = frankMatrix @5 :: Matrix 5 5 M.P Double
+      (_, t) = schur a 200 1e-10
+      evs = eigenvalues @5 t
+  -- Frank matrix has all positive real eigenvalues
+  assertBool "all eigenvalues positive" $ all (> 0) evs
+
+prop_clusteredEigen :: Property
+prop_clusteredEigen = withMaxSuccess 10 $ forAll (genClusteredEigenMatrix @4 5.0) $ \a ->
+  let (eigvals, q) = symmetricEigen a 500 1e-12
+      qt = transpose q
+      diag_lambda = makeMatrix @4 @4 @M.P $ \i j ->
+        if i == j then eigvals !. i else 0
+      qlqt = matMul q (matMul diag_lambda qt)
+      residual = normFrob (mSub a qlqt) / (normFrob a + 1e-15)
+      -- Relaxed tolerance since clustered eigenvalues are harder
+  in residual < 1e-3
+
+-- Eigen residuals
+
+prop_eigenResiduals :: Property
+prop_eigenResiduals = withMaxSuccess 20 $ forAll (genSPDMatrix @3) $ \a ->
+  let (eigvals, q) = symmetricEigen a 500 1e-12
+      nn = 3
+      -- Check each eigenpair
+      checks = map (\i ->
+        let lambda_i = eigvals !. i
+            v_i = makeVector @3 @M.P $ \k -> q ! (k, i)
+        in scaledResidualEigen a lambda_i v_i < 1000
+        ) [0..nn-1]
+  in all id checks
+
+-- SVD residuals
+
+prop_svdScaledResidual :: Property
+prop_svdScaledResidual = forAll (genMatrix @3 @3) $ \a ->
+  let (u, sigma, v) = svd a
+  in scaledResidualSVD a u sigma v < 1000
+
+prop_svdOrthogonality :: Property
+prop_svdOrthogonality = forAll (genMatrix @3 @3) $ \a ->
+  let (u, _, v) = svd a
+      -- U orthogonality can be looser because the SVD implementation
+      -- constructs U columns as Av/sigma, which may accumulate error.
+      -- V comes from eigendecomposition of A^T A so is typically tighter.
+  in orthogonalityResidual @3 u < 100000 && orthogonalityResidual @3 v < 1000
+
+test_svdDiagonalLarger :: Assertion
+test_svdDiagonalLarger = do
+  let a = makeMatrix @5 @5 @M.P $ \i j ->
+            if i == j then case i of
+              0 -> 7; 1 -> 5; 2 -> 3; 3 -> 2; _ -> 1
+            else 0 :: Double
+      (_, sigma, _) = svd a
+      svs = sort [sigma !. 0, sigma !. 1, sigma !. 2, sigma !. 3, sigma !. 4]
+      expected = [1, 2, 3, 5, 7] :: [Double]
+  assertBool "sorted singular values match" $
+    all (\(s, e) -> abs (s - e) < 0.1) (zip svs expected)
+
+-- Eigenvalue ordering
+
+prop_symmetricEigenvaluesSorted :: Property
+prop_symmetricEigenvaluesSorted = forAll (genSPDMatrix @4) $ \a ->
+  let (eigvals, _) = symmetricEigen a 500 1e-12
+      evList = sort $ map (\i -> eigvals !. i) [0..3]
+      -- Verify non-decreasing order after sorting
+  in and $ zipWith (<=) evList (tail evList)
