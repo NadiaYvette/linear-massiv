@@ -123,3 +123,30 @@ benchmark linear-massiv-bench
     FlexibleInstances
     MultiParamTypeClasses
   ghc-options: -Wall -O2 -threaded -rtsopts "-with-rtsopts=-N"
+
+benchmark linear-massiv-comparison
+  type: exitcode-stdio-1.0
+  main-is: Main.hs
+  hs-source-dirs: bench-comparison
+  build-depends:
+    base,
+    linear-massiv,
+    massiv,
+    hmatrix >= 0.20,
+    linear,
+    criterion >= 1.5,
+    deepseq,
+    vector
+  default-language: GHC2021
+  default-extensions:
+    DataKinds
+    TypeFamilies
+    ScopedTypeVariables
+    TypeApplications
+    TypeOperators
+    GADTs
+    RankNTypes
+    FlexibleContexts
+    FlexibleInstances
+    MultiParamTypeClasses
+  ghc-options: -Wall -O2 -threaded -rtsopts "-with-rtsopts=-N"
