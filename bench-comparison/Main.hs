@@ -22,10 +22,10 @@ import Numeric.LinearAlgebra.Massiv.Internal
 import Numeric.LinearAlgebra.Massiv.BLAS.Level1 (dotP)
 import Numeric.LinearAlgebra.Massiv.BLAS.Level2 (matvecP)
 import Numeric.LinearAlgebra.Massiv.BLAS.Level3 (matMulP)
-import Numeric.LinearAlgebra.Massiv.Solve.LU (luSolve)
-import Numeric.LinearAlgebra.Massiv.Solve.Cholesky (choleskySolve)
-import Numeric.LinearAlgebra.Massiv.Orthogonal.QR (qr)
-import Numeric.LinearAlgebra.Massiv.Eigen.Symmetric (symmetricEigen)
+import Numeric.LinearAlgebra.Massiv.Solve.LU (luSolve, luSolveP)
+import Numeric.LinearAlgebra.Massiv.Solve.Cholesky (choleskySolve, choleskySolveP)
+import Numeric.LinearAlgebra.Massiv.Orthogonal.QR (qr, qrP)
+import Numeric.LinearAlgebra.Massiv.Eigen.Symmetric (symmetricEigen, symmetricEigenP)
 import Numeric.LinearAlgebra.Massiv.Eigen.SVD (svd)
 
 -- hmatrix
@@ -202,53 +202,64 @@ main = do
     , bgroup "luSolve"
       [ bgroup "10x10"
         [ bench "hmatrix"       $ nf (hmLinearSolve dd10) hv10
-        , bench "linear-massiv" $ nf (luSolve (mkDDLM @10)) (mkVecLM @10)
+        , bench "linear-massiv" $ nf (luSolveP (mkDDLM @10)) (mkVecLM @10)
+        , bench "lm-generic"    $ nf (luSolve (mkDDLM @10)) (mkVecLM @10)
         ]
       , bgroup "50x50"
         [ bench "hmatrix"       $ nf (hmLinearSolve dd50) hv50
-        , bench "linear-massiv" $ nf (luSolve (mkDDLM @50)) (mkVecLM @50)
+        , bench "linear-massiv" $ nf (luSolveP (mkDDLM @50)) (mkVecLM @50)
+        , bench "lm-generic"    $ nf (luSolve (mkDDLM @50)) (mkVecLM @50)
         ]
       , bgroup "100x100"
         [ bench "hmatrix"       $ nf (hmLinearSolve dd100) hv100
-        , bench "linear-massiv" $ nf (luSolve (mkDDLM @100)) (mkVecLM @100)
+        , bench "linear-massiv" $ nf (luSolveP (mkDDLM @100)) (mkVecLM @100)
+        , bench "lm-generic"    $ nf (luSolve (mkDDLM @100)) (mkVecLM @100)
         ]
       ]
     , bgroup "choleskySolve"
       [ bgroup "10x10"
         [ bench "hmatrix"       $ nf (hmCholSolve spd10) hv10
-        , bench "linear-massiv" $ nf (choleskySolve (mkSPDLM @10)) (mkVecLM @10)
+        , bench "linear-massiv" $ nf (choleskySolveP (mkSPDLM @10)) (mkVecLM @10)
+        , bench "lm-generic"    $ nf (choleskySolve (mkSPDLM @10)) (mkVecLM @10)
         ]
       , bgroup "50x50"
         [ bench "hmatrix"       $ nf (hmCholSolve spd50) hv50
-        , bench "linear-massiv" $ nf (choleskySolve (mkSPDLM @50)) (mkVecLM @50)
+        , bench "linear-massiv" $ nf (choleskySolveP (mkSPDLM @50)) (mkVecLM @50)
+        , bench "lm-generic"    $ nf (choleskySolve (mkSPDLM @50)) (mkVecLM @50)
         ]
       , bgroup "100x100"
         [ bench "hmatrix"       $ nf (hmCholSolve spd100) hv100
-        , bench "linear-massiv" $ nf (choleskySolve (mkSPDLM @100)) (mkVecLM @100)
+        , bench "linear-massiv" $ nf (choleskySolveP (mkSPDLM @100)) (mkVecLM @100)
+        , bench "lm-generic"    $ nf (choleskySolve (mkSPDLM @100)) (mkVecLM @100)
         ]
       ]
     , bgroup "QR"
       [ bgroup "10x10"
         [ bench "hmatrix"       $ nf H.qr hm10
-        , bench "linear-massiv" $ nf qr (mkMatLM @10 @10)
+        , bench "linear-massiv" $ nf qrP (mkMatLM @10 @10)
+        , bench "lm-generic"    $ nf qr (mkMatLM @10 @10)
         ]
       , bgroup "50x50"
         [ bench "hmatrix"       $ nf H.qr hm50
-        , bench "linear-massiv" $ nf qr (mkMatLM @50 @50)
+        , bench "linear-massiv" $ nf qrP (mkMatLM @50 @50)
+        , bench "lm-generic"    $ nf qr (mkMatLM @50 @50)
         ]
       , bgroup "100x100"
         [ bench "hmatrix"       $ nf H.qr hm100
-        , bench "linear-massiv" $ nf qr (mkMatLM @100 @100)
+        , bench "linear-massiv" $ nf qrP (mkMatLM @100 @100)
+        , bench "lm-generic"    $ nf qr (mkMatLM @100 @100)
         ]
       ]
     , bgroup "eigenSH"
       [ bgroup "10x10"
         [ bench "hmatrix"       $ nf (H.eigSH . H.trustSym) spd10
-        , bench "linear-massiv" $ nf (\a -> symmetricEigen a 200 1e-12) (mkSPDLM @10)
+        , bench "linear-massiv" $ nf (\a -> symmetricEigenP a 200 1e-12) (mkSPDLM @10)
+        , bench "lm-generic"    $ nf (\a -> symmetricEigen a 200 1e-12) (mkSPDLM @10)
         ]
       , bgroup "50x50"
         [ bench "hmatrix"       $ nf (H.eigSH . H.trustSym) spd50
-        , bench "linear-massiv" $ nf (\a -> symmetricEigen a 500 1e-12) (mkSPDLM @50)
+        , bench "linear-massiv" $ nf (\a -> symmetricEigenP a 500 1e-12) (mkSPDLM @50)
+        , bench "lm-generic"    $ nf (\a -> symmetricEigen a 500 1e-12) (mkSPDLM @50)
         ]
       ]
     , bgroup "SVD"

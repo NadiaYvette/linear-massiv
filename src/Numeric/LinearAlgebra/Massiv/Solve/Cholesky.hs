@@ -1,4 +1,7 @@
 {-# LANGUAGE AllowAmbiguousTypes #-}
+{-# LANGUAGE MagicHash #-}
+{-# LANGUAGE UnboxedTuples #-}
+{-# LANGUAGE BangPatterns #-}
 
 -- |
 -- Module      : Numeric.LinearAlgebra.Massiv.Solve.Cholesky
@@ -56,16 +59,23 @@ module Numeric.LinearAlgebra.Massiv.Solve.Cholesky
   , choleskyGaxpy
     -- * Solving with Cholesky (\(Ax = b\))
   , choleskySolve
+  , choleskySolveP
   ) where
 
 import qualified Data.Massiv.Array as M
-import Data.Massiv.Array (Ix1, Ix2(..), Sz(..))
+import Data.Massiv.Array (Ix1, Ix2(..), Sz(..), unwrapByteArray, unwrapByteArrayOffset,
+                          unwrapMutableByteArray, unwrapMutableByteArrayOffset)
 import GHC.TypeNats (KnownNat)
+import GHC.Exts
+import GHC.ST (ST(..))
+import Data.Primitive.ByteArray (ByteArray(..), MutableByteArray(..))
 
 import Numeric.LinearAlgebra.Massiv.Types
 import Numeric.LinearAlgebra.Massiv.Internal
 import Numeric.LinearAlgebra.Massiv.Solve.Triangular (forwardSub, backSub)
 import Numeric.LinearAlgebra.Massiv.BLAS.Level3 (transpose)
+import Numeric.LinearAlgebra.Massiv.Internal.Kernel
+  (rawCholColumn, rawForwardSubCholPacked, rawBackSubCholTPacked)
 
 -- | Outer-product Cholesky factorization (GVL4 Algorithm 4.2.1, p. 164).
 --
@@ -220,3 +230,69 @@ choleskySolve a b =
       gt = transpose g
       y = forwardSub g b
   in backSub gt y
+
+-- | Specialised Cholesky solve for @P Double@.
+-- Does Cholesky factorisation + solve entirely using raw ByteArray# primops,
+-- avoiding separate G/G^T matrix construction.
+choleskySolveP :: forall n. KnownNat n
+               => Matrix n n M.P Double -> Vector n M.P Double -> Vector n M.P Double
+choleskySolveP (MkMatrix a) (MkVector b) =
+  let nn = dimVal @n
+  in createVector @n @M.P $ \mx -> do
+    -- Allocate n×n working storage for G, copy lower triangle of A
+    mg <- M.newMArray @M.P (M.Sz2 nn nn) (0 :: Double)
+    let mbaG = unwrapMutableByteArray mg
+        offG = unwrapMutableByteArrayOffset mg
+    -- Copy lower triangle using raw primops
+    copyLowerTriangle a mbaG offG nn
+
+    -- Phase 1: Cholesky factorisation column by column
+    mapM_ (rawCholColumn mbaG offG nn) [0..nn-1]
+
+    -- Phase 2: Freeze G and prepare RHS
+    frozenG <- M.freezeS mg
+    let baG = unwrapByteArray frozenG
+        offFG = unwrapByteArrayOffset frozenG
+
+    -- Copy b into output vector
+    let mbaX = unwrapMutableByteArray mx
+        offX = unwrapMutableByteArrayOffset mx
+    copyVectorRaw b mbaX offX nn
+
+    -- Phase 3: Forward substitution (Gy = b)
+    rawForwardSubCholPacked baG offFG nn mbaX offX
+
+    -- Phase 4: Back substitution (G^T x = y), without forming G^T
+    rawBackSubCholTPacked baG offFG nn mbaX offX
+{-# NOINLINE choleskySolveP #-}
+
+-- | Copy lower triangle of an immutable 2D P array into a mutable byte array.
+copyLowerTriangle :: M.Array M.P Ix2 Double -> MutableByteArray s -> Int -> Int -> ST s ()
+copyLowerTriangle src (MutableByteArray mba_dst) (I# off_dst) (I# n) = ST $ \s0 ->
+  let ba_src = case unwrapByteArray src of ByteArray ba -> ba
+      off_src = case unwrapByteArrayOffset src of I# o -> o
+      goI i s
+        | isTrue# (i >=# n) = s
+        | otherwise = goI (i +# 1#) (goJ i 0# s)
+      goJ i j s
+        | isTrue# (j ># i) = s
+        | otherwise =
+            let v = indexDoubleArray# ba_src (off_src +# i *# n +# j)
+            in case writeDoubleArray# mba_dst (off_dst +# i *# n +# j) v s of
+                 s' -> goJ i (j +# 1#) s'
+  in (# goI 0# s0, () #)
+{-# INLINE copyLowerTriangle #-}
+
+-- | Copy an immutable P vector into a mutable byte array.
+copyVectorRaw :: M.Array M.P Ix1 Double -> MutableByteArray s -> Int -> Int -> ST s ()
+copyVectorRaw src (MutableByteArray mba_dst) (I# off_dst) (I# n) = ST $ \s0 ->
+  let ba_src = case unwrapByteArray src of ByteArray ba -> ba
+      off_src = case unwrapByteArrayOffset src of I# o -> o
+      go i s
+        | isTrue# (i >=# n) = s
+        | otherwise =
+            let v = indexDoubleArray# ba_src (off_src +# i)
+            in case writeDoubleArray# mba_dst (off_dst +# i) v s of
+                 s' -> go (i +# 1#) s'
+  in (# go 0# s0, () #)
+{-# INLINE copyVectorRaw #-}

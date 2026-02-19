@@ -15,7 +15,7 @@ module Numeric.LinearAlgebra.Massiv.Internal.Kernel
   , rawGemv
     -- * BLAS-3: matrix multiply (GEMM)
   , rawGemmKernel
-    -- * QR helpers
+    -- * QR helpers (immutable)
   , rawSumSqRange
   , rawSumProdRange
   , rawHouseholderApplyCol
@@ -23,6 +23,23 @@ module Numeric.LinearAlgebra.Massiv.Internal.Kernel
     -- * Eigen / tridiag helpers
   , rawApplyGivensRows
   , rawSymRank2Update
+    -- * LU kernels
+  , rawLUEliminateColumn
+  , rawSwapRows
+  , rawPivotSearch
+  , rawForwardSubUnitPacked
+  , rawBackSubPacked
+    -- * Cholesky kernels
+  , rawCholColumn
+  , rawForwardSubCholPacked
+  , rawBackSubCholTPacked
+    -- * QR mutable kernels
+  , rawMutSumSqColumn
+  , rawMutSumProdColumns
+  , rawMutHouseholderApply
+  , rawMutQAccum
+    -- * Eigen mutable kernels
+  , rawMutApplyGivensColumns
   ) where
 
 import GHC.Exts
@@ -348,6 +365,395 @@ rawSymRank2Update (MutableByteArray mba) (I# off) (I# n)
 
   in (# goI from_ s0, () #)
 {-# INLINE rawSymRank2Update #-}
+
+-- --------------------------------------------------------------------------
+-- LU kernels
+-- --------------------------------------------------------------------------
+
+-- | In-place LU elimination for column k of an n×n row-major matrix.
+-- Computes multipliers and updates the trailing submatrix.
+-- Inner j-loop uses DoubleX4# SIMD (contiguous row access).
+rawLUEliminateColumn :: MutableByteArray s -> Int -> Int -> Int -> ST s ()
+rawLUEliminateColumn (MutableByteArray mba) (I# off) (I# n) (I# k) = ST $ \s0 ->
+  -- Read A[k,k] (the pivot)
+  case readDoubleArray# mba (off +# k *# n +# k) s0 of
+    (# s1, akk #) ->
+      let goI i s
+            | isTrue# (i >=# n) = s
+            | otherwise =
+                -- Read A[i,k], compute multiplier
+                case readDoubleArray# mba (off +# i *# n +# k) s of
+                  (# s', aik #) ->
+                    let mult = aik /## akk
+                        iRowOff = off +# i *# n
+                        kRowOff = off +# k *# n
+                        jSpan = n -# k -# 1#
+                        jStart = k +# 1#
+                        j4End = jStart +# (jSpan -# (jSpan `remInt#` 4#))
+                        negMultV = broadcastDoubleX4# (negateDouble# mult)
+                    -- Store multiplier at A[i,k]
+                    in case writeDoubleArray# mba (off +# i *# n +# k) mult s' of
+                         s'' ->
+                           -- SIMD j-loop: A[i,j] -= mult * A[k,j]  =  A[i,j] + (-mult)*A[k,j]
+                           let goJSimd j s_
+                                 | isTrue# (j >=# j4End) = s_
+                                 | otherwise =
+                                     case readDoubleArrayAsDoubleX4# mba (iRowOff +# j) s_ of
+                                       (# s1_, aij #) ->
+                                         case readDoubleArrayAsDoubleX4# mba (kRowOff +# j) s1_ of
+                                              (# s2_, akjV_ #) ->
+                                                let aij' = fmaddDoubleX4# negMultV akjV_ aij
+                                                in case writeDoubleArrayAsDoubleX4# mba (iRowOff +# j) aij' s2_ of
+                                                     s3_ -> goJSimd (j +# 4#) s3_
+                               -- Scalar cleanup
+                               goJScalar j s_
+                                 | isTrue# (j >=# n) = s_
+                                 | otherwise =
+                                     case readDoubleArray# mba (iRowOff +# j) s_ of
+                                       (# s1_, aij #) ->
+                                         case readDoubleArray# mba (kRowOff +# j) s1_ of
+                                           (# s2_, akj #) ->
+                                             case writeDoubleArray# mba (iRowOff +# j) (aij -## mult *## akj) s2_ of
+                                               s3_ -> goJScalar (j +# 1#) s3_
+                           in goI (i +# 1#) (goJScalar j4End (goJSimd jStart s''))
+      in (# goI (k +# 1#) s1, () #)
+{-# INLINE rawLUEliminateColumn #-}
+
+-- | Swap elements in columns [fromCol..n-1] between two rows of an n-wide matrix.
+-- Uses DoubleX4# SIMD for the contiguous row data.
+rawSwapRows :: MutableByteArray s -> Int -> Int -> Int -> Int -> Int -> ST s ()
+rawSwapRows (MutableByteArray mba) (I# off) (I# n) (I# row1) (I# row2) (I# fromCol) = ST $ \s0 ->
+  let r1Off = off +# row1 *# n
+      r2Off = off +# row2 *# n
+      jSpan = n -# fromCol
+      j4End = fromCol +# (jSpan -# (jSpan `remInt#` 4#))
+
+      goSimd j s
+        | isTrue# (j >=# j4End) = s
+        | otherwise =
+            case readDoubleArrayAsDoubleX4# mba (r1Off +# j) s of
+              (# s1, v1 #) ->
+                case readDoubleArrayAsDoubleX4# mba (r2Off +# j) s1 of
+                  (# s2, v2 #) ->
+                    case writeDoubleArrayAsDoubleX4# mba (r1Off +# j) v2 s2 of
+                      s3 -> case writeDoubleArrayAsDoubleX4# mba (r2Off +# j) v1 s3 of
+                              s4 -> goSimd (j +# 4#) s4
+
+      goScalar j s
+        | isTrue# (j >=# n) = s
+        | otherwise =
+            case readDoubleArray# mba (r1Off +# j) s of
+              (# s1, v1 #) ->
+                case readDoubleArray# mba (r2Off +# j) s1 of
+                  (# s2, v2 #) ->
+                    case writeDoubleArray# mba (r1Off +# j) v2 s2 of
+                      s3 -> case writeDoubleArray# mba (r2Off +# j) v1 s3 of
+                              s4 -> goScalar (j +# 1#) s4
+
+  in (# goScalar j4End (goSimd fromCol s0), () #)
+{-# INLINE rawSwapRows #-}
+
+-- | Find row with maximum |A[i,k]| for i in [fromRow..n-1].
+-- Returns the row index of the pivot.
+rawPivotSearch :: MutableByteArray s -> Int -> Int -> Int -> Int -> ST s Int
+rawPivotSearch (MutableByteArray mba) (I# off) (I# n) (I# k) (I# fromRow) = ST $ \s0 ->
+  let go i bestIdx bestVal s
+        | isTrue# (i >=# n) = (# s, I# bestIdx #)
+        | otherwise =
+            case readDoubleArray# mba (off +# i *# n +# k) s of
+              (# s', v #) ->
+                let av = if isTrue# (v >=## 0.0##) then v else negateDouble# v
+                in if isTrue# (av >## bestVal)
+                   then go (i +# 1#) i av s'
+                   else go (i +# 1#) bestIdx bestVal s'
+  in case readDoubleArray# mba (off +# fromRow *# n +# k) s0 of
+       (# s1, v0 #) ->
+         let av0 = if isTrue# (v0 >=## 0.0##) then v0 else negateDouble# v0
+         in go (fromRow +# 1#) fromRow av0 s1
+{-# INLINE rawPivotSearch #-}
+
+-- | In-place forward substitution using packed LU matrix (unit lower triangular).
+-- Solves Ly = b where L is stored in the strictly lower part of ba_lu.
+-- The solution overwrites mba_x.
+rawForwardSubUnitPacked :: ByteArray -> Int -> Int -> MutableByteArray s -> Int -> ST s ()
+rawForwardSubUnitPacked (ByteArray ba_lu) (I# off_lu) (I# n)
+                        (MutableByteArray mba_x) (I# off_x) = ST $ \s0 ->
+  let goJ j s
+        | isTrue# (j >=# n) = s
+        | otherwise =
+            case readDoubleArray# mba_x (off_x +# j) s of
+              (# s', xj #) ->
+                let goI i s_
+                      | isTrue# (i >=# n) = s_
+                      | otherwise =
+                          let lij = indexDoubleArray# ba_lu (off_lu +# i *# n +# j)
+                          in case readDoubleArray# mba_x (off_x +# i) s_ of
+                               (# s1, xi #) ->
+                                 case writeDoubleArray# mba_x (off_x +# i) (xi -## lij *## xj) s1 of
+                                   s2 -> goI (i +# 1#) s2
+                in goJ (j +# 1#) (goI (j +# 1#) s')
+  in (# goJ 0# s0, () #)
+{-# INLINE rawForwardSubUnitPacked #-}
+
+-- | In-place back substitution using packed LU matrix (upper triangular).
+-- Solves Ux = y where U is stored in the upper part of ba_lu.
+-- The solution overwrites mba_x.
+rawBackSubPacked :: ByteArray -> Int -> Int -> MutableByteArray s -> Int -> ST s ()
+rawBackSubPacked (ByteArray ba_lu) (I# off_lu) (I# n)
+                 (MutableByteArray mba_x) (I# off_x) = ST $ \s0 ->
+  let goJ j s
+        | isTrue# (j <# 0#) = s
+        | otherwise =
+            -- x[j] /= U[j,j]
+            let ujj = indexDoubleArray# ba_lu (off_lu +# j *# n +# j)
+            in case readDoubleArray# mba_x (off_x +# j) s of
+                 (# s', xj_ #) ->
+                   let xj = xj_ /## ujj
+                   in case writeDoubleArray# mba_x (off_x +# j) xj s' of
+                        s'' ->
+                          -- for i = 0..j-1: x[i] -= U[i,j] * x[j]
+                          let goI i s_
+                                | isTrue# (i >=# j) = s_
+                                | otherwise =
+                                    let uij = indexDoubleArray# ba_lu (off_lu +# i *# n +# j)
+                                    in case readDoubleArray# mba_x (off_x +# i) s_ of
+                                         (# s1, xi #) ->
+                                           case writeDoubleArray# mba_x (off_x +# i) (xi -## uij *## xj) s1 of
+                                             s2 -> goI (i +# 1#) s2
+                          in goJ (j -# 1#) (goI 0# s'')
+  in (# goJ (n -# 1#) s0, () #)
+{-# INLINE rawBackSubPacked #-}
+
+-- --------------------------------------------------------------------------
+-- Cholesky kernels
+-- --------------------------------------------------------------------------
+
+-- | Process one column j of Cholesky factorisation in-place.
+-- For k in [0..j-1]: subtract G[i,k]*G[j,k] from G[i,j] for i in [j..n-1].
+-- Then scale: G[j,j] = sqrt(G[j,j]); G[i,j] /= G[j,j] for i > j.
+rawCholColumn :: MutableByteArray s -> Int -> Int -> Int -> ST s ()
+rawCholColumn (MutableByteArray mba) (I# off) (I# n) (I# j) = ST $ \s0 ->
+  -- Phase 1: subtract contributions from previous columns
+  let goK k s
+        | isTrue# (k >=# j) = s
+        | otherwise =
+            -- Read G[j,k]
+            case readDoubleArray# mba (off +# j *# n +# k) s of
+              (# s', gjk #) ->
+                -- For i in [j..n-1]: G[i,j] -= G[i,k] * gjk
+                let goI i s_
+                      | isTrue# (i >=# n) = s_
+                      | otherwise =
+                          case readDoubleArray# mba (off +# i *# n +# j) s_ of
+                            (# s1, gij #) ->
+                              case readDoubleArray# mba (off +# i *# n +# k) s1 of
+                                (# s2, gik #) ->
+                                  case writeDoubleArray# mba (off +# i *# n +# j) (gij -## gik *## gjk) s2 of
+                                    s3 -> goI (i +# 1#) s3
+                in goK (k +# 1#) (goI j s')
+  in case goK 0# s0 of
+       s1 ->
+         -- Phase 2: scale column
+         case readDoubleArray# mba (off +# j *# n +# j) s1 of
+           (# s2, gjj #) ->
+             let sjj = sqrtDouble# gjj
+             in case writeDoubleArray# mba (off +# j *# n +# j) sjj s2 of
+                  s3 ->
+                    let goScale i s_
+                          | isTrue# (i >=# n) = s_
+                          | otherwise =
+                              case readDoubleArray# mba (off +# i *# n +# j) s_ of
+                                (# s4, gij #) ->
+                                  case writeDoubleArray# mba (off +# i *# n +# j) (gij /## sjj) s4 of
+                                    s5 -> goScale (i +# 1#) s5
+                    in (# goScale (j +# 1#) s3, () #)
+{-# INLINE rawCholColumn #-}
+
+-- | Forward substitution with Cholesky factor G (lower triangular, non-unit diagonal).
+-- Solves Gy = b, overwrites mba_x with y.
+rawForwardSubCholPacked :: ByteArray -> Int -> Int -> MutableByteArray s -> Int -> ST s ()
+rawForwardSubCholPacked (ByteArray ba_g) (I# off_g) (I# n)
+                        (MutableByteArray mba_x) (I# off_x) = ST $ \s0 ->
+  let goJ j s
+        | isTrue# (j >=# n) = s
+        | otherwise =
+            let gjj = indexDoubleArray# ba_g (off_g +# j *# n +# j)
+            in case readDoubleArray# mba_x (off_x +# j) s of
+                 (# s', xj_ #) ->
+                   let xj = xj_ /## gjj
+                   in case writeDoubleArray# mba_x (off_x +# j) xj s' of
+                        s'' ->
+                          let goI i s_
+                                | isTrue# (i >=# n) = s_
+                                | otherwise =
+                                    let gij = indexDoubleArray# ba_g (off_g +# i *# n +# j)
+                                    in case readDoubleArray# mba_x (off_x +# i) s_ of
+                                         (# s1, xi #) ->
+                                           case writeDoubleArray# mba_x (off_x +# i) (xi -## gij *## xj) s1 of
+                                             s2 -> goI (i +# 1#) s2
+                          in goJ (j +# 1#) (goI (j +# 1#) s'')
+  in (# goJ 0# s0, () #)
+{-# INLINE rawForwardSubCholPacked #-}
+
+-- | Back substitution with G^T (upper triangular) WITHOUT forming G^T.
+-- Solves G^T x = y, overwrites mba_x with x.
+-- Uses G^T[i,j] = G[j,i] to read from the lower triangle.
+rawBackSubCholTPacked :: ByteArray -> Int -> Int -> MutableByteArray s -> Int -> ST s ()
+rawBackSubCholTPacked (ByteArray ba_g) (I# off_g) (I# n)
+                      (MutableByteArray mba_x) (I# off_x) = ST $ \s0 ->
+  let goJ j s
+        | isTrue# (j <# 0#) = s
+        | otherwise =
+            -- G^T[j,j] = G[j,j]
+            let gjj = indexDoubleArray# ba_g (off_g +# j *# n +# j)
+            in case readDoubleArray# mba_x (off_x +# j) s of
+                 (# s', xj_ #) ->
+                   let xj = xj_ /## gjj
+                   in case writeDoubleArray# mba_x (off_x +# j) xj s' of
+                        s'' ->
+                          -- for i = 0..j-1: x[i] -= G^T[i,j] * x[j] = G[j,i] * x[j]
+                          let goI i s_
+                                | isTrue# (i >=# j) = s_
+                                | otherwise =
+                                    -- G^T[i,j] = G[j,i]
+                                    let gji = indexDoubleArray# ba_g (off_g +# j *# n +# i)
+                                    in case readDoubleArray# mba_x (off_x +# i) s_ of
+                                         (# s1, xi #) ->
+                                           case writeDoubleArray# mba_x (off_x +# i) (xi -## gji *## xj) s1 of
+                                             s2 -> goI (i +# 1#) s2
+                          in goJ (j -# 1#) (goI 0# s'')
+  in (# goJ (n -# 1#) s0, () #)
+{-# INLINE rawBackSubCholTPacked #-}
+
+-- --------------------------------------------------------------------------
+-- QR mutable kernels
+-- --------------------------------------------------------------------------
+
+-- | Sum of squares of a column slice in a mutable row-major matrix.
+-- Σ A[i,col]² for i in [startRow..endRow-1].
+rawMutSumSqColumn :: MutableByteArray s -> Int -> Int -> Int -> Int -> Int -> ST s Double
+rawMutSumSqColumn (MutableByteArray mba) (I# off) (I# ncols) (I# startRow) (I# endRow) (I# col) = ST $ \s0 ->
+  let go i acc s
+        | isTrue# (i >=# endRow) = (# s, D# acc #)
+        | otherwise =
+            case readDoubleArray# mba (off +# i *# ncols +# col) s of
+              (# s', v #) -> go (i +# 1#) (acc +## v *## v) s'
+  in go startRow 0.0## s0
+{-# INLINE rawMutSumSqColumn #-}
+
+-- | Dot product of two column slices in a mutable row-major matrix.
+-- Σ A[i,col1] * A[i,col2] for i in [startRow..endRow-1].
+rawMutSumProdColumns :: MutableByteArray s -> Int -> Int -> Int -> Int -> Int -> Int -> ST s Double
+rawMutSumProdColumns (MutableByteArray mba) (I# off) (I# ncols) (I# startRow) (I# endRow) (I# col1) (I# col2) = ST $ \s0 ->
+  let go i acc s
+        | isTrue# (i >=# endRow) = (# s, D# acc #)
+        | otherwise =
+            case readDoubleArray# mba (off +# i *# ncols +# col1) s of
+              (# s1, v1 #) ->
+                case readDoubleArray# mba (off +# i *# ncols +# col2) s1 of
+                  (# s2, v2 #) -> go (i +# 1#) (acc +## v1 *## v2) s2
+  in go startRow 0.0## s0
+{-# INLINE rawMutSumProdColumns #-}
+
+-- | Apply Householder reflector stored in column k (rows k+1..endRow-1,
+-- with v[k]=1 implicit) to targetCol of a mutable row-major matrix.
+-- Phase 1: w = beta * (R[k,targetCol] + Σ_{i=k+1}^{endRow-1} v[i]*R[i,targetCol])
+-- Phase 2: R[k,targetCol] -= w; R[i,targetCol] -= v[i]*w
+rawMutHouseholderApply :: MutableByteArray s -> Int -> Int -> Double
+                       -> Int -> Int -> Int -> ST s ()
+rawMutHouseholderApply (MutableByteArray mba) (I# off) (I# ncols) (D# beta)
+                       (I# k) (I# endRow) (I# targetCol) = ST $ \s0 ->
+  -- Phase 1: compute dot product
+  case readDoubleArray# mba (off +# k *# ncols +# targetCol) s0 of
+    (# s1, rkj #) ->
+      let goSum i acc s
+            | isTrue# (i >=# endRow) = (# s, beta *## (rkj +## acc) #)
+            | otherwise =
+                case readDoubleArray# mba (off +# i *# ncols +# k) s of
+                  (# s', vi #) ->
+                    case readDoubleArray# mba (off +# i *# ncols +# targetCol) s' of
+                      (# s'', rij #) -> goSum (i +# 1#) (acc +## vi *## rij) s''
+      in case goSum (k +# 1#) 0.0## s1 of
+           (# s2, w #) ->
+             -- Phase 2: update R[k,targetCol]
+             case writeDoubleArray# mba (off +# k *# ncols +# targetCol) (rkj -## w) s2 of
+               s3 ->
+                 let goUpdate i s
+                       | isTrue# (i >=# endRow) = s
+                       | otherwise =
+                           case readDoubleArray# mba (off +# i *# ncols +# k) s of
+                             (# s', vi #) ->
+                               case readDoubleArray# mba (off +# i *# ncols +# targetCol) s' of
+                                 (# s'', rij #) ->
+                                   case writeDoubleArray# mba (off +# i *# ncols +# targetCol) (rij -## vi *## w) s'' of
+                                     s''' -> goUpdate (i +# 1#) s'''
+                 in (# goUpdate (k +# 1#) s3, () #)
+{-# INLINE rawMutHouseholderApply #-}
+
+-- | Apply stored Householder reflector to one row of Q during accumulation.
+-- v is stored in the subdiagonal of frozen R (column k, rows k+1..endRow-1).
+-- Phase 1: wi = beta * (Q[row,k] + Σ_{l=k+1}^{endRow-1} Q[row,l] * v[l])
+-- Phase 2: Q[row,k] -= wi; Q[row,l] -= wi * v[l]
+rawMutQAccum :: MutableByteArray s -> Int -> Int
+             -> ByteArray -> Int -> Int
+             -> Double -> Int -> Int -> Int -> ST s ()
+rawMutQAccum (MutableByteArray mba_q) (I# off_q) (I# qcols)
+             (ByteArray ba_r) (I# off_r) (I# rcols)
+             (D# beta) (I# k) (I# endRow) (I# row) = ST $ \s0 ->
+  -- Phase 1: compute wi = beta * (Q[row,k] + Σ Q[row,l] * v[l])
+  case readDoubleArray# mba_q (off_q +# row *# qcols +# k) s0 of
+    (# s1, qrk #) ->
+      let goSum l acc s
+            | isTrue# (l >=# endRow) = (# s, beta *## (qrk +## acc) #)
+            | otherwise =
+                let vl = indexDoubleArray# ba_r (off_r +# l *# rcols +# k)
+                in case readDoubleArray# mba_q (off_q +# row *# qcols +# l) s of
+                     (# s', qrl #) -> goSum (l +# 1#) (acc +## qrl *## vl) s'
+      in case goSum (k +# 1#) 0.0## s1 of
+           (# s2, wi #) ->
+             -- Phase 2: Q[row,k] -= wi
+             case writeDoubleArray# mba_q (off_q +# row *# qcols +# k) (qrk -## wi) s2 of
+               s3 ->
+                 let goUpdate l s
+                       | isTrue# (l >=# endRow) = s
+                       | otherwise =
+                           let vl = indexDoubleArray# ba_r (off_r +# l *# rcols +# k)
+                           in case readDoubleArray# mba_q (off_q +# row *# qcols +# l) s of
+                                (# s', qrl #) ->
+                                  case writeDoubleArray# mba_q (off_q +# row *# qcols +# l) (qrl -## wi *## vl) s' of
+                                    s'' -> goUpdate (l +# 1#) s''
+                 in (# goUpdate (k +# 1#) s3, () #)
+{-# INLINE rawMutQAccum #-}
+
+-- --------------------------------------------------------------------------
+-- Eigen mutable kernels
+-- --------------------------------------------------------------------------
+
+-- | Apply Givens rotation to two columns of a mutable matrix.
+-- For each row in [0..nrows-1]:
+--   tmp = c * M[row,col_p] + s * M[row,col_q]
+--   M[row,col_q] = -s * M[row,col_p] + c * M[row,col_q]
+--   M[row,col_p] = tmp
+rawMutApplyGivensColumns :: MutableByteArray s -> Int -> Int
+                         -> Double -> Double -> Int -> Int -> Int -> ST s ()
+rawMutApplyGivensColumns (MutableByteArray mba) (I# off) (I# ncols)
+                         (D# c_) (D# s_) (I# col_p) (I# col_q) (I# nrows) = ST $ \s0 ->
+  let go row s
+        | isTrue# (row >=# nrows) = s
+        | otherwise =
+            let pIdx = off +# row *# ncols +# col_p
+                qIdx = off +# row *# ncols +# col_q
+            in case readDoubleArray# mba pIdx s of
+                 (# s1, mp #) ->
+                   case readDoubleArray# mba qIdx s1 of
+                     (# s2, mq #) ->
+                       let tmp = c_ *## mp +## s_ *## mq
+                           qnew = negateDouble# s_ *## mp +## c_ *## mq
+                       in case writeDoubleArray# mba pIdx tmp s2 of
+                            s3 -> case writeDoubleArray# mba qIdx qnew s3 of
+                                    s4 -> go (row +# 1#) s4
+  in (# go 0# s0, () #)
+{-# INLINE rawMutApplyGivensColumns #-}
 
 -- --------------------------------------------------------------------------
 -- Utilities

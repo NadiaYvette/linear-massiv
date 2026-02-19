@@ -1,4 +1,7 @@
 {-# LANGUAGE AllowAmbiguousTypes #-}
+{-# LANGUAGE MagicHash #-}
+{-# LANGUAGE UnboxedTuples #-}
+{-# LANGUAGE BangPatterns #-}
 
 -- |
 -- Module      : Numeric.LinearAlgebra.Massiv.Orthogonal.QR
@@ -52,20 +55,27 @@
 module Numeric.LinearAlgebra.Massiv.Orthogonal.QR
   ( -- * QR factorisation (Householder)
     qr
+  , qrP
   , qrR
     -- * QR factorisation (Givens)
   , qrGivens
   ) where
 
 import qualified Data.Massiv.Array as M
-import Data.Massiv.Array (Ix1, Ix2(..), Sz(..))
+import Data.Massiv.Array (Ix1, Ix2(..), Sz(..), unwrapByteArray, unwrapByteArrayOffset,
+                          unwrapMutableByteArray, unwrapMutableByteArrayOffset)
 import GHC.TypeNats (KnownNat)
 import Control.Monad.ST (ST)
+import GHC.Exts
+import GHC.ST (ST(..))
+import Data.Primitive.ByteArray (ByteArray(..), MutableByteArray(..))
 
 import Numeric.LinearAlgebra.Massiv.Types
 import Numeric.LinearAlgebra.Massiv.Internal
 import Numeric.LinearAlgebra.Massiv.Orthogonal.Givens
   (givensRotation)
+import Numeric.LinearAlgebra.Massiv.Internal.Kernel
+  (rawMutSumSqColumn, rawMutSumProdColumns, rawMutHouseholderApply, rawMutQAccum)
 
 -- | Full QR factorisation via Householder reflections (GVL4 Algorithm 5.2.1, p. 249).
 --
@@ -172,6 +182,81 @@ qr a =
         if i <= j then M.index' rArr (i :. j) else 0
 
   in (qMat, rClean)
+
+-- | Specialised QR factorisation for @P Double@ using raw ByteArray# primops.
+qrP :: forall m n. (KnownNat m, KnownNat n)
+    => Matrix m n M.P Double -> (Matrix m m M.P Double, Matrix m n M.P Double)
+qrP a =
+  let mm = dimVal @m
+      nn = dimVal @n
+      steps = min mm nn
+
+      -- Phase 1: In-place Householder triangularisation using raw kernels.
+      (betaList, rArr) = M.withMArrayST (unMatrix a) $ \mr -> do
+        let mbaR = unwrapMutableByteArray mr
+            offR = unwrapMutableByteArrayOffset mr
+        betas <- mapM (\k -> do
+          -- Read x0 = R[k,k]
+          x0 <- M.readM mr (k :. k)
+          -- σ = Σ R[i,k]² for i = k+1..m-1 (using raw kernel)
+          sigma <- rawMutSumSqColumn mbaR offR nn (k + 1) mm k
+          if sigma == 0 && x0 >= 0
+            then pure 0
+            else do
+              let mu = sqrt (x0 * x0 + sigma)
+                  v0 = if x0 <= 0 then x0 - mu else -sigma / (x0 + mu)
+                  beta = 2 * v0 * v0 / (sigma + v0 * v0)
+              -- Scale v: v(i) = R(i,k) / v0 for i > k
+              scaleColumn mbaR offR nn (k + 1) mm k (1.0 / v0)
+              -- Set diagonal
+              M.write_ mr (k :. k) mu
+              -- Apply H_k to columns k+1..n-1 using raw kernel
+              mapM_ (\j ->
+                rawMutHouseholderApply mbaR offR nn beta k mm j
+                ) [k+1..nn-1]
+              pure beta
+          ) [0..steps-1]
+        pure betas
+
+      -- Phase 2: Backward accumulation of Q using raw kernels.
+      qMat = createMatrix @m @m @M.P $ \mq -> do
+        -- Initialize Q = I
+        mapM_ (\i -> mapM_ (\j ->
+          M.write_ mq (i :. j) (if i == j then 1 else 0)
+          ) [0..mm-1]) [0..mm-1]
+        let mbaQ = unwrapMutableByteArray mq
+            offQ = unwrapMutableByteArrayOffset mq
+            baR = unwrapByteArray rArr
+            offFR = unwrapByteArrayOffset rArr
+        -- Forward accumulation: Q <- Q·H_0·H_1·…·H_{steps-1}
+        mapM_ (\k -> do
+          let beta_k = betaList !! k
+          if beta_k == 0 then pure ()
+          else
+            mapM_ (\i ->
+              rawMutQAccum mbaQ offQ mm baR offFR nn beta_k k mm i
+              ) [0..mm-1]
+          ) [0..steps-1]
+
+      -- Extract clean R
+      rClean = makeMatrix @m @n @M.P $ \i j ->
+        if i <= j then M.index' rArr (i :. j) else 0
+
+  in (qMat, rClean)
+{-# NOINLINE qrP #-}
+
+-- | Scale elements in a column of a mutable matrix: A[i,col] *= scale for i in [start..end-1].
+scaleColumn :: MutableByteArray s -> Int -> Int -> Int -> Int -> Int -> Double -> ST s ()
+scaleColumn (MutableByteArray mba) (I# off) (I# ncols) (I# start) (I# end) (I# col) (D# scale) = ST $ \s0 ->
+  let go i s
+        | isTrue# (i >=# end) = s
+        | otherwise =
+            case readDoubleArray# mba (off +# i *# ncols +# col) s of
+              (# s', v #) ->
+                case writeDoubleArray# mba (off +# i *# ncols +# col) (v *## scale) s' of
+                  s'' -> go (i +# 1#) s''
+  in (# go start s0, () #)
+{-# INLINE scaleColumn #-}
 
 -- | Helper: Σ R(i,col)² for i=start+1..end-1  (sum of squares below diagonal)
 sumSqRange :: (M.Manifest r e, Num e) => M.MArray s r Ix2 e -> Int -> Int -> Int -> ST s e

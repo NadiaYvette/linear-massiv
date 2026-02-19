@@ -1,4 +1,7 @@
 {-# LANGUAGE AllowAmbiguousTypes #-}
+{-# LANGUAGE MagicHash #-}
+{-# LANGUAGE UnboxedTuples #-}
+{-# LANGUAGE BangPatterns #-}
 
 -- |
 -- Module      : Numeric.LinearAlgebra.Massiv.Eigen.Symmetric
@@ -13,11 +16,12 @@
 module Numeric.LinearAlgebra.Massiv.Eigen.Symmetric
   ( tridiagonalize
   , symmetricEigen
+  , symmetricEigenP
   , jacobiEigen
   ) where
 
 import qualified Data.Massiv.Array as M
-import Data.Massiv.Array (Ix2(..), Ix1)
+import Data.Massiv.Array (Ix2(..), Ix1, unwrapMutableByteArray, unwrapMutableByteArrayOffset)
 import GHC.TypeNats (KnownNat)
 import Control.Monad (when, forM_)
 import Control.Monad.ST (ST)
@@ -25,6 +29,7 @@ import Control.Monad.ST (ST)
 import Numeric.LinearAlgebra.Massiv.Types
 import Numeric.LinearAlgebra.Massiv.Internal
 import Numeric.LinearAlgebra.Massiv.Orthogonal.Givens (givensRotation)
+import Numeric.LinearAlgebra.Massiv.Internal.Kernel (rawMutApplyGivensColumns)
 
 -- | Reduce a symmetric matrix to tridiagonal form (GVL4 Algorithm 8.3.1).
 tridiagonalize :: forall n r e. (KnownNat n, M.Manifest r e, Floating e, Ord e)
@@ -228,6 +233,7 @@ implicitQRStepInPlace md msd mq nn shift lo hi = do
         else pure ()
 
 -- | Apply Givens rotation from the right to Q: Q <- Q · G(ci, ck)
+-- For P Double, uses raw ByteArray# primops; generic fallback otherwise.
 applyGivensRightQ :: (M.Manifest r e, Num e)
                   => M.MArray s r Ix2 e -> e -> e -> Int -> Int -> Int -> ST s ()
 applyGivensRightQ mq c s ci ck nn =
@@ -236,6 +242,93 @@ applyGivensRightQ mq c s ci ck nn =
     qrk <- M.readM mq (row :. ck)
     M.write_ mq (row :. ci) (c * qrc - s * qrk)
     M.write_ mq (row :. ck) (s * qrc + c * qrk)
+
+-- | Specialised Givens rotation for P Double Q matrices using raw primops.
+applyGivensRightQP :: M.MArray s M.P Ix2 Double -> Double -> Double -> Int -> Int -> Int -> ST s ()
+applyGivensRightQP mq c s ci ck nn =
+  let mbaQ = unwrapMutableByteArray mq
+      offQ = unwrapMutableByteArrayOffset mq
+  in rawMutApplyGivensColumns mbaQ offQ nn c s ci ck nn
+
+-- | Specialised symmetric eigenvalue decomposition for @P Double@.
+-- Uses raw ByteArray# primops for the Givens rotation in the QR step.
+symmetricEigenP :: forall n. KnownNat n
+                => Matrix n n M.P Double -> Int -> Double -> (Vector n M.P Double, Matrix n n M.P Double)
+symmetricEigenP a maxIter tol =
+  let nn = dimVal @n
+      (q0, diag_, subdiag) = tridiagonalize a
+      (dArr, qArr) = M.withMArrayST (unMatrix q0) $ \mq -> do
+        md <- M.thawS (unVector diag_)
+        msd <- M.thawS (unVector subdiag)
+        tridiagQRLoopP md msd mq nn maxIter tol
+        dFrozen <- M.freezeS md
+        pure (MkVector dFrozen)
+  in (dArr, MkMatrix qArr)
+{-# NOINLINE symmetricEigenP #-}
+
+-- | P-specialised QR loop using raw Givens.
+tridiagQRLoopP :: M.MArray s M.P Ix1 Double -> M.MArray s M.P Ix1 Double -> M.MArray s M.P Ix2 Double
+               -> Int -> Int -> Double -> ST s ()
+tridiagQRLoopP md msd mq nn maxIter tol = go 0 0 (nn - 1)
+  where
+    go !iter !lo !hi
+      | iter >= maxIter = pure ()
+      | lo >= hi = pure ()
+      | otherwise = do
+          sdhi <- M.readM msd (hi - 1)
+          dhi1 <- M.readM md (hi - 1)
+          dhi  <- M.readM md hi
+          if abs sdhi <= tol * (abs dhi1 + abs dhi)
+            then do M.write_ msd (hi - 1) 0; go iter lo (hi - 1)
+            else do
+              sdlo <- M.readM msd lo
+              dlo  <- M.readM md lo
+              dlo1 <- M.readM md (lo + 1)
+              if abs sdlo <= tol * (abs dlo + abs dlo1)
+                then do M.write_ msd lo 0; go iter (lo + 1) hi
+                else do
+                  split <- findSplit md msd lo hi tol
+                  case split of
+                    Just q -> do
+                      M.write_ msd q 0
+                      go iter lo q
+                      go iter (q + 1) hi
+                    Nothing -> do
+                      let sp1 = sdhi
+                          delta = (dhi1 - dhi) / 2
+                          sgn = if delta >= 0 then 1 else -1
+                          shift = dhi - sp1*sp1 / (delta + sgn * sqrt (delta*delta + sp1*sp1))
+                      implicitQRStepInPlaceP md msd mq nn shift lo hi
+                      go (iter + 1) lo hi
+
+-- | P-specialised implicit QR step using raw Givens.
+implicitQRStepInPlaceP :: M.MArray s M.P Ix1 Double -> M.MArray s M.P Ix1 Double -> M.MArray s M.P Ix2 Double
+                       -> Int -> Double -> Int -> Int -> ST s ()
+implicitQRStepInPlaceP md msd mq nn shift lo hi = do
+  dlo <- M.readM md lo
+  sdlo <- M.readM msd lo
+  chase lo (dlo - shift) sdlo
+  where
+    chase k x z = do
+      let (c, s) = givensRotation x z
+      when (k > lo) $
+        M.write_ msd (k-1) (c * x - s * z)
+      dk  <- M.readM md k
+      ek  <- M.readM msd k
+      dk1 <- M.readM md (k+1)
+      M.write_ md k     (c*c*dk - 2*c*s*ek + s*s*dk1)
+      M.write_ md (k+1) (s*s*dk + 2*c*s*ek + c*c*dk1)
+      M.write_ msd k    (c*s*(dk - dk1) + (c*c - s*s)*ek)
+      -- Use raw primop Givens instead of generic version
+      applyGivensRightQP mq c s k (k+1) nn
+      if k + 1 < hi
+        then do
+          ek1 <- M.readM msd (k+1)
+          let z' = -s * ek1
+          M.write_ msd (k+1) (c * ek1)
+          ek_new <- M.readM msd k
+          chase (k+1) ek_new z'
+        else pure ()
 
 -- | Classical Jacobi eigenvalue method (GVL4 Section 8.5).
 jacobiEigen :: forall n r e. (KnownNat n, M.Manifest r e, Floating e, Ord e)

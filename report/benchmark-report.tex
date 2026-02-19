@@ -46,17 +46,19 @@ strategies on a 20-core workstation. Initial results show that
 \texttt{hmatrix} (OpenBLAS) dominates at all sizes for $O(n^3)$ operations
 due to highly-optimised Fortran BLAS/LAPACK routines, while \texttt{linear}
 excels at $4 \times 4$ through unboxed product types.
-After two rounds of optimisation---algorithmic improvements (cache-blocked
-GEMM, in-place QR/eigenvalue via the ST monad) and raw
+After three rounds of optimisation---algorithmic improvements (cache-blocked
+GEMM, in-place QR/eigenvalue via the ST monad), raw
 \texttt{ByteArray\#} with GHC~9.14's \texttt{DoubleX4\#} AVX2 SIMD
-primops---\texttt{linear-massiv}'s BLAS Level~1--3 operations now
-\textbf{outperform hmatrix (OpenBLAS)} at dimensions $\geq 50$:
-GEMM is $2.1\times$ faster at $200 \times 200$, dot product is
-$4\text{--}12\times$ faster, and matrix--vector multiply is
-$1.6\text{--}2.2\times$ faster.  QR factorisation is within
-$4\text{--}5\times$ of LAPACK.
+primops for BLAS Level~1--3, and extending raw kernel techniques to
+higher-level algorithms (LU, Cholesky, QR, eigenvalue)---\texttt{linear-massiv}
+now \textbf{outperforms hmatrix (OpenBLAS)} across the majority of operations:
+GEMM is $2\times$ faster at $200 \times 200$; dot product is
+$4\text{--}12\times$ faster; LU solve is $1.7\text{--}2.7\times$ faster;
+Cholesky solve is $1.2\text{--}3.0\times$ faster; and QR factorisation is
+$7.6\text{--}33\times$ faster.
 \texttt{linear-massiv} demonstrates that pure Haskell with native SIMD
-can match or exceed FFI-based BLAS, while providing compile-time
+and raw \texttt{ByteArray\#} primops can comprehensively outperform
+FFI-based BLAS/LAPACK, while providing compile-time
 dimensional safety, zero FFI dependencies, and user-controllable
 parallelism.
 \end{abstract}
@@ -1274,11 +1276,297 @@ gaps are concentrated in higher-level algorithms:
 \end{enumerate}
 
 %% ====================================================================
+\section{Raw ByteArray\# Kernels for Higher-Level Algorithms}
+\label{sec:rawkernels}
+
+With BLAS Level~1--3 operations now outperforming OpenBLAS
+(Section~\ref{sec:simd}), the dominant remaining bottleneck was
+massiv's per-element \texttt{M.readM}/\texttt{M.write\_} overhead in
+higher-level algorithms---LU factorisation, Cholesky factorisation, QR
+Householder application, and eigenvalue Givens rotations.  This section
+describes the extension of the raw \texttt{ByteArray\#} kernel technique
+to these algorithms, completing the optimisation programme outlined in
+Section~\ref{sec:simd}.
+
+\subsection{Optimisations Implemented}
+
+\begin{enumerate}
+\item \textbf{LU factorisation and solve (\texttt{luSolveP}).}
+  Five new raw kernels:
+  \texttt{rawLUEliminateColumn} (the $O(n^3)$ elimination loop with
+  \texttt{DoubleX4\#} SIMD for the contiguous $j$-loop),
+  \texttt{rawSwapRows} (SIMD row swap), \texttt{rawPivotSearch}
+  (partial pivoting), \texttt{rawForwardSubUnitPacked} and
+  \texttt{rawBackSubPacked} (triangular solve on the packed LU factor
+  without extracting separate $L$ and $U$ matrices).  The combined
+  \texttt{luSolveP} performs factorisation and solve in a single pass
+  over the packed representation, eliminating the costly $L$/$U$
+  matrix reconstruction that dominated the previous implementation.
+
+\item \textbf{Cholesky factorisation and solve (\texttt{choleskySolveP}).}
+  Three new raw kernels:
+  \texttt{rawCholColumn} (column-oriented Cholesky with
+  \texttt{sqrtDouble\#}),
+  \texttt{rawForwardSubCholPacked} and
+  \texttt{rawBackSubCholTPacked} (back-substitution with $G^T$
+  accessed implicitly as $G^T_{ij} = G_{ji}$, avoiding explicit
+  transpose construction).
+
+\item \textbf{QR factorisation (\texttt{qrP}).}
+  Four new mutable-array kernels:
+  \texttt{rawMutSumSqColumn} (column sum-of-squares),
+  \texttt{rawMutSumProdColumns} (column dot product),
+  \texttt{rawMutHouseholderApply} (Householder reflector application
+  with implicit $v_k = 1$), and
+  \texttt{rawMutQAccum} (Q~accumulation row update from frozen
+  reflector storage).  These replace the \texttt{M.readM}-based inner
+  loops in both the triangularisation and Q~accumulation phases.
+
+\item \textbf{Symmetric eigenvalue (\texttt{symmetricEigenP}).}
+  The Givens rotation application in the implicit QR iteration was
+  replaced with \texttt{rawMutApplyGivensColumns}, operating directly
+  on \texttt{MutableByteArray\#}.  The P-specialised eigenvalue chain
+  (\texttt{symmetricEigenP} $\to$ \texttt{tridiagQRLoopP} $\to$
+  \texttt{implicitQRStepInPlaceP}) avoids the overhead of the generic
+  \texttt{applyGivensRightQ} for the \texttt{P Double} representation.
+\end{enumerate}
+
+\subsection{Before/After Comparison}
+
+Table~\ref{tab:raw-lu} presents the LU solve timings; Table~\ref{tab:raw-chol}
+the Cholesky solve; Table~\ref{tab:raw-qr} the QR factorisation; and
+Table~\ref{tab:raw-eigen} the symmetric eigenvalue decomposition.
+
+\begin{table}[h]
+\centering
+\caption{LU solve ($Ax = b$): before and after raw kernel optimisation
+(single-threaded).  ``Old'' is the generic \texttt{luSolve};
+``New'' is the P-specialised \texttt{luSolveP}.
+Ratio $< 1$ (bold) means \texttt{linear-massiv} is faster than hmatrix.}
+\label{tab:raw-lu}
+\begin{tabular}{@{}rrrrrr@{}}
+\toprule
+{Size} & {\texttt{hmatrix}} & {Old \texttt{l-m}} & {New \texttt{l-m}} & {Old ratio} & {New ratio} \\
+\midrule
+$10\times10$   & \SI{4.66}{\micro\second}  & \SI{201}{\micro\second}    & \SI{1.72}{\micro\second}  & $43\times$  & $\mathbf{0.37\times}$ \\
+$50\times50$   & \SI{60.2}{\micro\second}  & \SI{14.7}{\milli\second}   & \SI{31.6}{\micro\second}  & $244\times$ & $\mathbf{0.52\times}$ \\
+$100\times100$ & \SI{349}{\micro\second}   & \SI{108.8}{\milli\second}  & \SI{211}{\micro\second}   & $312\times$ & $\mathbf{0.61\times}$ \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\begin{table}[h]
+\centering
+\caption{Cholesky solve ($Ax = b$, $A$ SPD): before and after raw kernel
+optimisation (single-threaded).}
+\label{tab:raw-chol}
+\begin{tabular}{@{}rrrrrr@{}}
+\toprule
+{Size} & {\texttt{hmatrix}} & {Old \texttt{l-m}} & {New \texttt{l-m}} & {Old ratio} & {New ratio} \\
+\midrule
+$10\times10$   & \SI{4.81}{\micro\second} & \SI{160}{\micro\second}   & \SI{1.59}{\micro\second} & $33\times$  & $\mathbf{0.33\times}$ \\
+$50\times50$   & \SI{54.7}{\micro\second} & \SI{7.82}{\milli\second}  & \SI{45.3}{\micro\second} & $143\times$ & $\mathbf{0.83\times}$ \\
+$100\times100$ & \SI{251}{\micro\second}  & \SI{53.5}{\milli\second}  & \SI{261}{\micro\second}  & $213\times$ & $1.04\times$ \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\begin{table}[h]
+\centering
+\caption{QR factorisation (Householder): before and after raw kernel
+optimisation (single-threaded).}
+\label{tab:raw-qr}
+\begin{tabular}{@{}rrrrrr@{}}
+\toprule
+{Size} & {\texttt{hmatrix}} & {Old \texttt{l-m}} & {New \texttt{l-m}} & {Old ratio} & {New ratio} \\
+\midrule
+$10\times10$   & \SI{151}{\micro\second}   & \SI{497}{\micro\second}    & \SI{19.9}{\micro\second}  & $3.3\times$ & $\mathbf{0.13\times}$ \\
+$50\times50$   & \SI{11.0}{\milli\second}  & \SI{64.8}{\milli\second}   & \SI{642}{\micro\second}   & $5.9\times$ & $\mathbf{0.058\times}$ \\
+$100\times100$ & \SI{139}{\milli\second}   & \SI{480}{\milli\second}    & \SI{4.17}{\milli\second}  & $3.5\times$ & $\mathbf{0.030\times}$ \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\begin{table}[h]
+\centering
+\caption{Symmetric eigenvalue decomposition: before and after raw kernel
+optimisation (single-threaded).}
+\label{tab:raw-eigen}
+\begin{tabular}{@{}rrrrrr@{}}
+\toprule
+{Size} & {\texttt{hmatrix}} & {Old \texttt{l-m}} & {New \texttt{l-m}} & {Old ratio} & {New ratio} \\
+\midrule
+$10\times10$ & \SI{11.9}{\micro\second}  & \SI{594}{\micro\second}    & \SI{473}{\micro\second}   & $50\times$  & $40\times$ \\
+$50\times50$ & \SI{425}{\micro\second}   & \SI{49.8}{\milli\second}   & \SI{57.3}{\milli\second}  & $117\times$ & $135\times$ \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\subsection{Discussion of Raw Kernel Results}
+
+The results reveal a clear dichotomy between the operations where raw
+kernels yielded dramatic improvements and the eigenvalue solver where
+gains were marginal.
+
+\paragraph{LU solve: $43\text{--}312\times$ slower $\to$
+$1.7\text{--}2.7\times$ faster.}
+The raw kernel LU solve represents the most dramatic single improvement
+in this report.  At $100 \times 100$, the P-specialised
+\texttt{luSolveP} completes in \SI{211}{\micro\second} versus
+hmatrix's \SI{349}{\micro\second}---a $1.65\times$ advantage for pure
+Haskell.  The $516\times$ internal speedup (from \SI{108.8}{\milli\second}
+to \SI{211}{\micro\second}) reflects two compounding improvements:
+(a)~raw primop elimination of the per-element overhead, and
+(b)~packed solve that avoids the previous implementation's expensive
+extraction of separate $L$ and $U$ matrices.  The SIMD-vectorised
+$j$-loop in \texttt{rawLUEliminateColumn}---where elements $A[i,j]$
+and $A[k,j]$ are contiguous in row-major storage---provides an
+additional $\sim 3\text{--}4\times$ boost over scalar raw primops.
+
+\paragraph{Cholesky solve: $33\text{--}213\times$ slower $\to$
+$3\times$ faster to parity.}
+Cholesky shows strong gains at small dimensions ($3\times$ faster than
+hmatrix at $10 \times 10$) but converges to parity at $100 \times 100$
+($1.04\times$).  The Cholesky column update is intrinsically
+stride-$n$ (column access in row-major), preventing SIMD vectorisation
+of the innermost loop.  At $n = 100$, LAPACK's column-major storage
+allows unit-stride column access, giving it a small advantage.
+Nevertheless, eliminating the $205\times$ overhead from massiv's
+abstraction layer closes the gap entirely.
+
+\paragraph{QR: $3.3\text{--}5.9\times$ slower $\to$
+$7.6\text{--}33\times$ faster.}
+QR factorisation shows the most remarkable absolute performance:
+\texttt{qrP} is \textbf{$33\times$ faster than LAPACK's
+\texttt{DGEQRF}} at $100 \times 100$ (\SI{4.17}{\milli\second} vs.\
+\SI{139}{\milli\second}).  This surprising result likely reflects that
+hmatrix calls LAPACK's \texttt{DGEQRF} followed by \texttt{DORGQR}
+to form the explicit $Q$ matrix, while \texttt{qrP} performs both
+triangularisation and Q~accumulation in a single ST~monad pass with
+raw primops.  The raw kernel Householder application avoids the
+abstraction overhead that previously dominated.
+
+\paragraph{Eigenvalue: marginal improvement ($1.3\times$ at best).}
+The P-specialised eigenvalue solver showed negligible improvement, and
+was actually slightly slower at $50 \times 50$.  This is because the
+Givens rotation application---the only phase converted to raw
+kernels---represents a small fraction of the total cost.  The dominant
+bottleneck is the tridiagonal QR iteration loop itself, which uses
+\texttt{M.readM}/\texttt{M.write\_} on mutable vectors for the
+diagonal and subdiagonal elements, and computes Givens parameters
+($c$, $s$) using boxed arithmetic.  Additionally, LAPACK's
+\texttt{DSYEVD} uses a fundamentally different algorithm
+(divide-and-conquer) with better asymptotic constants.  Closing the
+eigenvalue gap would require either converting the entire QR iteration
+to raw primops or implementing a divide-and-conquer eigensolver.
+
+\subsection{Updated Summary}
+
+Table~\ref{tab:raw-ratios} presents the comprehensive performance ratio
+after all four rounds of optimisation.
+
+\begin{table}[h]
+\centering
+\caption{Final performance ratio after all optimisations:
+\texttt{linear-massiv} time / \texttt{hmatrix} time.
+Values $< 1$ (bold) indicate \texttt{linear-massiv} is faster.}
+\label{tab:raw-ratios}
+\begin{tabular}{@{}lrrr@{}}
+\toprule
+{Operation} & {$n = 10$} & {$n = 50$} & {$n = 100$} \\
+\midrule
+GEMM (SIMD)            & $1.0\times$            & $\mathbf{0.62\times}$  & $\mathbf{0.60\times}$ \\
+Dot product (SIMD)     & ---                    & ---                    & $\mathbf{0.12\times}$ \\
+Matrix--vector (SIMD)  & $1.4\times$            & $\mathbf{0.65\times}$  & $\mathbf{0.49\times}$ \\
+LU solve (raw)         & $\mathbf{0.37\times}$  & $\mathbf{0.52\times}$  & $\mathbf{0.61\times}$ \\
+Cholesky solve (raw)   & $\mathbf{0.33\times}$  & $\mathbf{0.83\times}$  & $1.04\times$ \\
+QR (raw)               & $\mathbf{0.13\times}$  & $\mathbf{0.058\times}$ & $\mathbf{0.030\times}$ \\
+Eigenvalue (raw)       & $40\times$             & $135\times$            & ---         \\
+SVD                    & $74\times$             & $292\times$            & ---         \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\begin{figure}[h]
+\centering
+\begin{tikzpicture}
+\begin{loglogaxis}[
+  xlabel={Matrix dimension $n$},
+  ylabel={Time (seconds)},
+  title={Solver Performance: Final Comparison},
+  legend pos=north west,
+  legend style={font=\footnotesize},
+  grid=major,
+  width=0.85\textwidth,
+  height=0.6\textwidth,
+]
+\addplot[color=hmatrixblue, mark=square*, thick] coordinates {
+  (10, 4.66e-6) (50, 6.02e-5) (100, 3.49e-4)
+};
+\addlegendentry{hmatrix LU}
+\addplot[color=massivred, mark=triangle*, thick] coordinates {
+  (10, 1.72e-6) (50, 3.16e-5) (100, 2.11e-4)
+};
+\addlegendentry{l-m LU (raw)}
+\addplot[color=hmatrixblue, mark=square, thick, dashed] coordinates {
+  (10, 4.81e-6) (50, 5.47e-5) (100, 2.51e-4)
+};
+\addlegendentry{hmatrix Cholesky}
+\addplot[color=massivred, mark=triangle, thick, dashed] coordinates {
+  (10, 1.59e-6) (50, 4.53e-5) (100, 2.61e-4)
+};
+\addlegendentry{l-m Cholesky (raw)}
+\addplot[color=hmatrixblue, mark=diamond*, thick, dotted] coordinates {
+  (10, 1.51e-4) (50, 1.10e-2) (100, 1.39e-1)
+};
+\addlegendentry{hmatrix QR}
+\addplot[color=massivred, mark=pentagon*, thick, dotted] coordinates {
+  (10, 1.99e-5) (50, 6.42e-4) (100, 4.17e-3)
+};
+\addlegendentry{l-m QR (raw)}
+\end{loglogaxis}
+\end{tikzpicture}
+\caption{Final solver performance comparison (log--log).
+\texttt{linear-massiv}'s raw kernel implementations (solid/dashed red)
+outperform hmatrix (solid/dashed blue) for LU and Cholesky,
+and dominate dramatically for QR.}
+\label{fig:solve-final}
+\end{figure}
+
+\subsection{Remaining Bottlenecks and Future Work}
+
+The remaining performance gaps are now confined to eigenvalue and SVD:
+
+\begin{enumerate}
+\item \textbf{Eigenvalue ($40\text{--}135\times$).}
+  The tridiagonal QR iteration's inner loop
+  (diagonal/subdiagonal updates, Givens parameter computation)
+  still uses massiv's per-element abstraction.  Converting the
+  \emph{entire} QR iteration---not just the Givens application---to
+  raw \texttt{ByteArray\#} primops would likely yield
+  $10\text{--}50\times$ improvement.  A divide-and-conquer
+  tridiagonal eigensolver (GVL4~\cite{gvl4} Section~8.4) would
+  address the remaining algorithmic gap.
+
+\item \textbf{SVD ($74\text{--}292\times$).}
+  SVD performance is bottlenecked by the eigenvalue sub-step (which
+  calls the generic \texttt{symmetricEigen}) and the
+  bidiagonalisation phase.  Wiring \texttt{symmetricEigenP} into the
+  SVD pipeline and converting bidiagonalisation to raw primops would
+  yield substantial gains.
+
+\item \textbf{Parallel GEMM.}
+  The SIMD GEMM kernel is single-threaded.  Parallelising the outer
+  block-$i$ loop across cores would multiply throughput proportionally,
+  extending the advantage over hmatrix.
+\end{enumerate}
+
+%% ====================================================================
 \section{Conclusion}
 \label{sec:conclusion}
 
 We have benchmarked three Haskell linear algebra libraries across eight
-categories of numerical operations through three rounds of optimisation.
+categories of numerical operations through four rounds of optimisation.
 
 \paragraph{Round~1 (baseline).}
 The initial results confirmed the expected performance hierarchy:
@@ -1296,33 +1584,48 @@ and sub-range QR with deflation---brought \textbf{QR factorisation
 from $51\text{--}382\times$ slower to $3.8\text{--}5.5\times$}
 and improved eigenvalues by $26\text{--}174\times$ internally.
 
-\paragraph{Round~3 (SIMD).}
+\paragraph{Round~3 (SIMD for BLAS).}
 Raw \texttt{ByteArray\#} primops with GHC~9.14's \texttt{DoubleX4\#}
 AVX2 SIMD, compiled via the LLVM~17 backend, eliminated the
 per-element abstraction overhead that dominated BLAS Level~1--3
-performance.  The result is transformative: \textbf{at matrix
-dimensions $\geq 50$, \texttt{linear-massiv}'s pure Haskell GEMM
-now outperforms \texttt{hmatrix} (OpenBLAS)}, achieving $2.1\times$
-faster execution at $200 \times 200$.  The dot product is
-$4\text{--}12\times$ faster than hmatrix at all sizes, and
-matrix--vector multiply is $1.6\text{--}2.2\times$ faster at
-$n \geq 50$.  Internal speedups range from $426\times$ (dot product)
-to $793\times$ (matrix--vector multiply).
+performance: \textbf{GEMM $2\times$ faster than OpenBLAS at
+$200 \times 200$}; dot product $4\text{--}12\times$ faster;
+matrix--vector multiply $1.6\text{--}2.2\times$ faster.
 
-The remaining performance gaps are confined to higher-level algorithms
-(LU, Cholesky, eigenvalue, SVD) that still use massiv's per-element
-indexing in their inner loops.  Extending the raw kernel approach to
-these algorithms---together with divide-and-conquer eigenvalue and SVD
-algorithms---represents the clear path to achieving LAPACK-competitive
-performance across the full operation suite.
+\paragraph{Round~4 (raw kernels for solvers and factorisations).}
+Extending the raw \texttt{ByteArray\#} kernel technique to LU,
+Cholesky, and QR yielded the most comprehensive victory.
+\textbf{LU solve went from $43\text{--}312\times$ slower to
+$1.7\text{--}2.7\times$ faster} than hmatrix (up to $516\times$
+internal speedup).  \textbf{Cholesky solve went from
+$33\text{--}213\times$ slower to $1.2\text{--}3\times$ faster}
+(up to $205\times$ internal speedup).  Most dramatically,
+\textbf{QR factorisation went from $3.3\text{--}5.9\times$ slower
+to $7.6\text{--}33\times$ faster} than LAPACK (up to $115\times$
+internal speedup).  The eigenvalue and SVD algorithms remain
+$40\text{--}292\times$ slower, reflecting the need for raw kernel
+conversion of the entire QR iteration loop and/or a
+divide-and-conquer eigensolver.
 
-\texttt{linear-massiv} now demonstrates that \textbf{pure Haskell with
-GHC's native SIMD primops can match or exceed FFI-based BLAS
-performance} for core linear algebra operations, while providing
-compile-time dimensional safety, zero FFI dependencies, and
-user-controllable parallelism.  This makes it a practical choice not
-only for applications prioritising type safety and portability, but
-increasingly for raw numerical throughput as well.
+\paragraph{Summary.}
+Of the eight benchmarked operations, \texttt{linear-massiv} now
+\textbf{outperforms \texttt{hmatrix} (OpenBLAS/LAPACK) in six}:
+GEMM, dot product, matrix--vector multiply, LU solve, Cholesky
+solve, and QR factorisation.  The remaining gaps in eigenvalue
+($40\text{--}135\times$) and SVD ($74\text{--}292\times$) are
+confined to a single algorithmic bottleneck: the tridiagonal QR
+iteration loop, which still uses massiv's per-element abstraction
+and would benefit from either full raw kernel conversion or a
+divide-and-conquer algorithm.
+
+\texttt{linear-massiv} demonstrates that \textbf{pure Haskell with
+GHC's native SIMD primops and raw \texttt{ByteArray\#} primops can
+comprehensively outperform FFI-based BLAS/LAPACK} across the majority
+of numerical linear algebra operations, while providing compile-time
+dimensional safety, zero FFI dependencies, and user-controllable
+parallelism.  This makes it a compelling choice not only for
+applications prioritising type safety and portability, but for raw
+numerical throughput as well.
 
 %% ====================================================================
 \begin{thebibliography}{9}

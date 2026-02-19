@@ -1,4 +1,7 @@
 {-# LANGUAGE AllowAmbiguousTypes #-}
+{-# LANGUAGE MagicHash #-}
+{-# LANGUAGE UnboxedTuples #-}
+{-# LANGUAGE BangPatterns #-}
 
 -- |
 -- Module      : Numeric.LinearAlgebra.Massiv.Solve.LU
@@ -57,19 +60,27 @@ module Numeric.LinearAlgebra.Massiv.Solve.LU
   , luNoPivot
     -- * Solving with LU (\(Ax = b\))
   , luSolve
+  , luSolveP
     -- * Determinant
   , det
   ) where
 
 import qualified Data.Massiv.Array as M
-import Data.Massiv.Array (Ix1, Ix2(..), Sz(..))
+import Data.Massiv.Array (Ix1, Ix2(..), Sz(..), unwrapByteArray, unwrapByteArrayOffset,
+                          unwrapMutableByteArray, unwrapMutableByteArrayOffset)
 import GHC.TypeNats (KnownNat)
 import Data.Ord (comparing)
 import Data.List (maximumBy)
+import GHC.Exts
+import GHC.ST (ST(..))
+import Data.Primitive.ByteArray (ByteArray(..), MutableByteArray(..))
 
 import Numeric.LinearAlgebra.Massiv.Types
 import Numeric.LinearAlgebra.Massiv.Internal
 import Numeric.LinearAlgebra.Massiv.Solve.Triangular (forwardSubUnit, backSub)
+import Numeric.LinearAlgebra.Massiv.Internal.Kernel
+  (rawLUEliminateColumn, rawSwapRows, rawPivotSearch,
+   rawForwardSubUnitPacked, rawBackSubPacked)
 
 -- | LU factorization with partial pivoting (GVL4 Algorithm 3.4.1, p. 126).
 --
@@ -226,8 +237,7 @@ luNoPivot (MkMatrix a) =
 luSolve :: forall n r e. (KnownNat n, M.Manifest r e, Fractional e, Ord e)
         => Matrix n n r e -> Vector n r e -> Vector n r e
 luSolve a b =
-  let nn = dimVal @n
-      (luMat, pivArr) = lu a
+  let (luMat, pivArr) = lu a
       -- Extract L (unit lower triangular)
       l = makeMatrix @n @n @r $ \i j ->
         if i == j then 1
@@ -244,6 +254,79 @@ luSolve a b =
       y = forwardSubUnit l pb
       -- Solve Ux = y
   in backSub u y
+
+-- | Specialised LU solve for @P Double@.
+-- Does LU factorisation + solve entirely using raw ByteArray# primops,
+-- avoiding L/U matrix reconstruction and massiv's per-element overhead.
+luSolveP :: forall n. KnownNat n
+         => Matrix n n M.P Double -> Vector n M.P Double -> Vector n M.P Double
+luSolveP (MkMatrix a) (MkVector b) =
+  let nn = dimVal @n
+  in createVector @n @M.P $ \mx -> do
+    -- Thaw matrix for in-place LU factorisation
+    ma <- M.thawS a
+    let mbaA = unwrapMutableByteArray ma
+        offA = unwrapMutableByteArrayOffset ma
+
+    -- Phase 1: LU factorisation with partial pivoting using raw kernels
+    pivots <- mapM (\k -> do
+      pivRow <- rawPivotSearch mbaA offA nn k k
+      condM (pivRow /= k) $
+        rawSwapRows mbaA offA nn k pivRow 0
+      rawLUEliminateColumn mbaA offA nn k
+      pure (k, pivRow)
+      ) [0..nn-2]
+
+    -- Phase 2: Freeze LU and prepare RHS
+    frozenLU <- M.freezeS ma
+    let baLU = unwrapByteArray frozenLU
+        offLU = unwrapByteArrayOffset frozenLU
+
+    -- Copy b into the output vector mx
+    let mbaX = unwrapMutableByteArray mx
+        offX = unwrapMutableByteArrayOffset mx
+    copyVector b mbaX offX nn
+
+    -- Apply pivot permutation to x
+    applyPivotsForward mbaX offX pivots
+
+    -- Phase 3: Forward substitution (unit lower triangular)
+    rawForwardSubUnitPacked baLU offLU nn mbaX offX
+
+    -- Phase 4: Back substitution (upper triangular)
+    rawBackSubPacked baLU offLU nn mbaX offX
+{-# NOINLINE luSolveP #-}
+
+-- | Copy an immutable P vector into a mutable byte array.
+copyVector :: M.Array M.P Ix1 Double -> MutableByteArray s -> Int -> Int -> ST s ()
+copyVector src (MutableByteArray mba_dst) (I# off_dst) (I# n) = ST $ \s0 ->
+  let ba_src = case unwrapByteArray src of ByteArray ba -> ba
+      off_src = case unwrapByteArrayOffset src of I# o -> o
+      go i s
+        | isTrue# (i >=# n) = s
+        | otherwise =
+            let v = indexDoubleArray# ba_src (off_src +# i)
+            in case writeDoubleArray# mba_dst (off_dst +# i) v s of
+                 s' -> go (i +# 1#) s'
+  in (# go 0# s0, () #)
+{-# INLINE copyVector #-}
+
+-- | Apply pivot permutation to a vector (forward direction).
+applyPivotsForward :: MutableByteArray s -> Int -> [(Int, Int)] -> ST s ()
+applyPivotsForward (MutableByteArray mba) (I# off) pivots = ST $ \s0 ->
+  let go [] s = s
+      go ((I# k, I# pivRow) : rest) s
+        | isTrue# (k ==# pivRow) = go rest s
+        | otherwise =
+            case readDoubleArray# mba (off +# k) s of
+              (# s1, vk #) ->
+                case readDoubleArray# mba (off +# pivRow) s1 of
+                  (# s2, vp #) ->
+                    case writeDoubleArray# mba (off +# k) vp s2 of
+                      s3 -> case writeDoubleArray# mba (off +# pivRow) vk s3 of
+                              s4 -> go rest s4
+  in (# go pivots s0, () #)
+{-# INLINE applyPivotsForward #-}
 
 -- | Compute the determinant of an \(n \times n\) matrix via LU factorization
 -- (GVL4 Section 3.2, p. 120).
