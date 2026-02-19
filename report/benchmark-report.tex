@@ -585,6 +585,200 @@ arises from several compounding factors:
   step) and iterative eigensolvers, this dominates runtime.
 \end{enumerate}
 
+\subsection{Proposals for Closing the Performance Gap}
+\label{sec:remedies}
+
+The factors above suggest a concrete sequence of optimisation work,
+ordered roughly by expected impact and feasibility.
+
+\subsubsection{In-place Factorisation via the ST Monad}
+\label{sec:remedy-inplace}
+
+The single largest source of overhead in the QR, eigenvalue, and SVD
+routines is the allocation of a fresh \texttt{Matrix} at every
+iteration step.  Currently, each Householder reflection in the QR
+factorisation calls \texttt{applyHouseholderLeftRect} and
+\texttt{applyHouseholderRightQ}, both of which invoke
+\texttt{makeMatrix} to reconstruct the entire $m \times n$ (or
+$m \times m$) result.  Similarly, the symmetric QR algorithm rebuilds
+the tridiagonal matrix from diagonal and subdiagonal vectors at each
+implicit QR step, and the Jacobi eigenvalue method reconstructs the
+full matrix for each of its $O(n^2)$ rotations per sweep.
+
+The remedy is straightforward: the LU solver (\texttt{luFactor}) already
+demonstrates the pattern.  It wraps the input in
+\texttt{M.withMArrayST}, allocates a mutable pivot vector via
+\texttt{M.newMArray}, and performs all elimination steps in the
+\texttt{ST}~monad using \texttt{M.readM} / \texttt{M.write\_}---with
+zero intermediate allocation.  Applying the same technique to
+Householder QR, the tridiagonal QR iteration, and the Jacobi method
+would:
+
+\begin{itemize}
+\item Reduce the $n$ Householder steps of QR from $n$ full-matrix
+  allocations to a single mutable copy of $R$ plus an accumulated $Q$,
+  both updated in-place.  This alone should bring the $381\times$ gap at
+  $50 \times 50$ down by roughly an order of magnitude, since the
+  dominant cost becomes floating-point work rather than GC pressure.
+
+\item Eliminate the per-iteration matrix reconstruction in the symmetric
+  QR algorithm.  LAPACK's \texttt{DSYEV} stores only the diagonal and
+  subdiagonal as mutable vectors and applies Givens rotations in-place;
+  the same approach in Haskell's \texttt{ST} monad would remove the
+  $O(n^2)$ allocation at each of the $O(n)$ iterations.
+
+\item Reduce the Jacobi method's cost from $O(n^2)$ matrix copies per
+  sweep to $O(n^2)$ element-level reads and writes per sweep---a factor
+  of $\sim n^2$ fewer allocations.
+\end{itemize}
+
+\subsubsection{Implicit Householder Representation (Compact WY)}
+\label{sec:remedy-wy}
+
+The current QR implementation forms the explicit $Q$ matrix by
+accumulating each Householder reflector $H_k = I - 2 v_k v_k^T$
+into a running product.  LAPACK instead stores the reflector vectors
+$v_1, \ldots, v_n$ and, when the full $Q$ is needed, applies them in
+reverse order (or uses the compact WY representation
+$Q = I - V T V^T$, GVL4~\cite{gvl4} Section~5.1.6).
+
+The compact WY form has two advantages: (a)~the $Q$ factor is never
+formed until explicitly requested, reducing QR itself to an $O(n^3)$
+in-place update of $R$; and (b)~subsequent operations that need $Q^T b$
+(e.g.\ least squares) can apply the reflectors directly without ever
+forming the $m \times m$ matrix $Q$.  This would transform QR from a
+bottleneck ($381\times$ gap) into a routine on par with LU solve
+($\sim 200\text{--}300\times$), and further in-place optimisation
+(Section~\ref{sec:remedy-inplace}) would close the gap still further.
+
+\subsubsection{Cache-Blocked GEMM}
+\label{sec:remedy-blocking}
+
+The current GEMM implementation is the textbook three-loop inner product
+form (GVL4~\cite{gvl4} Algorithm~1.1.5, ijk variant):
+
+\[
+C_{ij} = \sum_{k=0}^{K-1} A_{ik}\, B_{kj}
+\]
+
+\noindent
+where each element $C_{ij}$ performs a \texttt{foldl'} over the shared
+dimension.  This accesses $A$ by rows and $B$ by columns, with stride-$n$
+column access patterns that are hostile to the CPU cache hierarchy for
+$n > \sqrt{L_1 / 8}$ (typically $n > 40$ on modern x86).
+
+GVL4 Algorithm~1.3.1 describes a six-loop tiled variant that partitions
+$A$, $B$, and $C$ into $b \times b$ sub-blocks (where $b$ is chosen so
+that three blocks fit in L1/L2 cache) and performs small \emph{block}
+matrix multiplies at each step.  Implementing this in pure Haskell would
+not match OpenBLAS's hand-tuned assembly, but experience from other
+languages suggests tiled GEMM typically yields $3\text{--}10\times$
+improvement over the na\"ive loop for $n \geq 100$, which would narrow
+the current $300\times$ gap to $30\text{--}100\times$.
+
+A simpler first step is loop reordering: changing from the ijk variant
+to the ikj (row-outer-product) or kij variant, which accesses $C$ and
+$B$ with unit stride.  This alone can yield $2\text{--}4\times$
+improvement on cache-unfriendly sizes and requires only changing the
+loop nesting order in the existing \texttt{foldl'} computation.
+
+\subsubsection{Divide-and-Conquer Eigenvalue and SVD}
+\label{sec:remedy-dc}
+
+The current eigenvalue solver uses the classical tridiagonal QR
+algorithm (GVL4~\cite{gvl4} Algorithm~8.3.3), which has $O(n^2)$
+cost per eigenvalue in the worst case and $O(n^3)$ overall.  LAPACK's
+\texttt{DSYEVD} uses a divide-and-conquer approach (GVL4
+Algorithm~8.4.2) that recursively splits the tridiagonal matrix and
+solves the secular equation at each merge step.  In practice,
+divide-and-conquer is $2\text{--}5\times$ faster than the QR algorithm
+for dense matrices with $n > 25$, and it is also more amenable to
+parallelisation since the two sub-problems at each recursion level are
+independent.
+
+Similarly, the current SVD uses iterated QR sweeps with Wilkinson
+shifts; LAPACK's \texttt{DGESDD} uses a divide-and-conquer SVD.
+Implementing these would address the $16{,}000\text{--}21{,}000\times$
+gaps at $50 \times 50$ (Table~\ref{tab:ratios}), which are inflated by
+the iterative algorithms' per-step allocation cost compounding with
+algorithmic inefficiency.
+
+\subsubsection{SIMD Primitives}
+\label{sec:remedy-simd}
+
+GHC provides experimental SIMD support via the \texttt{ghc-prim}
+package, exposing 128-bit and 256-bit vector types
+(\texttt{DoubleX2\#}, \texttt{DoubleX4\#}) with fused multiply-add
+operations.  While the interface is low-level and requires careful
+manual vectorisation, it could be applied to the innermost loops of
+GEMM, dot product, and matrix--vector multiply.  A 4-wide
+\texttt{DoubleX4\#} FMA would process four $C_{ij}$ accumulations per
+cycle, giving a theoretical $4\times$ throughput improvement on the
+inner loop---significant for Level~1 and Level~2 BLAS operations where
+the gap is dominated by per-element overhead rather than cache effects.
+
+Alternatively, the \texttt{primitive-simd} or \texttt{simd} packages
+provide portable wrappers around GHC's SIMD primops.  The
+\texttt{vector} library (which underlies massiv's \texttt{P}rimitive
+representation) stores \texttt{Double} in contiguous pinned memory,
+making it compatible with SIMD load/store patterns.
+
+\subsubsection{Optional FFI Backend}
+\label{sec:remedy-ffi}
+
+For users who can accept an FFI dependency, \texttt{linear-massiv}
+could provide an optional backend that delegates Level~3 BLAS operations
+to the system BLAS/LAPACK via \texttt{hmatrix} or direct
+\texttt{cblas\_dgemm} FFI calls, while preserving the type-safe
+\texttt{KnownNat}-indexed interface.  This is architecturally
+straightforward: the \texttt{Matrix m n r e} type wraps a massiv array
+whose underlying \texttt{P}rimitive representation is a pinned
+\texttt{ByteArray}, which can be passed to C via
+\texttt{unsafeWithPtr} or copied into an hmatrix \texttt{Matrix Double}
+with a single \texttt{memcpy}.
+
+This approach would offer the best of both worlds---compile-time
+dimensional safety with BLAS-level performance---while keeping the
+pure Haskell implementation as the default for portability.  A Cabal
+flag (e.g.\ \texttt{-f blas-backend}) could control which backend is
+linked, similar to how \texttt{vector-algorithms} provides optional
+C-accelerated sort routines.
+
+\subsubsection{Summary of Expected Impact}
+\label{sec:remedy-summary}
+
+Table~\ref{tab:remedies} estimates the cumulative effect of each
+proposed optimisation on the GEMM performance ratio at $100 \times 100$.
+
+\begin{table}[h]
+\centering
+\caption{Estimated impact of proposed optimisations on the
+$100 \times 100$ GEMM performance ratio (current: $329\times$).}
+\label{tab:remedies}
+\begin{tabular}{@{}llr@{}}
+\toprule
+{Optimisation} & {Mechanism} & {Est.\ ratio} \\
+\midrule
+Current baseline           & na\"ive ijk, pure allocation & $329\times$ \\
++ Loop reorder (ikj)       & unit-stride access           & $\sim 100\text{--}160\times$ \\
++ Cache-blocked tiling     & L1/L2 reuse                  & $\sim 30\text{--}50\times$ \\
++ SIMD (DoubleX4\#)        & 4-wide FMA inner loop        & $\sim 8\text{--}15\times$ \\
++ FFI backend (OpenBLAS)   & delegate to DGEMM            & $\sim 1\times$ \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\noindent
+For factorisation and iterative algorithms (QR, eigenvalue, SVD), the
+in-place ST~monad refactoring (Section~\ref{sec:remedy-inplace}) and
+implicit Householder representation (Section~\ref{sec:remedy-wy}) are
+the highest-priority items, as they address the dominant allocation
+overhead that accounts for much of the $300\text{--}21{,}000\times$
+gaps.  The divide-and-conquer algorithms
+(Section~\ref{sec:remedy-dc}) would further reduce the gap for
+eigenvalue and SVD problems, particularly at moderate-to-large
+dimensions.
+
 \subsection{When to Use Each Library}
 
 \begin{description}
@@ -629,12 +823,20 @@ performance gap. At $100 \times 100$ with 16 threads, GEMM runs in
 single-threaded \SI{1.5}{\milli\second}, but representing a meaningful
 improvement from the $330\times$ single-threaded ratio.
 
-The primary directions for closing the performance gap are: (1)~integrating
-SIMD primitives via GHC's upcoming vector extension support; (2)~implementing
-cache-blocked (Level-3 BLAS tiled) algorithms following GVL4 Chapter~1;
-(3)~using massiv's mutable arrays (\texttt{MArray}) for in-place factorisation
-algorithms; and (4)~optionally delegating to hmatrix as a backend for users who
-can accept the FFI dependency.
+Section~\ref{sec:remedies} proposes six concrete optimisation
+directions for closing the gap, ordered by expected impact: (1)~in-place
+factorisation via the ST monad, eliminating the per-iteration matrix
+allocation that dominates QR, eigenvalue, and SVD runtimes;
+(2)~implicit Householder (compact WY) representation to avoid forming
+explicit $Q$ matrices; (3)~cache-blocked tiled GEMM and loop
+reordering for better cache utilisation; (4)~divide-and-conquer
+eigenvalue and SVD algorithms; (5)~SIMD primitives via GHC's
+\texttt{DoubleX4\#} for inner-loop vectorisation; and (6)~an optional
+FFI backend delegating to system BLAS/LAPACK for users who can accept
+the dependency.  These optimisations are cumulative: the first three
+alone could plausibly reduce the GEMM gap from $329\times$ to
+$\sim 30\text{--}50\times$, and the in-place refactoring should
+dramatically improve factorisation and iterative solver performance.
 
 %% ====================================================================
 \begin{thebibliography}{9}
