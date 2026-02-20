@@ -17,22 +17,31 @@ module Numeric.LinearAlgebra.Massiv.Eigen.Symmetric
   ( tridiagonalize
   , symmetricEigen
   , symmetricEigenP
+  , symmetricEigenPPar
   , jacobiEigen
   ) where
 
 import qualified Data.Massiv.Array as M
-import Data.Massiv.Array (Ix2(..), Ix1, unwrapMutableByteArray, unwrapMutableByteArrayOffset)
+import Data.Massiv.Array (Ix2(..), Ix1, unwrapByteArray, unwrapByteArrayOffset, unwrapMutableByteArray, unwrapMutableByteArrayOffset)
 import GHC.TypeNats (KnownNat)
 import Control.Monad (when, forM_)
-import Control.Monad.ST (ST)
+import Control.Monad.ST (ST, stToIO)
+import Control.Concurrent (forkIO, newEmptyMVar, putMVar, takeMVar)
+import System.IO.Unsafe (unsafePerformIO)
 import GHC.Exts
 import GHC.ST (ST(..))
-import Data.Primitive.ByteArray (MutableByteArray(..))
+import Data.Primitive.ByteArray (MutableByteArray(..), newByteArray)
 
 import Numeric.LinearAlgebra.Massiv.Types
 import Numeric.LinearAlgebra.Massiv.Internal
 import Numeric.LinearAlgebra.Massiv.Orthogonal.Givens (givensRotation)
-import Numeric.LinearAlgebra.Massiv.Internal.Kernel (rawMutApplyGivensColumns)
+import Numeric.LinearAlgebra.Massiv.Internal.Kernel
+  ( rawMutApplyGivensColumns
+  , rawMutSumSqColumn
+  , rawMutSymMatvecSub
+  , rawMutSymRank2Update
+  , rawMutTridiagQAccum
+  )
 
 -- | Reduce a symmetric matrix to tridiagonal form (GVL4 Algorithm 8.3.1).
 tridiagonalize :: forall n r e. (KnownNat n, M.Manifest r e, Floating e, Ord e)
@@ -128,6 +137,115 @@ sumQV mq tArr row start end col = go (start + 1) 0
                       q <- M.readM mq (row :. l)
                       let v = M.index' tArr (l :. col)
                       go (l+1) (acc + q*v)
+
+-- | Raw-primop tridiagonalisation specialised for @P Double@.
+-- Two-phase: (1) in-place Householder via raw ByteArray# kernels,
+-- (2) Q accumulation using rawMutTridiagQAccum.
+tridiagonalizeP :: forall n. KnownNat n
+                => Matrix n n M.P Double
+                -> (Matrix n n M.P Double, Vector n M.P Double, Vector n M.P Double)
+tridiagonalizeP a =
+  let nn = dimVal @n
+
+      -- Phase 1: In-place Householder tridiagonalisation
+      (betaList, tArr) = M.withMArrayST (unMatrix a) $ \mt -> do
+        let !mbaT = unwrapMutableByteArray mt
+            !offT = unwrapMutableByteArrayOffset mt
+        -- Allocate reusable temporary vectors (n Doubles = n*8 bytes)
+        mbaV <- newByteArray (nn * 8)
+        mbaP <- newByteArray (nn * 8)
+        mbaW <- newByteArray (nn * 8)
+        betas <- mapM (\k -> tridiagStepP mbaT offT nn mbaV mbaP mbaW k) [0..nn-3]
+        pure betas
+
+      -- Get underlying ByteArray from frozen T for Q accumulation
+      !tBA  = unwrapByteArray tArr
+      !tOff = unwrapByteArrayOffset tArr
+
+      -- Phase 2: Accumulate Q using raw primops
+      qMat = createMatrix @n @n @M.P $ \mq -> do
+        let !mbaQ = unwrapMutableByteArray mq
+            !offQ = unwrapMutableByteArrayOffset mq
+        -- Set Q = I
+        forM_ [0..nn-1] $ \i -> forM_ [0..nn-1] $ \j ->
+          writeRawD mbaQ offQ (i*nn+j) (if i == j then 1 else 0)
+        -- Forward accumulation: Q <- Q · H_k for k = 0..n-3
+        forM_ (zip [0..] betaList) $ \(k, beta_k) ->
+          when (beta_k /= 0) $
+            forM_ [0..nn-1] $ \row ->
+              rawMutTridiagQAccum mbaQ offQ nn tBA tOff nn beta_k (k+1) k nn row
+
+      -- Read diagonal and subdiagonal from frozen T
+      diag_   = makeVector @n @M.P $ \i -> M.index' tArr (i :. i)
+      subdiag = makeVector @n @M.P $ \i ->
+        if i < nn - 1 then M.index' tArr ((i+1) :. i) else 0
+
+  in (qMat, diag_, subdiag)
+{-# NOINLINE tridiagonalizeP #-}
+
+-- | One step of raw-primop Householder tridiagonalisation.
+tridiagStepP :: MutableByteArray s -> Int -> Int
+             -> MutableByteArray s -> MutableByteArray s -> MutableByteArray s
+             -> Int -> ST s Double
+tridiagStepP mbaT offT nn mbaV mbaP mbaW k = do
+  -- 1. Read x0 = T[k+1,k]
+  x0 <- readRawD mbaT offT ((k+1)*nn + k)
+  -- 2. Compute sigma = Σ T[i,k]^2 for i=k+2..nn-1
+  sigma <- rawMutSumSqColumn mbaT offT nn (k+2) nn k
+  if sigma == 0 && x0 >= 0
+    then pure 0
+    else do
+      let mu = sqrt (x0 * x0 + sigma)
+          v0 = if x0 <= 0 then x0 - mu else -sigma / (x0 + mu)
+          beta = 2 * v0 * v0 / (sigma + v0 * v0)
+          subSize = nn - k - 1
+
+      -- 3. Build v in mbaV: v[0]=1, v[i]=T[k+1+i,k]/v0
+      writeRawD mbaV 0 0 1.0
+      forM_ [1..subSize-1] $ \i -> do
+        tik <- readRawD mbaT offT ((k+1+i)*nn + k)
+        writeRawD mbaV 0 i (tik / v0)
+
+      -- 4. p = beta * T_sub * v
+      rawMutSymMatvecSub mbaT offT nn mbaV 0 mbaP 0 (k+1) nn
+      forM_ [0..subSize-1] $ \i -> do
+        pi_ <- readRawD mbaP 0 i
+        writeRawD mbaP 0 i (beta * pi_)
+
+      -- 5. Dot product p^T v
+      ptv <- mutDotVec mbaP 0 mbaV 0 subSize
+      let alpha_ = beta * ptv / 2
+
+      -- 6. w = p - alpha*v
+      forM_ [0..subSize-1] $ \i -> do
+        pi_ <- readRawD mbaP 0 i
+        vi  <- readRawD mbaV 0 i
+        writeRawD mbaW 0 i (pi_ - alpha_ * vi)
+
+      -- 7. Rank-2 update: T -= vw^T + wv^T
+      rawMutSymRank2Update mbaT offT nn mbaV 0 mbaW 0 (k+1) nn
+
+      -- 8. Store Householder vector in column k subdiagonal
+      forM_ [1..subSize-1] $ \i -> do
+        vi <- readRawD mbaV 0 i
+        writeRawD mbaT offT ((k+1+i)*nn + k) vi
+
+      -- 9. Set subdiagonal element
+      writeRawD mbaT offT ((k+1)*nn + k) mu
+      writeRawD mbaT offT (k*nn + (k+1)) mu
+
+      pure beta
+
+-- | Dot product of two mutable vectors.
+mutDotVec :: MutableByteArray s -> Int -> MutableByteArray s -> Int -> Int -> ST s Double
+mutDotVec mbaA offA mbaB offB n = go 0 0
+  where
+    go !i !acc
+      | i >= n = pure acc
+      | otherwise = do
+          ai <- readRawD mbaA offA i
+          bi <- readRawD mbaB offB i
+          go (i+1) (acc + ai * bi)
 
 -- | Symmetric eigenvalue decomposition (GVL4 Algorithm 8.3.3).
 symmetricEigen :: forall n r e. (KnownNat n, M.Manifest r e, Floating e, Ord e)
@@ -246,13 +364,6 @@ applyGivensRightQ mq c s ci ck nn =
     M.write_ mq (row :. ci) (c * qrc - s * qrk)
     M.write_ mq (row :. ck) (s * qrc + c * qrk)
 
--- | Specialised Givens rotation for P Double Q matrices using raw primops.
-applyGivensRightQP :: M.MArray s M.P Ix2 Double -> Double -> Double -> Int -> Int -> Int -> ST s ()
-applyGivensRightQP mq c s ci ck nn =
-  let mbaQ = unwrapMutableByteArray mq
-      offQ = unwrapMutableByteArrayOffset mq
-  in rawMutApplyGivensColumns mbaQ offQ nn c s ci ck nn
-
 -- | Specialised symmetric eigenvalue decomposition for @P Double@.
 -- Uses raw ByteArray# primops for the entire QR iteration, including
 -- diagonal/subdiagonal reads and writes plus Givens rotation on Q.
@@ -260,7 +371,7 @@ symmetricEigenP :: forall n. KnownNat n
                 => Matrix n n M.P Double -> Int -> Double -> (Vector n M.P Double, Matrix n n M.P Double)
 symmetricEigenP a maxIter tol =
   let nn = dimVal @n
-      (q0, diag_, subdiag) = tridiagonalize a
+      (q0, diag_, subdiag) = tridiagonalizeP a
       (dArr, qArr) = M.withMArrayST (unMatrix q0) $ \mq -> do
         md <- M.thawS (unVector diag_)
         msd <- M.thawS (unVector subdiag)
@@ -275,6 +386,76 @@ symmetricEigenP a maxIter tol =
         pure (MkVector dFrozen)
   in (dArr, MkMatrix qArr)
 {-# NOINLINE symmetricEigenP #-}
+
+-- | Parallel specialised symmetric eigenvalue decomposition for @P Double@.
+-- Uses raw-primop tridiagonalisation and forks independent sub-problems
+-- when the QR loop finds a split point.
+symmetricEigenPPar :: forall n. KnownNat n
+                   => Matrix n n M.P Double -> Int -> Double
+                   -> (Vector n M.P Double, Matrix n n M.P Double)
+symmetricEigenPPar a maxIter tol = unsafePerformIO $ do
+  let nn = dimVal @n
+      (q0, diag_, subdiag) = tridiagonalizeP a
+  -- Thaw into IO (s = RealWorld) for parallel QR iteration
+  mq  <- M.thawS (unMatrix q0)
+  md  <- M.thawS (unVector diag_)
+  msd <- M.thawS (unVector subdiag)
+  let !mbaD  = unwrapMutableByteArray md
+      !offD  = unwrapMutableByteArrayOffset md
+      !mbaSD = unwrapMutableByteArray msd
+      !offSD = unwrapMutableByteArrayOffset msd
+      !mbaQ  = unwrapMutableByteArray mq
+      !offQ  = unwrapMutableByteArrayOffset mq
+  rawTridiagQRLoopPar mbaD offD mbaSD offSD mbaQ offQ nn maxIter tol
+  dFrozen <- M.freezeS md
+  qFrozen <- M.freezeS mq
+  pure (MkVector dFrozen, MkMatrix qFrozen)
+{-# NOINLINE symmetricEigenPPar #-}
+
+-- | Parallel QR loop: forks independent sub-problems when a split is found.
+-- Operates in IO to enable forkIO for non-overlapping sub-problem ranges.
+rawTridiagQRLoopPar :: MutableByteArray RealWorld -> Int
+                    -> MutableByteArray RealWorld -> Int
+                    -> MutableByteArray RealWorld -> Int
+                    -> Int -> Int -> Double -> IO ()
+rawTridiagQRLoopPar mbaD offD mbaSD offSD mbaQ offQ nn maxIter tol = go 0 0 (nn - 1)
+  where
+    rd mba off i = stToIO (readRawD mba off i)
+    wr mba off i v = stToIO (writeRawD mba off i v)
+
+    go !iter !lo !hi
+      | iter >= maxIter = pure ()
+      | lo >= hi = pure ()
+      | otherwise = do
+          sdhi <- rd mbaSD offSD (hi - 1)
+          dhi1 <- rd mbaD offD (hi - 1)
+          dhi  <- rd mbaD offD hi
+          if abs sdhi <= tol * (abs dhi1 + abs dhi)
+            then do wr mbaSD offSD (hi - 1) 0; go iter lo (hi - 1)
+            else do
+              sdlo <- rd mbaSD offSD lo
+              dlo  <- rd mbaD offD lo
+              dlo1 <- rd mbaD offD (lo + 1)
+              if abs sdlo <= tol * (abs dlo + abs dlo1)
+                then do wr mbaSD offSD lo 0; go iter (lo + 1) hi
+                else do
+                  split <- stToIO $ rawFindSplit mbaD offD mbaSD offSD lo hi tol
+                  case split of
+                    Just q -> do
+                      wr mbaSD offSD q 0
+                      done <- newEmptyMVar
+                      _ <- forkIO $ do
+                        go iter lo q
+                        putMVar done ()
+                      go iter (q + 1) hi
+                      takeMVar done
+                    Nothing -> do
+                      let sp1 = sdhi
+                          delta = (dhi1 - dhi) / 2
+                          sgn = if delta >= 0 then 1 else -1
+                          shift = dhi - sp1*sp1 / (delta + sgn * sqrt (delta*delta + sp1*sp1))
+                      stToIO $ rawImplicitQRStep mbaD offD mbaSD offSD mbaQ offQ nn shift lo hi
+                      go (iter + 1) lo hi
 
 -- | Read a Double from a raw MutableByteArray at element index.
 readRawD :: MutableByteArray s -> Int -> Int -> ST s Double

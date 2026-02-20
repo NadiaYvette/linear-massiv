@@ -2,5 +2,7 @@ packages: .
 
 allow-newer: all:base, all:template-haskell, all:ghc-prim
 
+benchmarks: True
+
 package linear-massiv
   ghc-options: -fllvm -pgmlo opt-17 -pgmlc llc-17 -mavx2 -mfma

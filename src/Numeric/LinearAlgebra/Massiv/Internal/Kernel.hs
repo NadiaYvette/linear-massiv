@@ -39,6 +39,10 @@ module Numeric.LinearAlgebra.Massiv.Internal.Kernel
   , rawMutSumProdColumns
   , rawMutHouseholderApply
   , rawMutQAccum
+    -- * Tridiagonalisation mutable kernels
+  , rawMutSymMatvecSub
+  , rawMutSymRank2Update
+  , rawMutTridiagQAccum
     -- * Eigen mutable kernels
   , rawMutApplyGivensColumns
   ) where
@@ -378,6 +382,121 @@ rawSymRank2Update (MutableByteArray mba) (I# off) (I# n)
 
   in (# goI from_ s0, () #)
 {-# INLINE rawSymRank2Update #-}
+
+-- --------------------------------------------------------------------------
+-- Tridiagonalisation mutable kernels
+-- --------------------------------------------------------------------------
+
+-- | Symmetric submatrix-vector product for tridiagonalisation.
+-- Computes p[i-from] = Σ_{j=from}^{to-1} T[i,j] * v[j-from]
+-- for i in [from..to-1].
+-- T is read from MutableByteArray (being modified in-place),
+-- v is read from MutableByteArray (temporary vector),
+-- p is written to MutableByteArray (temporary vector).
+rawMutSymMatvecSub :: MutableByteArray s -> Int -> Int
+                   -> MutableByteArray s -> Int
+                   -> MutableByteArray s -> Int
+                   -> Int -> Int -> ST s ()
+rawMutSymMatvecSub (MutableByteArray mba_t) (I# off_t) (I# ncols)
+                   (MutableByteArray mba_v) (I# off_v)
+                   (MutableByteArray mba_p) (I# off_p)
+                   (I# from_) (I# to) = ST $ \s0 ->
+  let goI i s
+        | isTrue# (i >=# to) = s
+        | otherwise = case goJ i from_ 0.0## s of
+            (# s', acc #) ->
+              case writeDoubleArray# mba_p (off_p +# (i -# from_)) acc s' of
+                s'' -> goI (i +# 1#) s''
+
+      goJ i j acc s
+        | isTrue# (j >=# to) = (# s, acc #)
+        | otherwise =
+            case readDoubleArray# mba_t (off_t +# i *# ncols +# j) s of
+              (# s1, tij #) ->
+                case readDoubleArray# mba_v (off_v +# (j -# from_)) s1 of
+                  (# s2, vj #) -> goJ i (j +# 1#) (acc +## tij *## vj) s2
+
+  in (# goI from_ s0, () #)
+{-# INLINE rawMutSymMatvecSub #-}
+
+-- | Symmetric rank-2 update reading v, w from MutableByteArrays.
+-- For i in [from..to-1], j in [from..i]:
+--   T[i,j] -= v[i-from]*w[j-from] + w[i-from]*v[j-from]
+--   T[j,i] = T[i,j]   (maintain symmetry)
+-- v and w are indexed relative to from (i.e., v[0] corresponds to row 'from').
+rawMutSymRank2Update :: MutableByteArray s -> Int -> Int
+                     -> MutableByteArray s -> Int
+                     -> MutableByteArray s -> Int
+                     -> Int -> Int -> ST s ()
+rawMutSymRank2Update (MutableByteArray mba_t) (I# off_t) (I# n)
+                     (MutableByteArray mba_v) (I# off_v)
+                     (MutableByteArray mba_w) (I# off_w)
+                     (I# from_) (I# to) = ST $ \s0 ->
+  let goI i s
+        | isTrue# (i >=# to) = s
+        | otherwise =
+            case readDoubleArray# mba_v (off_v +# (i -# from_)) s of
+              (# s1, vi #) ->
+                case readDoubleArray# mba_w (off_w +# (i -# from_)) s1 of
+                  (# s2, wi #) -> goI (i +# 1#) (goJ i vi wi from_ s2)
+
+      goJ i vi wi j s
+        | isTrue# (j ># i) = s
+        | otherwise =
+            case readDoubleArray# mba_v (off_v +# (j -# from_)) s of
+              (# s1, vj #) ->
+                case readDoubleArray# mba_w (off_w +# (j -# from_)) s1 of
+                  (# s2, wj #) ->
+                    let delta = vi *## wj +## wi *## vj
+                        ij = off_t +# i *# n +# j
+                        ji = off_t +# j *# n +# i
+                    in case readDoubleArray# mba_t ij s2 of
+                         (# s3, tij #) ->
+                           let tij' = tij -## delta
+                           in case writeDoubleArray# mba_t ij tij' s3 of
+                                s4 | isTrue# (i ==# j) -> goJ i vi wi (j +# 1#) s4
+                                   | otherwise ->
+                                       case writeDoubleArray# mba_t ji tij' s4 of
+                                         s5 -> goJ i vi wi (j +# 1#) s5
+
+  in (# goI from_ s0, () #)
+{-# INLINE rawMutSymRank2Update #-}
+
+-- | Q accumulation for tridiagonalisation.
+-- Householder vectors are stored in column hvCol of frozen T,
+-- with implicit v[qCol] = 1.0.
+-- Phase 1: wi = beta * (Q[row,qCol] + Σ_{l=qCol+1}^{endRow-1} Q[row,l] * T[l,hvCol])
+-- Phase 2: Q[row,qCol] -= wi; Q[row,l] -= wi * T[l,hvCol]
+rawMutTridiagQAccum :: MutableByteArray s -> Int -> Int
+                    -> ByteArray -> Int -> Int
+                    -> Double -> Int -> Int -> Int -> Int -> ST s ()
+rawMutTridiagQAccum (MutableByteArray mba_q) (I# off_q) (I# qcols)
+                    (ByteArray ba_t) (I# off_t) (I# tcols)
+                    (D# beta) (I# qCol) (I# hvCol) (I# endRow) (I# row) = ST $ \s0 ->
+  -- Phase 1: wi = beta * (Q[row,qCol] + Σ Q[row,l] * T[l,hvCol])
+  case readDoubleArray# mba_q (off_q +# row *# qcols +# qCol) s0 of
+    (# s1, qrk #) ->
+      let goSum l acc s
+            | isTrue# (l >=# endRow) = (# s, beta *## (qrk +## acc) #)
+            | otherwise =
+                let vl = indexDoubleArray# ba_t (off_t +# l *# tcols +# hvCol)
+                in case readDoubleArray# mba_q (off_q +# row *# qcols +# l) s of
+                     (# s', qrl #) -> goSum (l +# 1#) (acc +## qrl *## vl) s'
+      in case goSum (qCol +# 1#) 0.0## s1 of
+           (# s2, wi #) ->
+             -- Phase 2: Q[row,qCol] -= wi
+             case writeDoubleArray# mba_q (off_q +# row *# qcols +# qCol) (qrk -## wi) s2 of
+               s3 ->
+                 let goUpdate l s
+                       | isTrue# (l >=# endRow) = s
+                       | otherwise =
+                           let vl = indexDoubleArray# ba_t (off_t +# l *# tcols +# hvCol)
+                           in case readDoubleArray# mba_q (off_q +# row *# qcols +# l) s of
+                                (# s', qrl #) ->
+                                  case writeDoubleArray# mba_q (off_q +# row *# qcols +# l) (qrl -## wi *## vl) s' of
+                                    s'' -> goUpdate (l +# 1#) s''
+                 in (# goUpdate (qCol +# 1#) s3, () #)
+{-# INLINE rawMutTridiagQAccum #-}
 
 -- --------------------------------------------------------------------------
 -- LU kernels

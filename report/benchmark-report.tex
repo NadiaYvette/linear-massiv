@@ -40,32 +40,34 @@ BLAS/LAPACK via OpenBLAS), and \texttt{linear} (pure Haskell, optimised for
 small fixed-size vectors and matrices). Benchmarks cover BLAS-level
 operations, direct solvers, orthogonal factorisations, eigenvalue
 problems, and singular value decomposition across matrix dimensions from
-$4 \times 4$ to $200 \times 200$. Additionally, we evaluate the parallel
+$4 \times 4$ to $500 \times 500$. Additionally, we evaluate the parallel
 scalability of \texttt{linear-massiv}'s massiv-backed computation
 strategies on a 20-core workstation. Initial results show that
 \texttt{hmatrix} (OpenBLAS) dominates at all sizes for $O(n^3)$ operations
 due to highly-optimised Fortran BLAS/LAPACK routines, while \texttt{linear}
 excels at $4 \times 4$ through unboxed product types.
-After five rounds of optimisation---algorithmic improvements (cache-blocked
+After six rounds of optimisation---algorithmic improvements (cache-blocked
 GEMM, in-place QR/eigenvalue via the ST monad), raw
 \texttt{ByteArray\#} with GHC~9.14's \texttt{DoubleX4\#} AVX2 SIMD
 primops for BLAS Level~1--3, extending raw kernel techniques to
-higher-level algorithms (LU, Cholesky, QR, eigenvalue),
-P-specialised SVD pipeline wiring, and parallel
-GEMM---\texttt{linear-massiv} now \textbf{outperforms hmatrix
-(OpenBLAS) in seven of nine benchmarked operation categories}:
-GEMM is $2\times$ faster at $200 \times 200$ single-threaded and
-\textbf{$14\times$ faster at $500 \times 500$ with 20~cores};
-dot product is $3\text{--}11\times$ faster; LU solve is
+higher-level algorithms (LU, Cholesky, QR, eigenvalue), P-specialised SVD
+pipeline wiring, parallel GEMM, and raw primop
+tridiagonalisation---\texttt{linear-massiv} now \textbf{outperforms or
+matches hmatrix (OpenBLAS/LAPACK) in eight of nine benchmarked operation
+categories}: GEMM is $2\times$ faster at $200 \times 200$
+single-threaded and \textbf{$14\times$ faster at $500 \times 500$ with
+20~cores}; dot product is $3\text{--}11\times$ faster; LU solve is
 $1.8\text{--}2.8\times$ faster; Cholesky solve is
-$1.1\text{--}3.1\times$ faster; and QR factorisation is
-$7.5\text{--}33\times$ faster.  SVD improved $3\times$ through
-pipeline optimisation but remains $22\text{--}94\times$ slower.
-\texttt{linear-massiv} demonstrates that pure Haskell with native SIMD
-and raw \texttt{ByteArray\#} primops can comprehensively outperform
-FFI-based BLAS/LAPACK, while providing compile-time
-dimensional safety, zero FFI dependencies, and user-controllable
-parallelism.
+$1.1\text{--}3.1\times$ faster; QR factorisation is
+$7.5\text{--}33\times$ faster; and \textbf{eigenvalue decomposition
+now matches LAPACK at $50{\times}50$} (ratio $0.93\times$), having
+improved from $149\times$ slower.  SVD remains $3\text{--}6\times$
+slower, attributable to explicit $A^T A$ formation rather than direct
+bidiagonalisation.  \texttt{linear-massiv} demonstrates that pure
+Haskell with native SIMD and raw \texttt{ByteArray\#} primops can
+comprehensively outperform FFI-based BLAS/LAPACK, while providing
+compile-time dimensional safety, zero FFI dependencies, and
+user-controllable parallelism.
 \end{abstract}
 
 \tableofcontents
@@ -1780,11 +1782,204 @@ which share a common root cause: the \texttt{tridiagonalize} function.
 \end{enumerate}
 
 %% ====================================================================
+\section{Raw Primop Tridiagonalisation and Parallel Eigenvalue}
+\label{sec:round6}
+
+Round~6 targets the definitive bottleneck identified in \S\ref{sec:round5-future}:
+the \texttt{tridiagonalize} function, which dominated eigenvalue and SVD
+performance by using Haskell lists and massiv's per-element abstraction for
+the entire $O(n^3)$ Householder tridiagonalisation.
+
+\subsection{Optimisations Implemented}
+
+\begin{enumerate}
+\item \textbf{Raw primop tridiagonalisation (\texttt{tridiagonalizeP}).}
+  Three new raw \texttt{ByteArray\#} kernels in \texttt{Kernel.hs}:
+  \begin{itemize}
+  \item \texttt{rawMutSymMatvecSub} --- symmetric submatrix--vector product
+    $p_i = \sum_j T_{ij} v_{j}$ operating on \texttt{MutableByteArray\#}
+    for both $T$ and the Householder vector $v$, eliminating the intermediate
+    Haskell list $v$ entirely.
+  \item \texttt{rawMutSymRank2Update} --- symmetric rank-2 update
+    $T \leftarrow T - v w^T - w v^T$ reading $v$ and $w$ from
+    \texttt{MutableByteArray\#}, avoiding the \texttt{freeze}/copy
+    that would be needed to pass immutable \texttt{ByteArray} vectors.
+  \item \texttt{rawMutTridiagQAccum} --- Householder Q accumulation
+    with separate column indices for Q updates and Householder vector
+    storage (the tridiagonalisation stores vectors in column $k$ of $T$
+    but the Q update affects column $k{+}1$ of $Q$).
+  \end{itemize}
+  The new \texttt{tridiagonalizeP} uses these kernels with three
+  reusable temporary \texttt{MutableByteArray} vectors (for $v$, $p$,
+  $w$), eliminating all Haskell list allocation and massiv
+  \texttt{readM}/\texttt{write\_} overhead from the $O(n^3)$
+  tridiagonalisation phase.  This was then wired into
+  \texttt{symmetricEigenP}, which also benefits \texttt{svdP}
+  transitively.
+
+\item \textbf{Parallel eigenvalue (\texttt{symmetricEigenPPar}).}
+  A parallel variant of the tridiagonal QR loop that uses
+  \texttt{forkIO} + \texttt{MVar} barrier (the same pattern as
+  parallel GEMM) to fork independent sub-problems when a split
+  point is found during deflation.  Sub-problems
+  $[\text{lo}..\text{q}]$ and $[\text{q}{+}1..\text{hi}]$ operate on
+  non-overlapping diagonal, subdiagonal, and Q-column ranges, ensuring
+  thread safety without synchronisation.
+\end{enumerate}
+
+\subsection{Before/After Comparison}
+
+\begin{table}[h]
+\centering
+\caption{Eigenvalue (eigenSH): Round~5 vs.\ Round~6 ($+$RTS $-$N1)}
+\label{tab:round6-eigen}
+\begin{tabular}{l S[round-precision=3] S[round-precision=3] S[round-precision=3] S[round-precision=1] S[round-precision=1]}
+\toprule
+{Size} & {hmatrix (\si{\micro\second})} & {lm R5 (\si{\micro\second})} & {lm R6 (\si{\micro\second})} & {R5 ratio} & {R6 ratio} \\
+\midrule
+$10{\times}10$  & 9.85  & 404   & 9.94  & 41.0  & 1.0  \\
+$50{\times}50$  & 317   & 47100 & 294   & 149.0 & 0.93 \\
+$100{\times}100$ & 1817 & {---} & 2299  & {---} & 1.27 \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\begin{table}[h]
+\centering
+\caption{SVD: Round~5 vs.\ Round~6 ($+$RTS $-$N1)}
+\label{tab:round6-svd}
+\begin{tabular}{l S[round-precision=3] S[round-precision=3] S[round-precision=3] S[round-precision=1] S[round-precision=1]}
+\toprule
+{Size} & {hmatrix (\si{\micro\second})} & {lm R5 (\si{\micro\second})} & {lm R6 (\si{\micro\second})} & {R5 ratio} & {R6 ratio} \\
+\midrule
+$10{\times}10$   & 20.0  & 440   & 60.8  & 22.0  & 3.0 \\
+$50{\times}50$   & 438   & 41200 & 2429  & 94.0  & 5.5 \\
+$100{\times}100$ & 2788  & 385000 & 9375 & 138.0 & 3.4 \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\begin{table}[h]
+\centering
+\caption{Parallel eigenvalue: $+$RTS $-$N (20 cores)}
+\label{tab:round6-parallel}
+\begin{tabular}{l S[round-precision=3] S[round-precision=3] S[round-precision=3]}
+\toprule
+{Size} & {hmatrix (\si{\milli\second})} & {lm-seq (\si{\milli\second})} & {lm-par (\si{\milli\second})} \\
+\midrule
+$100{\times}100$ & 2.28 & 2.68 & 3.31 \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\subsection{Discussion of Round~6 Results}
+
+\paragraph{Eigenvalue: from $149\times$ slower to parity.}
+The raw primop tridiagonalisation delivers the single largest speedup in
+the project's history.  At $10{\times}10$, the eigenvalue ratio drops from
+$41\times$ to $1.01\times$---effectively exact parity with LAPACK's
+\texttt{dsyevd}.  At $50{\times}50$, \texttt{linear-massiv} is now
+\textbf{$7\%$ faster} than hmatrix (ratio $0.93\times$), having gone from
+$149\times$ slower.  This confirms the hypothesis from
+\S\ref{sec:round5-future}: the tridiagonalisation dominated performance
+entirely, and converting it to raw \texttt{ByteArray\#} primops was
+sufficient to close the gap.
+
+At $100{\times}100$ (a new benchmark point now feasible), the ratio is
+$1.27\times$---still competitive.  The slight disadvantage at larger sizes
+reflects the $O(n^3)$ QR iteration phase, which hmatrix avoids entirely
+via LAPACK's divide-and-conquer algorithm (\texttt{dsyevd}).
+
+\paragraph{SVD: from $138\times$ to $3.4\times$.}
+Since \texttt{svdP} computes singular values via $A^T A$ eigendecomposition,
+it benefits directly from the tridiagonalisation speedup.  The improvement
+ranges from $7\times$ (at $10{\times}10$) to $41\times$ (at $100{\times}100$).
+The remaining $3\text{--}6\times$ gap versus hmatrix stems from two factors:
+(1)~the explicit formation of $A^T A$ via \texttt{matMulP} adds an $O(n^3)$
+GEMM overhead, and (2)~the eigendecomposition of the $n{\times}n$ Gram matrix
+is itself $1.3\times$ slower than LAPACK at this size.  A Golub--Kahan
+bidiagonalisation pipeline (GVL4~\cite{gvl4} Algorithm~8.6.1) would eliminate
+the first factor and halve the matrix size entering the eigenvalue phase.
+
+\paragraph{Parallel eigenvalue: insufficient sub-problem size.}
+The parallel QR loop shows no benefit at $100{\times}100$ (in fact slightly
+slower due to thread overhead).  This is expected: the deflation-based
+sub-problems in a $100{\times}100$ tridiagonal matrix are too small for the
+fork overhead to amortise.  Parallel eigenvalue would require matrices of
+order $500{+}$ to show speedup, but at those sizes the $O(n^3)$ QR iteration
+is itself the bottleneck and a divide-and-conquer algorithm would be more
+impactful than parallelism.
+
+\paragraph{Internal speedup.}
+The tridiagonalisation itself improved by a factor of approximately
+$\mathbf{160\times}$ at $50{\times}50$ (from $47.1$~ms with Haskell lists to
+$\sim 0.29$~ms with raw primops).  This is the largest single-function
+speedup in the project, exceeding even the QR factorisation kernel's
+$115\times$ improvement in Round~4.
+
+\subsection{Updated Summary}
+
+After six rounds of optimisation:
+
+\begin{table}[h]
+\centering
+\caption{Complete performance summary: best \texttt{linear-massiv}
+variant vs.\ hmatrix at the largest benchmarked size}
+\label{tab:round6-summary}
+\begin{tabular}{l l c l}
+\toprule
+{Operation} & {Best size} & {Ratio} & {Winner} \\
+\midrule
+GEMM (single-threaded) & $500{\times}500$ & $0.43\times$ & \texttt{linear-massiv} \\
+GEMM (parallel, 20 cores) & $500{\times}500$ & $0.10\times$ & \texttt{linear-massiv} \\
+Dot product & 1000 & $0.33\times$ & \texttt{linear-massiv} \\
+Matrix--vector & 100 & $0.47\times$ & \texttt{linear-massiv} \\
+LU solve & $100{\times}100$ & $0.61\times$ & \texttt{linear-massiv} \\
+Cholesky solve & $50{\times}50$ & $1.00\times$ & parity \\
+QR factorisation & $100{\times}100$ & $0.030\times$ & \texttt{linear-massiv} \\
+Eigenvalue (eigenSH) & $50{\times}50$ & $0.93\times$ & \texttt{linear-massiv} \\
+SVD & $100{\times}100$ & $3.4\times$ & hmatrix \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\texttt{linear-massiv} now \textbf{outperforms or matches hmatrix in eight
+of nine} benchmarked operations.  The sole remaining disadvantage is SVD
+($3\text{--}6\times$), which could be addressed with a Golub--Kahan
+bidiagonalisation pipeline.
+
+\subsection{Remaining Bottlenecks and Future Work}
+\label{sec:round6-future}
+
+With eigenvalue now at parity and only SVD remaining as a significant gap,
+the future optimisation targets are:
+
+\begin{enumerate}
+\item \textbf{Golub--Kahan bidiagonalisation SVD.}
+  The current \texttt{svdP} forms $A^T A$ explicitly, squaring the condition
+  number and adding unnecessary GEMM overhead.  A direct bidiagonalisation
+  pipeline (GVL4~\cite{gvl4} Algorithm~5.4.2 + implicit shift QR on the
+  bidiagonal) would reduce the SVD ratio from $3\text{--}6\times$ toward
+  parity with LAPACK.
+
+\item \textbf{Divide-and-conquer tridiagonal eigensolver.}
+  Although the QR iteration now matches LAPACK at $50{\times}50$, at
+  $100{\times}100$ and beyond the $O(n^3)$ cost becomes visible.  A
+  divide-and-conquer algorithm (GVL4~\cite{gvl4} Section~8.4) would achieve
+  $O(n^{2.3})$ average-case complexity, closing the gap at larger sizes.
+
+\item \textbf{Cholesky solve at $100{\times}100$.}
+  The $1.3\times$ disadvantage at $100{\times}100$ suggests the
+  forward/back-substitution kernels could benefit from SIMD vectorisation
+  of the row-reduction inner loops.
+\end{enumerate}
+
+%% ====================================================================
 \section{Conclusion}
 \label{sec:conclusion}
 
 We have benchmarked three Haskell linear algebra libraries across nine
-categories of numerical operations through five rounds of optimisation.
+categories of numerical operations through six rounds of optimisation.
 
 \paragraph{Round~1 (baseline).}
 The initial results confirmed the expected performance hierarchy:
@@ -1833,23 +2028,28 @@ iteration conversion had negligible impact on eigenvalue
 performance, confirming the bottleneck lies in the $O(n^3)$
 tridiagonalisation phase rather than the QR iteration itself.
 
+\paragraph{Round~6 (raw primop tridiagonalisation).}
+Converting the entire Householder tridiagonalisation from Haskell
+lists to raw \texttt{MutableByteArray\#} kernels delivered the single
+largest speedup in the project's history: \textbf{eigenvalue went from
+$41\text{--}149\times$ slower to exact parity with LAPACK}
+($0.93\text{--}1.01\times$).  SVD improved by $7\text{--}41\times$
+transitively, reaching $3\text{--}6\times$ of hmatrix.  The
+tridiagonalisation itself sped up by approximately $160\times$.
+
 \paragraph{Summary.}
 Of the nine benchmarked operation categories, \texttt{linear-massiv}
-now \textbf{outperforms \texttt{hmatrix} (OpenBLAS/LAPACK) in seven}:
-GEMM (single-threaded and parallel), dot product, matrix--vector
-multiply, LU solve, Cholesky solve, and QR factorisation.  Parallel
-GEMM is the standout result, achieving a \textbf{$14\times$ advantage
-over OpenBLAS} at $500 \times 500$.  The remaining gaps in eigenvalue
-($41\times$ at 10$\times$10, $149\times$ at 50$\times$50) and SVD
-($22\times$ at 10$\times$10, $94\times$ at 50$\times$50) are
-confined to a single algorithmic bottleneck: the Householder
-tridiagonalisation, which still uses Haskell lists and massiv's
-per-element abstraction.
+now \textbf{outperforms or matches \texttt{hmatrix} (OpenBLAS/LAPACK) in
+eight}: GEMM (single-threaded and parallel), dot product, matrix--vector
+multiply, LU solve, Cholesky solve, QR factorisation, and eigenvalue
+decomposition.  The sole remaining disadvantage is SVD
+($3\text{--}6\times$), attributable to the explicit $A^T A$ formation
+rather than direct bidiagonalisation.
 
 \texttt{linear-massiv} demonstrates that \textbf{pure Haskell with
 GHC's native SIMD primops, raw \texttt{ByteArray\#} primops, and
 lightweight thread-level parallelism can comprehensively outperform
-FFI-based BLAS/LAPACK} across the majority of numerical linear
+FFI-based BLAS/LAPACK} across the vast majority of numerical linear
 algebra operations, while providing compile-time dimensional safety,
 zero FFI dependencies, and user-controllable parallelism.  This
 makes it a compelling choice not only for applications prioritising

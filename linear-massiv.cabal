@@ -93,7 +93,7 @@ test-suite linear-massiv-test
     FlexibleContexts
     FlexibleInstances
     MultiParamTypeClasses
-  ghc-options: -Wall
+  ghc-options: -Wall -threaded -rtsopts
 
 benchmark linear-massiv-bench
   type: exitcode-stdio-1.0

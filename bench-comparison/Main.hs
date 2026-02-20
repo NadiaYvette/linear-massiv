@@ -25,7 +25,7 @@ import Numeric.LinearAlgebra.Massiv.BLAS.Level3 (matMulP, matMulPPar)
 import Numeric.LinearAlgebra.Massiv.Solve.LU (luSolve, luSolveP)
 import Numeric.LinearAlgebra.Massiv.Solve.Cholesky (choleskySolve, choleskySolveP)
 import Numeric.LinearAlgebra.Massiv.Orthogonal.QR (qr, qrP)
-import Numeric.LinearAlgebra.Massiv.Eigen.Symmetric (symmetricEigen, symmetricEigenP)
+import Numeric.LinearAlgebra.Massiv.Eigen.Symmetric (symmetricEigen, symmetricEigenP, symmetricEigenPPar)
 import Numeric.LinearAlgebra.Massiv.Eigen.SVD (svd, svdP)
 
 -- hmatrix
@@ -266,6 +266,11 @@ main = do
         [ bench "hmatrix"       $ nf (H.eigSH . H.trustSym) spd50
         , bench "linear-massiv" $ nf (\a -> symmetricEigenP a 500 1e-12) (mkSPDLM @50)
         , bench "lm-generic"    $ nf (\a -> symmetricEigen a 500 1e-12) (mkSPDLM @50)
+        ]
+      , bgroup "100x100"
+        [ bench "hmatrix"       $ nf (H.eigSH . H.trustSym) spd100
+        , bench "linear-massiv" $ nf (\a -> symmetricEigenP a 1000 1e-12) (mkSPDLM @100)
+        , bench "lm-parallel"   $ nf (\a -> symmetricEigenPPar a 1000 1e-12) (mkSPDLM @100)
         ]
       ]
     , bgroup "SVD"
