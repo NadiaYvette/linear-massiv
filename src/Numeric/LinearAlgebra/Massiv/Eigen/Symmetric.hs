@@ -30,7 +30,7 @@ import Control.Concurrent (forkIO, newEmptyMVar, putMVar, takeMVar)
 import System.IO.Unsafe (unsafePerformIO)
 import GHC.Exts
 import GHC.ST (ST(..))
-import Data.Primitive.ByteArray (MutableByteArray(..), ByteArray(..), newByteArray, freezeByteArray)
+import Data.Primitive.ByteArray (MutableByteArray(..), newByteArray, unsafeFreezeByteArray)
 
 import Numeric.LinearAlgebra.Massiv.Types
 import Numeric.LinearAlgebra.Massiv.Internal
@@ -472,6 +472,20 @@ writeRawD (MutableByteArray mba) (I# off) (I# i) (D# v) = ST $ \s ->
     s' -> (# s', () #)
 {-# INLINE writeRawD #-}
 
+-- | Read an Int from a raw MutableByteArray at element index.
+readRawI :: MutableByteArray s -> Int -> Int -> ST s Int
+readRawI (MutableByteArray mba) (I# off) (I# i) = ST $ \s ->
+  case readIntArray# mba (off +# i) s of
+    (# s', v #) -> (# s', I# v #)
+{-# INLINE readRawI #-}
+
+-- | Write an Int to a raw MutableByteArray at element index.
+writeRawI :: MutableByteArray s -> Int -> Int -> Int -> ST s ()
+writeRawI (MutableByteArray mba) (I# off) (I# i) (I# v) = ST $ \s ->
+  case writeIntArray# mba (off +# i) v s of
+    s' -> (# s', () #)
+{-# INLINE writeRawI #-}
+
 -- | Raw primop QR loop: all diagonal/subdiagonal access via raw ByteArray# primops.
 rawTridiagQRLoop :: MutableByteArray s -> Int   -- ^ diagonal array + offset
                  -> MutableByteArray s -> Int   -- ^ subdiagonal array + offset
@@ -559,176 +573,250 @@ rawImplicitQRStep mbaD offD mbaSD offSD mbaQ offQ nn shift lo hi = do
 
 -- --------------------------------------------------------------------------
 -- Divide-and-conquer tridiagonal eigensolver (GVL4 Section 8.4)
+-- Optimised: pre-allocated workspace, QR fallback for small subproblems,
+-- unsafeFreezeByteArray to avoid O(n²) copies.
 -- --------------------------------------------------------------------------
 
--- | Divide-and-conquer eigensolver for a symmetric tridiagonal matrix.
--- Operates on mutable diagonal d[lo..hi], subdiagonal e[lo..hi-1],
--- and eigenvector matrix Q (fullN × fullN). On entry, Q[lo..hi, lo..hi]
--- should be identity. On exit, d[lo..hi] contains eigenvalues and
--- Q[:, lo..hi] contains corresponding eigenvectors.
-dcEigenTridiag :: MutableByteArray s -> Int   -- ^ d + offset
-               -> MutableByteArray s -> Int   -- ^ e + offset
-               -> MutableByteArray s -> Int   -- ^ Q + offset (fullN × fullN row-major)
-               -> Int                         -- ^ fullN (Q dimension)
-               -> Int -> Int                  -- ^ lo, hi (active range, inclusive)
-               -> Double                      -- ^ tolerance
-               -> ST s ()
-dcEigenTridiag mbaD offD mbaE offE mbaQ offQ fullN lo hi tol
-  | lo >= hi = pure ()  -- 1×1: eigenvalue is d[lo], eigenvector is e_lo (already identity)
-  | hi == lo + 1 = do
-      -- 2×2 direct solve
-      d0 <- readRawD mbaD offD lo
-      d1 <- readRawD mbaD offD hi
-      e0 <- readRawD mbaE offE lo
-      let tr = d0 + d1
-          det_ = d0 * d1 - e0 * e0
-          disc = sqrt (max 0 (tr * tr - 4 * det_))
-          lam1 = (tr - disc) / 2   -- smaller eigenvalue
-          lam2 = (tr + disc) / 2   -- larger eigenvalue
-      -- Eigenvector rotation
-      let (c, s) = if abs e0 < tol * (abs d0 + abs d1)
-                   then (1, 0)
-                   else let theta = (d1 - d0) / (2 * e0)
-                            t_ = if theta >= 0
-                                 then 1 / (theta + sqrt (1 + theta * theta))
-                                 else 1 / (theta - sqrt (1 + theta * theta))
-                            c_ = 1 / sqrt (1 + t_ * t_)
-                        in (c_, t_ * c_)
-      writeRawD mbaD offD lo lam1
-      writeRawD mbaD offD hi lam2
-      writeRawD mbaE offE lo 0
-      -- Apply Givens rotation to Q columns lo and hi
-      rawMutApplyGivensColumns mbaQ offQ fullN c s lo hi fullN
+-- | Optimised divide-and-conquer eigensolver for a symmetric tridiagonal matrix.
+-- Pre-allocates all temporary arrays once (eliminating per-level GC pressure),
+-- falls back to QR for subproblems ≤ 25, and uses unsafeFreezeByteArray for
+-- O(1) GEMM input preparation.
+dcEigenTridiagOpt :: MutableByteArray s -> Int   -- ^ d + offset
+                  -> MutableByteArray s -> Int   -- ^ e + offset
+                  -> MutableByteArray s -> Int   -- ^ Q + offset (fullN × fullN row-major)
+                  -> Int                         -- ^ fullN (Q dimension)
+                  -> Int -> Int                  -- ^ lo, hi (active range, inclusive)
+                  -> Double                      -- ^ tolerance
+                  -> ST s ()
+dcEigenTridiagOpt mbaD offD mbaE offE mbaQ offQ fullN lo0 hi0 tol
+  | hi0 <= lo0 = pure ()
   | otherwise = do
-      let k = (lo + hi) `div` 2  -- split point
-          n1 = k - lo + 1        -- size of T1
-          n2 = hi - k            -- size of T2
-          nn = hi - lo + 1       -- total active size
+      let !maxN = hi0 - lo0 + 1
+      -- Pre-allocate all workspace at maximum needed size (once, not per-level)
+      wsLam    <- newByteArray (maxN * 8)
+      wsZ      <- newByteArray (maxN * 8)
+      wsDSort  <- newByteArray (maxN * 8)
+      wsZSort  <- newByteArray (maxN * 8)
+      wsIdx    <- newByteArray (maxN * 8)
+      wsPerm   <- newByteArray (maxN * 8)  -- deflation permutation (Int indices)
+      wsW      <- newByteArray (maxN * maxN * 8)
+      wsQsub   <- newByteArray (fullN * maxN * 8)
+      wsResult <- newByteArray (fullN * maxN * 8)
+      wsQtemp  <- newByteArray (maxN * maxN * 8)
 
-      -- Read the coupling element beta = e[k]
-      beta <- readRawD mbaE offE k
+      let !dcThreshold = 25
 
-      -- Modify diagonal: d[k] -= |beta|, d[k+1] -= |beta|
-      dk  <- readRawD mbaD offD k
-      dk1 <- readRawD mbaD offD (k + 1)
-      let absBeta = abs beta
-          rho = beta  -- sign matters for z vector
-      writeRawD mbaD offD k     (dk - absBeta)
-      writeRawD mbaD offD (k+1) (dk1 - absBeta)
-      writeRawD mbaE offE k 0  -- zero out the coupling
+          -- Main recursive function (captures workspace via closure)
+          dcGo !lo !hi
+            | lo >= hi = pure ()
+            | hi == lo + 1 = do
+                -- 2×2 direct eigensolve
+                d0 <- readRawD mbaD offD lo
+                d1 <- readRawD mbaD offD hi
+                e0 <- readRawD mbaE offE lo
+                let !tr = d0 + d1
+                    !det_ = d0 * d1 - e0 * e0
+                    !disc = sqrt (max 0 (tr * tr - 4 * det_))
+                    !lam1 = (tr - disc) / 2
+                    !lam2 = (tr + disc) / 2
+                    (!c, !s) = if abs e0 < tol * (abs d0 + abs d1)
+                               then (1, 0)
+                               else let !theta = (d1 - d0) / (2 * e0)
+                                        !t_ = if theta >= 0
+                                              then 1 / (theta + sqrt (1 + theta * theta))
+                                              else 1 / (theta - sqrt (1 + theta * theta))
+                                        !c_ = 1 / sqrt (1 + t_ * t_)
+                                    in (c_, t_ * c_)
+                writeRawD mbaD offD lo lam1
+                writeRawD mbaD offD hi lam2
+                writeRawD mbaE offE lo 0
+                rawMutApplyGivensColumns mbaQ offQ fullN c s lo hi fullN
+            | hi - lo + 1 <= dcThreshold = do
+                -- QR fallback for small subproblems
+                let !k = hi - lo + 1
+                -- Initialise wsQtemp as k×k identity
+                forM_ [0..k*k-1] $ \i -> writeRawD wsQtemp 0 i 0
+                forM_ [0..k-1] $ \i -> writeRawD wsQtemp 0 (i * k + i) 1
+                -- Run QR iteration on d[lo..hi], e[lo..hi-1]
+                rawTridiagQRLoop mbaD (offD + lo) mbaE (offE + lo) wsQtemp 0 k (30 * k) tol
+                -- Apply rotation: Q[:, lo..lo+k-1] = Q[:, lo..lo+k-1] * wsQtemp
+                applyRotToQ lo k wsQtemp
+            | otherwise = do
+                -- D&C merge for larger subproblems
+                let !k  = (lo + hi) `div` 2
+                    !n1 = k - lo + 1
+                    !n2 = hi - k
+                    !nn = hi - lo + 1
 
-      -- Recurse on T1 [lo..k] and T2 [k+1..hi]
-      dcEigenTridiag mbaD offD mbaE offE mbaQ offQ fullN lo k tol
-      dcEigenTridiag mbaD offD mbaE offE mbaQ offQ fullN (k+1) hi tol
+                -- Read and modify the coupling element
+                beta <- readRawD mbaE offE k
+                dk   <- readRawD mbaD offD k
+                dk1  <- readRawD mbaD offD (k + 1)
+                let !absBeta = abs beta
+                    !rho = beta
+                writeRawD mbaD offD k     (dk - absBeta)
+                writeRawD mbaD offD (k+1) (dk1 - absBeta)
+                writeRawD mbaE offE k 0
 
-      -- === Merge phase ===
-      -- After recursion, d[lo..k] has eigenvalues of T1, d[k+1..hi] has eigenvalues of T2.
-      -- Q columns lo..k and k+1..hi have been updated with eigenvectors.
-      -- Form z = Q^T * v where v has 1 at position k (last row of Q1 block) and
-      -- 1 at position k+1 (first row of Q2 block).
-      -- z[i] = Q[k, lo+i] (for i in T1 range) or Q[k+1, lo+i] (for i in T2 range)
+                -- Recurse on T1 [lo..k] and T2 [k+1..hi]
+                dcGo lo k
+                dcGo (k + 1) hi
 
-      -- Allocate temporary arrays
-      mbaLam <- newByteArray (nn * 8)    -- new eigenvalues
-      mbaZ   <- newByteArray (nn * 8)    -- z vector
-      mbaDSort <- newByteArray (nn * 8)  -- sorted d values
-      mbaZSort <- newByteArray (nn * 8)  -- sorted z values
-      mbaIdx   <- newByteArray (nn * 8)  -- original index (stored as Double)
+                -- === Merge phase ===
+                -- Extract z vector from Q rows
+                forM_ [0..n1-1] $ \i -> do
+                  qv <- readRawD mbaQ 0 (offQ + k * fullN + (lo + i))
+                  writeRawD wsZ 0 i qv
+                forM_ [0..n2-1] $ \i -> do
+                  qv <- readRawD mbaQ 0 (offQ + (k+1) * fullN + (lo + n1 + i))
+                  writeRawD wsZ 0 (n1 + i) qv
 
-      -- Extract z vector: z[i] = Q[k, lo+i] for i=0..n1-1, Q[k+1, lo+i] for i=n1..nn-1
-      forM_ [0..n1-1] $ \i -> do
-        let qIdx = offQ + k * fullN + (lo + i)
-        qv <- readRawD mbaQ 0 qIdx
-        writeRawD mbaZ 0 i qv
-      forM_ [0..n2-1] $ \i -> do
-        let qIdx = offQ + (k+1) * fullN + (lo + n1 + i)
-        qv <- readRawD mbaQ 0 qIdx
-        writeRawD mbaZ 0 (n1 + i) qv
+                -- Copy d[lo..hi] and z into sortable arrays with indices
+                forM_ [0..nn-1] $ \i -> do
+                  di <- readRawD mbaD offD (lo + i)
+                  writeRawD wsDSort 0 i di
+                  writeRawD wsZSort 0 i =<< readRawD wsZ 0 i
+                  writeRawD wsIdx 0 i (fromIntegral i)
 
-      -- Copy d[lo..hi] into a sortable array with indices
-      forM_ [0..nn-1] $ \i -> do
-        di <- readRawD mbaD offD (lo + i)
-        writeRawD mbaDSort 0 i di
-        writeRawD mbaZSort 0 i =<< readRawD mbaZ 0 i
-        writeRawD mbaIdx 0 i (fromIntegral i)
+                -- Sort by d values (insertion sort)
+                forM_ [1..nn-1] $ \i -> do
+                  di   <- readRawD wsDSort 0 i
+                  zi   <- readRawD wsZSort 0 i
+                  idxi <- readRawD wsIdx 0 i
+                  let insertAt !j
+                        | j < 0 = do
+                            writeRawD wsDSort 0 0 di
+                            writeRawD wsZSort 0 0 zi
+                            writeRawD wsIdx 0 0 idxi
+                        | otherwise = do
+                            dj <- readRawD wsDSort 0 j
+                            if dj > di
+                              then do
+                                writeRawD wsDSort 0 (j+1) dj
+                                writeRawD wsZSort 0 (j+1) =<< readRawD wsZSort 0 j
+                                writeRawD wsIdx 0 (j+1) =<< readRawD wsIdx 0 j
+                                insertAt (j - 1)
+                              else do
+                                writeRawD wsDSort 0 (j+1) di
+                                writeRawD wsZSort 0 (j+1) zi
+                                writeRawD wsIdx 0 (j+1) idxi
+                  insertAt (i - 1)
 
-      -- Sort by d values (insertion sort — fine for moderate nn)
-      forM_ [1..nn-1] $ \i -> do
-        di <- readRawD mbaDSort 0 i
-        zi <- readRawD mbaZSort 0 i
-        idxi <- readRawD mbaIdx 0 i
-        let insertAt j
-              | j < 0 = do
-                  writeRawD mbaDSort 0 0 di
-                  writeRawD mbaZSort 0 0 zi
-                  writeRawD mbaIdx 0 0 idxi
-              | otherwise = do
-                  dj <- readRawD mbaDSort 0 j
-                  if dj > di
+                -- Deflation: partition into non-deflated and deflated
+                zn2 <- sumZSq wsZSort 0 nn
+                let !deflTol = tol * sqrt zn2
+                kND <- deflatePartition wsZSort 0 wsPerm 0 nn deflTol
+
+                -- Extract Q_sub with permuted columns into wsQsub (fullN × nn)
+                forM_ [0..nn-1] $ \sortedJ -> do
+                  origIdx <- readRawD wsIdx 0 sortedJ
+                  let !origJ = round origIdx :: Int
+                      !srcCol = lo + origJ
+                  forM_ [0..fullN-1] $ \row -> do
+                    qv <- readRawD mbaQ 0 (offQ + row * fullN + srcCol)
+                    writeRawD wsQsub 0 (row * nn + sortedJ) qv
+
+                if kND == 0
+                  then do
+                    -- All deflated: eigenvalues = sorted d, eigenvectors = sorted Q cols
+                    forM_ [0..nn-1] $ \i ->
+                      forM_ [0..fullN-1] $ \row -> do
+                        qv <- readRawD wsQsub 0 (row * nn + i)
+                        writeRawD mbaQ 0 (offQ + row * fullN + (lo + i)) qv
+                    forM_ [0..nn-1] $ \i -> do
+                      di <- readRawD wsDSort 0 i
+                      writeRawD mbaD offD (lo + i) di
+
+                  else if kND == nn
                     then do
-                      writeRawD mbaDSort 0 (j+1) dj
-                      writeRawD mbaZSort 0 (j+1) =<< readRawD mbaZSort 0 j
-                      writeRawD mbaIdx 0 (j+1) =<< readRawD mbaIdx 0 j
-                      insertAt (j-1)
+                      -- No deflation: full secular solve + full GEMM (original path)
+                      secularSolve wsLam 0 wsDSort 0 wsZSort 0 rho nn deflTol
+                      dcEigenvectors wsW 0 wsDSort 0 wsZSort 0 wsLam 0 rho nn
+                      baQsub <- unsafeFreezeByteArray wsQsub
+                      baW    <- unsafeFreezeByteArray wsW
+                      forM_ [0..fullN * nn - 1] $ \i -> writeRawD wsResult 0 i 0
+                      rawGemmKernel baQsub 0 baW 0 wsResult 0 fullN nn nn
+                      forM_ [0..nn-1] $ \i ->
+                        forM_ [0..fullN-1] $ \row -> do
+                          rv <- readRawD wsResult 0 (row * nn + i)
+                          writeRawD mbaQ 0 (offQ + row * fullN + (lo + i)) rv
+                      forM_ [0..nn-1] $ \i -> do
+                        lam <- readRawD wsLam 0 i
+                        writeRawD mbaD offD (lo + i) lam
+
                     else do
-                      writeRawD mbaDSort 0 (j+1) di
-                      writeRawD mbaZSort 0 (j+1) zi
-                      writeRawD mbaIdx 0 (j+1) idxi
-        insertAt (i-1)
+                      -- Partial deflation: reduced secular solve + reduced GEMM
+                      -- Build compressed d_nd[0..kND-1] and z_nd[0..kND-1]
+                      -- Store in wsQtemp: d_nd at offset 0, z_nd at offset kND
+                      forM_ [0..kND-1] $ \j -> do
+                        pi_ <- readRawI wsPerm 0 j
+                        dpi <- readRawD wsDSort 0 pi_
+                        zpi <- readRawD wsZSort 0 pi_
+                        writeRawD wsQtemp 0 j dpi
+                        writeRawD wsQtemp 0 (kND + j) zpi
 
-      -- Deflation: set near-zero z entries to zero
-      let zNorm2 = sum <$> mapM (\i -> do zi <- readRawD mbaZSort 0 i; pure (zi*zi)) [0..nn-1]
-      zn2 <- zNorm2
-      let zNorm = sqrt zn2
-          deflTol = tol * zNorm
+                      -- Solve kND secular equations on compressed system
+                      secularSolve wsLam 0 wsQtemp 0 wsQtemp kND rho kND deflTol
 
-      -- Count non-deflated entries and solve secular equation for them
-      -- For simplicity, solve for all entries, treating deflated ones specially
-      secularSolve mbaLam 0 mbaDSort 0 mbaZSort 0 rho nn deflTol
+                      -- Compute kND×kND eigenvector matrix W_nd
+                      dcEigenvectors wsW 0 wsQtemp 0 wsQtemp kND wsLam 0 rho kND
 
-      -- Compute eigenvectors: W[j,i] = z[j] / (d[j] - lambda[i]), normalised
-      mbaW <- newByteArray (nn * nn * 8)  -- nn×nn eigenvector matrix
-      dcEigenvectors mbaW 0 mbaDSort 0 mbaZSort 0 mbaLam 0 rho nn
+                      -- Copy deflated columns from wsQsub to mbaQ
+                      forM_ [kND..nn-1] $ \j -> do
+                        pi_ <- readRawI wsPerm 0 j
+                        forM_ [0..fullN-1] $ \row -> do
+                          qv <- readRawD wsQsub 0 (row * nn + pi_)
+                          writeRawD mbaQ 0 (offQ + row * fullN + (lo + j)) qv
 
-      -- Compose Q columns: Q_new[:, lo+i] = sum_j Q_old[:, lo+perm[j]] * W[j, i]
-      -- This is Q_new = Q_old[:, lo..hi] * P * W where P is the sort permutation
-      -- First, build Q_sub = Q_old[:, lo..hi] with columns permuted by sort order
-      mbaQsub <- newByteArray (fullN * nn * 8)  -- fullN × nn
-      forM_ [0..nn-1] $ \sortedJ -> do
-        origIdx <- readRawD mbaIdx 0 sortedJ
-        let origJ = round origIdx :: Int
-            srcCol = lo + origJ
-        forM_ [0..fullN-1] $ \row -> do
-          qv <- readRawD mbaQ 0 (offQ + row * fullN + srcCol)
-          writeRawD mbaQsub 0 (row * nn + sortedJ) qv
+                      -- Extract Q_nd (fullN×kND) from non-deflated columns
+                      forM_ [0..kND-1] $ \j -> do
+                        pi_ <- readRawI wsPerm 0 j
+                        forM_ [0..fullN-1] $ \row -> do
+                          qv <- readRawD wsQsub 0 (row * nn + pi_)
+                          writeRawD wsResult 0 (row * kND + j) qv
 
-      -- Freeze Q_sub and W for GEMM
-      baQsub <- freezeByteArray mbaQsub 0 (fullN * nn * 8)
-      baW <- freezeByteArray mbaW 0 (nn * nn * 8)
+                      -- GEMM: wsQsub(fullN×kND) = Q_nd(fullN×kND) × W_nd(kND×kND)
+                      baQnd <- unsafeFreezeByteArray wsResult
+                      baW   <- unsafeFreezeByteArray wsW
+                      forM_ [0..fullN * kND - 1] $ \i -> writeRawD wsQsub 0 i 0
+                      rawGemmKernel baQnd 0 baW 0 wsQsub 0 fullN kND kND
 
-      -- Allocate result: fullN × nn
-      mbaResult <- newByteArray (fullN * nn * 8)
-      -- Zero it
-      forM_ [0..fullN * nn - 1] $ \i -> writeRawD mbaResult 0 i 0
+                      -- Copy GEMM result (non-deflated columns) to mbaQ
+                      forM_ [0..kND-1] $ \j ->
+                        forM_ [0..fullN-1] $ \row -> do
+                          rv <- readRawD wsQsub 0 (row * kND + j)
+                          writeRawD mbaQ 0 (offQ + row * fullN + (lo + j)) rv
 
-      -- GEMM: result = Q_sub * W  (fullN × nn = fullN × nn * nn × nn)
-      rawGemmKernel (ByteArray (unBA baQsub)) 0 (ByteArray (unBA baW)) 0 mbaResult 0 fullN nn nn
+                      -- Write eigenvalues: non-deflated from wsLam, deflated from wsDSort
+                      forM_ [0..kND-1] $ \i -> do
+                        lam <- readRawD wsLam 0 i
+                        writeRawD mbaD offD (lo + i) lam
+                      forM_ [kND..nn-1] $ \j -> do
+                        pi_ <- readRawI wsPerm 0 j
+                        di <- readRawD wsDSort 0 pi_
+                        writeRawD mbaD offD (lo + j) di
 
-      -- Write result back to Q columns lo..hi
-      forM_ [0..nn-1] $ \i ->
-        forM_ [0..fullN-1] $ \row -> do
-          rv <- readRawD mbaResult 0 (row * nn + i)
-          writeRawD mbaQ 0 (offQ + row * fullN + (lo + i)) rv
+          -- Apply a k×k rotation matrix to Q columns [lo..lo+k-1] via GEMM
+          applyRotToQ !lo !k rotMat = do
+            -- Extract Q[:, lo..lo+k-1] into wsQsub (fullN × k)
+            forM_ [0..k-1] $ \j ->
+              forM_ [0..fullN-1] $ \row -> do
+                qv <- readRawD mbaQ 0 (offQ + row * fullN + (lo + j))
+                writeRawD wsQsub 0 (row * k + j) qv
+            -- O(1) freeze for GEMM inputs
+            baQsub <- unsafeFreezeByteArray wsQsub
+            baRot  <- unsafeFreezeByteArray rotMat
+            -- Zero result
+            forM_ [0..fullN * k - 1] $ \i -> writeRawD wsResult 0 i 0
+            -- GEMM: result(fullN×k) = Qsub(fullN×k) * Rot(k×k)
+            rawGemmKernel baQsub 0 baRot 0 wsResult 0 fullN k k
+            -- Copy result back to Q
+            forM_ [0..k-1] $ \j ->
+              forM_ [0..fullN-1] $ \row -> do
+                rv <- readRawD wsResult 0 (row * k + j)
+                writeRawD mbaQ 0 (offQ + row * fullN + (lo + j)) rv
 
-      -- Write eigenvalues back to d[lo..hi]
-      forM_ [0..nn-1] $ \i -> do
-        lam <- readRawD mbaLam 0 i
-        writeRawD mbaD offD (lo + i) lam
-
--- Helper to unwrap ByteArray for rawGemmKernel
-unBA :: ByteArray -> ByteArray#
-unBA (ByteArray ba) = ba
-{-# INLINE unBA #-}
+      dcGo lo0 hi0
 
 -- | Solve the secular equation: f(λ) = 1 + ρ * Σ z[i]² / (d[i] - λ) = 0
 -- for all nn roots. Roots are stored in mbaLam.
@@ -753,51 +841,145 @@ secularSolve mbaLam offLam mbaD offD mbaZ offZ rho nn deflTol = do
 -- | Solve one root of the secular equation between d[j] and d[j+1]
 -- (or between d[n-1] and +infinity for the last root when rho > 0,
 -- or between -infinity and d[0] for the first root when rho < 0).
--- Uses the middle-way method with Newton-like iteration.
+-- Uses the Gragg/Borges fixed-weight quadratic method (cf. LAPACK dlasd4):
+-- splits f(λ) at the two closest poles, approximates far terms as constant,
+-- and solves the resulting quadratic for rapid convergence (2–4 iterations).
 secularSolveOne :: MutableByteArray s -> Int -> MutableByteArray s -> Int
                 -> Double -> Int -> Int -> ST s Double
 secularSolveOne mbaD offD mbaZ offZ rho j nn = do
   dj <- readRawD mbaD offD j
-  -- Determine bracket
-  (lo_, hi_) <- if rho > 0
+  zj <- readRawD mbaZ offZ j
+  let !zj2 = zj * zj
+  -- Determine bracket and second pole
+  if rho > 0
     then if j < nn - 1
-      then do dj1 <- readRawD mbaD offD (j+1); pure (dj, dj1)
+      then do
+        dj1 <- readRawD mbaD offD (j+1)
+        zj1 <- readRawD mbaZ offZ (j+1)
+        -- Interior root between d[j] and d[j+1]
+        let !gap = dj1 - dj
+            !mid = dj + gap * 0.5
+        fixedWeightLoop 0 mid dj dj1 gap zj2 (zj1 * zj1)
       else do
-        -- Last root: bracket (d[n-1], d[n-1] + ||z||²)
+        -- Last root when rho > 0: between d[n-1] and d[n-1] + rho*||z||²
         zn2 <- sumZSq mbaZ offZ nn
-        pure (dj, dj + abs rho * zn2)
+        let !hi_ = dj + abs rho * zn2
+            !mid = (dj + hi_) * 0.5
+        -- For edge root, use Newton+bisection (no second close pole)
+        newtonLoop 0 mid dj hi_
     else if j > 0
-      then do dj0 <- readRawD mbaD offD (j-1); pure (dj0, dj)
+      then do
+        dj0 <- readRawD mbaD offD (j-1)
+        zj0 <- readRawD mbaZ offZ (j-1)
+        -- Interior root between d[j-1] and d[j] (rho < 0)
+        let !gap = dj - dj0
+            !mid = dj0 + gap * 0.5
+        fixedWeightLoop 0 mid dj0 dj gap (zj0 * zj0) zj2
       else do
+        -- First root when rho < 0
         zn2 <- sumZSq mbaZ offZ nn
-        pure (dj - abs rho * zn2, dj)
-
-  -- Initial guess: midpoint
-  let mid = (lo_ + hi_) / 2
-  -- Newton-like iteration on the secular function
-  iterate_ 0 mid lo_ hi_
+        let !lo_ = dj - abs rho * zn2
+            !mid = (lo_ + dj) * 0.5
+        newtonLoop 0 mid lo_ dj
   where
-    maxIter_ = 80 :: Int
+    !maxIter_ = 30 :: Int
 
-    iterate_ !iter lam lb ub
+    -- Fixed-weight quadratic iteration for interior roots.
+    -- dLo, dHi are the two closest poles; gap = dHi - dLo.
+    -- z2Lo, z2Hi are z²[lo_pole] and z²[hi_pole].
+    fixedWeightLoop !iter !lam !lb !ub !gap !z2Lo !z2Hi
+      | iter >= maxIter_ = pure lam
+      | otherwise = do
+          -- Evaluate f(λ) with split at dLo and dHi
+          (psiSum, phiSum) <- secularFuncSplit mbaD offD mbaZ offZ nn lam lb ub
+          let !f = 1 + rho * (psiSum + phiSum)
+          if abs f < 1e-15 * (1 + abs lam)
+            then pure lam
+            else do
+              -- Extract close-pole contributions
+              let !deltaLo = lb - lam   -- d[lo_pole] - λ (negative for interior root)
+                  !deltaHi = ub - lam   -- d[hi_pole] - λ (positive for interior root)
+                  -- Protect against division by zero near poles
+                  !aClose = if abs deltaLo > 1e-300 then z2Lo / deltaLo else 0
+                  !bClose = if abs deltaHi > 1e-300 then z2Hi / deltaHi else 0
+                  -- "Far" residual: W = f - ρ*(aClose + bClose)
+                  !w = f - rho * (aClose + bClose)
+                  -- Quadratic in τ = dLo - λ (= deltaLo):
+                  -- W*τ² - (W*gap + ρ*z2Lo + ρ*z2Hi)*τ + ρ*z2Lo*gap = 0
+                  !qa = w
+                  !qb = -(w * gap + rho * z2Lo + rho * z2Hi)
+                  !qc = rho * z2Lo * gap
+                  !disc = qb * qb - 4 * qa * qc
+              if disc < 0 || abs qa < 1e-300
+                then do
+                  -- Degenerate: fall back to bisection
+                  let !lamNew = (lb + ub) * 0.5
+                      !(lb', ub') = if f * rho > 0 then (lb, lam) else (lam, ub)
+                  fixedWeightLoop (iter + 1) lamNew lb' ub' gap z2Lo z2Hi
+                else do
+                  let !sqrtDisc = sqrt disc
+                      -- Two roots for τ = dLo - λ, i.e. λ = dLo - τ
+                      -- Use the numerically stable form
+                      !tauA = if qb <= 0
+                              then (-qb + sqrtDisc) / (2 * qa)
+                              else 2 * qc / (-qb + sqrtDisc)
+                      !tauB = if qb <= 0
+                              then 2 * qc / (-qb + sqrtDisc)
+                              else (-qb + sqrtDisc) / (2 * qa)
+                      -- λ = dLo - τ; pick the root in (dLo, dHi) i.e. τ in (-gap, 0)
+                      !lamA = lb - tauA
+                      !lamB = lb - tauB
+                      !lamNew0 = if lamA > lb && lamA < ub then lamA
+                                 else if lamB > lb && lamB < ub then lamB
+                                 else (lb + ub) * 0.5  -- bisection fallback
+                      -- Update bracket
+                      !(lb', ub') = if f * rho > 0 then (lb, lam) else (lam, ub)
+                      -- Ensure lamNew is in updated bracket
+                      !lamNew = if lamNew0 > lb' && lamNew0 < ub'
+                                then lamNew0
+                                else (lb' + ub') * 0.5
+                  if abs (lamNew - lam) < 1e-15 * (1 + abs lam)
+                    then pure lamNew
+                    else fixedWeightLoop (iter + 1) lamNew lb' ub' gap z2Lo z2Hi
+
+    -- Newton+bisection fallback for edge roots (first/last eigenvalue).
+    newtonLoop !iter !lam !lb !ub
       | iter >= maxIter_ = pure lam
       | otherwise = do
           (f, fp) <- secularFuncAndDeriv mbaD offD mbaZ offZ rho nn lam
           if abs f < 1e-15 * (1 + abs lam)
             then pure lam
             else do
-              -- Newton step with bisection fallback
-              let step = f / fp
-                  lamNew0 = lam - step
-                  -- Ensure we stay in bracket
-                  lamNew = if lamNew0 <= lb || lamNew0 >= ub
-                           then (lb + ub) / 2
-                           else lamNew0
-                  -- Update bracket
-                  (lb', ub') = if f > 0 then (lb, lam) else (lam, ub)
+              let !step = f / fp
+                  !lamNew0 = lam - step
+                  !lamNew = if lamNew0 <= lb || lamNew0 >= ub
+                            then (lb + ub) * 0.5
+                            else lamNew0
+                  !(lb', ub') = if f > 0 then (lb, lam) else (lam, ub)
               if abs (lamNew - lam) < 1e-15 * (1 + abs lam)
                 then pure lamNew
-                else iterate_ (iter + 1) lamNew lb' ub'
+                else newtonLoop (iter + 1) lamNew lb' ub'
+
+-- | Evaluate the secular function split at the two bracket poles.
+-- Returns (ψ, φ) where f(λ) = 1 + ρ*(ψ + φ).
+-- ψ = Σ_{d[i] ≤ dLo} z[i]²/(d[i] - λ), φ = Σ_{d[i] ≥ dHi} z[i]²/(d[i] - λ)
+secularFuncSplit :: MutableByteArray s -> Int -> MutableByteArray s -> Int
+                 -> Int -> Double -> Double -> Double -> ST s (Double, Double)
+secularFuncSplit mbaD offD mbaZ offZ nn lam dLo dHi = go 0 0 0
+  where
+    go i !psiAcc !phiAcc
+      | i >= nn = pure (psiAcc, phiAcc)
+      | otherwise = do
+          di <- readRawD mbaD offD i
+          zi <- readRawD mbaZ offZ i
+          let !diff = di - lam
+              !zi2 = zi * zi
+          if abs diff < 1e-300
+            then go (i+1) psiAcc phiAcc
+            else let !term = zi2 / diff
+                 in if di <= dLo
+                    then go (i+1) (psiAcc + term) phiAcc
+                    else go (i+1) psiAcc (phiAcc + term)
 
 -- | Evaluate the secular function f(λ) = 1 + ρ * Σ z[i]² / (d[i] - λ)
 -- and its derivative f'(λ) = ρ * Σ z[i]² / (d[i] - λ)².
@@ -828,8 +1010,42 @@ sumZSq mbaZ offZ nn = go 0 0
           zi <- readRawD mbaZ offZ i
           go (i+1) (acc + zi * zi)
 
+-- | Partition sorted indices into non-deflated (|z[i]| > deflTol) and deflated.
+-- Returns k (non-deflated count).
+-- perm[0..k-1] = sorted indices of non-deflated entries (in sorted order).
+-- perm[k..nn-1] = sorted indices of deflated entries (in sorted order).
+deflatePartition :: MutableByteArray s -> Int    -- ^ sorted z + offset
+                 -> MutableByteArray s -> Int    -- ^ output perm (Int array) + offset
+                 -> Int -> Double                -- ^ nn, deflTol
+                 -> ST s Int
+deflatePartition mbaZ offZ mbaPerm offPerm nn deflTol = do
+    k <- goND 0 0
+    goDF 0 k
+    pure k
+  where
+    goND !i !kND
+      | i >= nn = pure kND
+      | otherwise = do
+          zi <- readRawD mbaZ offZ i
+          if abs zi > deflTol
+            then do
+              writeRawI mbaPerm offPerm kND i
+              goND (i+1) (kND+1)
+            else goND (i+1) kND
+    goDF !i !pos
+      | i >= nn = pure ()
+      | otherwise = do
+          zi <- readRawD mbaZ offZ i
+          if abs zi <= deflTol
+            then do
+              writeRawI mbaPerm offPerm pos i
+              goDF (i+1) (pos+1)
+            else goDF (i+1) pos
+
 -- | Compute eigenvector matrix W from secular equation solutions.
 -- W[j,i] = z[j] / (d[j] - lambda[i]), each column normalised.
+-- Single-pass: writes unnormalised entries and accumulates norm² simultaneously,
+-- then normalises each column with SIMD.
 dcEigenvectors :: MutableByteArray s -> Int     -- ^ W (nn × nn output)
                -> MutableByteArray s -> Int     -- ^ d (sorted poles)
                -> MutableByteArray s -> Int     -- ^ z
@@ -839,26 +1055,25 @@ dcEigenvectors :: MutableByteArray s -> Int     -- ^ W (nn × nn output)
 dcEigenvectors mbaW offW mbaD offD mbaZ offZ mbaLam offLam _rho nn = do
   forM_ [0..nn-1] $ \i -> do
     lami <- readRawD mbaLam offLam i
-    -- Compute column i: W[j,i] = z[j] / (d[j] - lami)
-    -- First pass: compute unnormalised entries and norm
-    norm2 <- go_norm i lami 0 0
-    let invNorm = if norm2 > 0 then 1 / sqrt norm2 else 1
-    -- Second pass: write normalised entries
+    -- Single pass: write unnormalised W[j,i] and accumulate norm²
+    norm2 <- writeAndNorm lami i 0 0
+    let !invNorm = if norm2 > 0 then 1 / sqrt norm2 else 1
+    -- SIMD normalisation: W[j,i] *= invNorm for all j
+    -- W is stored row-major W[j,i] at offset j*nn+i, so column i has stride nn.
+    -- Since column stride is nn (not 1), we use scalar normalisation.
     forM_ [0..nn-1] $ \j -> do
-      zj <- readRawD mbaZ offZ j
-      dj <- readRawD mbaD offD j
-      let diff = dj - lami
-          wji = if abs diff < 1e-300 then 0 else (zj / diff) * invNorm
-      writeRawD mbaW offW (j * nn + i) wji
+      wji <- readRawD mbaW offW (j * nn + i)
+      writeRawD mbaW offW (j * nn + i) (wji * invNorm)
   where
-    go_norm i lami j !acc
+    writeAndNorm !lami !i !j !acc
       | j >= nn = pure acc
       | otherwise = do
           zj <- readRawD mbaZ offZ j
           dj <- readRawD mbaD offD j
-          let diff = dj - lami
-              w = if abs diff < 1e-300 then 0 else zj / diff
-          go_norm i lami (j+1) (acc + w * w)
+          let !diff = dj - lami
+              !w = if abs diff < 1e-300 then 0 else zj / diff
+          writeRawD mbaW offW (j * nn + i) w
+          writeAndNorm lami i (j + 1) (acc + w * w)
 
 -- | Classical Jacobi eigenvalue method (GVL4 Section 8.5).
 jacobiEigen :: forall n r e. (KnownNat n, M.Manifest r e, Floating e, Ord e)

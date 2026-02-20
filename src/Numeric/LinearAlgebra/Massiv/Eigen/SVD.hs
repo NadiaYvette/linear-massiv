@@ -41,7 +41,8 @@ module Numeric.LinearAlgebra.Massiv.Eigen.SVD
 import qualified Data.Massiv.Array as M
 import Data.Massiv.Array (Ix2(..), Sz(..), unwrapByteArray, unwrapByteArrayOffset,
                           unwrapMutableByteArray, unwrapMutableByteArrayOffset)
-import Data.Primitive.ByteArray (ByteArray(..), MutableByteArray(..), newByteArray)
+import Data.Primitive.ByteArray (ByteArray(..), MutableByteArray(..), newByteArray,
+                                 unsafeFreezeByteArray)
 import GHC.TypeNats (KnownNat)
 import Control.Monad (forM_, when)
 import Control.Monad.ST (runST)
@@ -52,8 +53,8 @@ import GHC.ST (ST(..))
 
 import Numeric.LinearAlgebra.Massiv.Types
 import Numeric.LinearAlgebra.Massiv.Internal
-import Numeric.LinearAlgebra.Massiv.BLAS.Level3 (matMul, matMulP, transpose)
-import Numeric.LinearAlgebra.Massiv.BLAS.Level2 (matvecP)
+import Numeric.LinearAlgebra.Massiv.BLAS.Level3 (matMul, matMulP, transpose, matMulAtAP)
+-- matvecP no longer needed: U-matrix now computed via single GEMM
 import Numeric.LinearAlgebra.Massiv.Eigen.Symmetric (symmetricEigen, symmetricEigenP)
 import Numeric.LinearAlgebra.Massiv.Internal.Kernel
   ( rawMutSumSqColumn, rawMutSumSqRow
@@ -136,39 +137,84 @@ svdAtAP :: forall m n. (KnownNat m, KnownNat n)
 svdAtAP a =
   let !mm = dimVal @m
       !nn = dimVal @n
-      at = transpose a
-      !ata = matMulP at a  -- n×n symmetric positive semidefinite, SIMD GEMM
+      !ata = matMulAtAP a  -- n×n symmetric positive semidefinite, fast transpose + SIMD GEMM
       -- Eigendecomposition of AᵀA using raw primop QR iteration
-      (!eigvals, !v) = symmetricEigenP ata (30 * nn) 1e-12
+      (!eigvals, !v) = symmetricEigenP ata (10 * nn) 1e-12
       -- Singular values = sqrt of eigenvalues (clamp negatives to 0)
       sigma = makeVector @n @M.P $ \i ->
         let ev = eigvals !. i
         in if ev > 0 then sqrt ev else 0
-      -- Compute U columns: u_j = A·v_j / σ_j using matvecP
-      -- Extract each column of V as a vector, multiply by A, normalise
+      -- Compute U = A·V via single GEMM, then scale columns by 1/σ_j
+      !av = matMulP a v  -- m×n result via SIMD GEMM
       u = createMatrix @m @m @M.P $ \mu -> do
-        -- Get immutable arrays for raw reads
-        let !baV = unwrapByteArray (unMatrix v)
-            !offV = unwrapByteArrayOffset (unMatrix v)
+        let !baAV  = unwrapByteArray (unMatrix av)
+            !offAV = unwrapByteArrayOffset (unMatrix av)
+            !mbaU  = unwrapMutableByteArray mu
+            !offU  = unwrapMutableByteArrayOffset mu
+            !(MutableByteArray mbaU#) = mbaU
+            !(I# offU#) = offU
+            !(I# mm#) = mm
+            !(I# nn#) = nn
+            !nn4 = nn - (nn `rem` 4)
+            !(I# nn4#) = nn4
+            !(I# mmxmm#) = mm * mm
+        -- Zero-initialise only the padding region U[i, nn..mm-1] when mm > nn.
+        -- The SIMD loop below fills all U[i, 0..nn-1], so no zeroing needed there.
+        when (mm > nn) $
+          ST $ \s0 ->
+            let goZ i s
+                  | isTrue# (i >=# mm#) = s
+                  | otherwise =
+                      let goCol j s1
+                            | isTrue# (j >=# mm#) = s1
+                            | otherwise = case writeDoubleArray# mbaU# (offU# +# i *# mm# +# j) 0.0## s1 of
+                                            s2 -> goCol (j +# 1#) s2
+                      in goZ (i +# 1#) (goCol nn# s)
+            in (# goZ 0# s0, () #)
+        -- Pre-compute invSigma vector, then freeze for immutable SIMD reads
+        mbaInvS <- newByteArray (nn * 8)
         forM_ [0..nn-1] $ \j -> do
           let sj = sigma !. j
-          if sj > 1e-14
-            then do
-              -- Extract column j of V as a Vector n
-              let !vj = makeVector @n @M.P $ \k -> readBA baV offV (k * nn + j)
-                  -- u_j = A · v_j / σ_j
-                  !avj = matvecP a vj
-                  !invSj = 1.0 / sj
-              forM_ [0..mm-1] $ \i ->
-                M.write_ mu (i :. j) (invSj * (avj !. i))
-            else
-              -- Zero singular value: use standard basis vector
-              forM_ [0..mm-1] $ \i ->
-                M.write_ mu (i :. j) (if i == j then 1 else 0)
+          writeRawD mbaInvS 0 j (if sj > 1e-14 then 1.0 / sj else 0.0)
+        !(ByteArray baInvS#) <- unsafeFreezeByteArray mbaInvS
+        -- Row-oriented SIMD column-scaling: U[i,j] = invSigma[j] * AV[i,j]
+        -- Both AV[i,0..nn-1] and U[i,0..nn-1] are contiguous in row-major layout
+        let !(ByteArray baAV#) = baAV
+            !(I# offAV#) = offAV
+        -- SIMD row loop (immutable reads for AV and invSigma, mutable writes for U)
+        ST $ \s0 ->
+          let goRow i s
+                | isTrue# (i >=# mm#) = s
+                | otherwise =
+                    let !avRowOff = offAV# +# i *# nn#
+                        !uRowOff  = offU# +# i *# mm#
+                        -- SIMD phase: process 4 columns at a time
+                        goSimd j s1
+                          | isTrue# (j >=# nn4#) = s1
+                          | otherwise =
+                              let avV  = indexDoubleArrayAsDoubleX4# baAV# (avRowOff +# j)
+                                  isV  = indexDoubleArrayAsDoubleX4# baInvS# j
+                                  !prod = timesDoubleX4# avV isV
+                              in case writeDoubleArrayAsDoubleX4# mbaU# (uRowOff +# j) prod s1 of
+                                   s2 -> goSimd (j +# 4#) s2
+                        -- Scalar cleanup for remainder columns
+                        goScalar j s1
+                          | isTrue# (j >=# nn#) = s1
+                          | otherwise =
+                              let avVal = indexDoubleArray# baAV# (avRowOff +# j)
+                                  isVal = indexDoubleArray# baInvS# j
+                              in case writeDoubleArray# mbaU# (uRowOff +# j) (avVal *## isVal) s1 of
+                                   s2 -> goScalar (j +# 1#) s2
+                    in goRow (i +# 1#) (goScalar nn4# (goSimd 0# s))
+          in (# goRow 0# s0, () #)
+        -- Fix zero singular values: set diagonal U[j,j] = 1.0
+        forM_ [0..nn-1] $ \j -> do
+          let sj = sigma !. j
+          when (sj <= 1e-14) $
+            writeRawD mbaU offU (j * mm + j) 1.0
         -- Extra columns for m > n: extend to full orthogonal basis
         forM_ [nn..mm-1] $ \j ->
-          forM_ [0..mm-1] $ \i ->
-            M.write_ mu (i :. j) (if i == j then 1 else 0)
+          writeRawD mbaU offU (j * mm + j) 1.0
   in (u, sigma, v)
 {-# NOINLINE svdAtAP #-}
 
@@ -198,9 +244,8 @@ singularValuesP :: forall m n. (KnownNat m, KnownNat n)
                 => Matrix m n M.P Double -> Vector n M.P Double
 singularValuesP a =
   let nn = dimVal @n
-      at = transpose a
-      !ata = matMulP at a
-      (!eigvals, _) = symmetricEigenP ata (30 * nn) 1e-12
+      !ata = matMulAtAP a
+      (!eigvals, _) = symmetricEigenP ata (10 * nn) 1e-12
       evList = map (\i -> eigvals !. i) [0..nn-1]
       sorted = sortBy (\x y -> compare (Down x) (Down y)) evList
   in makeVector @n @M.P $ \i ->

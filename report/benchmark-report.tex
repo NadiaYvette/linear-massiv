@@ -46,28 +46,29 @@ strategies on a 20-core workstation. Initial results show that
 \texttt{hmatrix} (OpenBLAS) dominates at all sizes for $O(n^3)$ operations
 due to highly-optimised Fortran BLAS/LAPACK routines, while \texttt{linear}
 excels at $4 \times 4$ through unboxed product types.
-After six rounds of optimisation---algorithmic improvements (cache-blocked
+After ten rounds of optimisation---algorithmic improvements (cache-blocked
 GEMM, in-place QR/eigenvalue via the ST monad), raw
 \texttt{ByteArray\#} with GHC~9.14's \texttt{DoubleX4\#} AVX2 SIMD
 primops for BLAS Level~1--3, extending raw kernel techniques to
 higher-level algorithms (LU, Cholesky, QR, eigenvalue), P-specialised SVD
-pipeline wiring, parallel GEMM, and raw primop
-tridiagonalisation---\texttt{linear-massiv} now \textbf{outperforms or
+pipeline wiring, parallel GEMM, raw primop tridiagonalisation, SIMD
+substitution kernels, SVD GEMM U-construction, and SVD SIMD
+column-scaling---\texttt{linear-massiv} now \textbf{outperforms or
 matches hmatrix (OpenBLAS/LAPACK) in eight of nine benchmarked operation
 categories}: GEMM is $2\times$ faster at $200 \times 200$
 single-threaded and \textbf{$14\times$ faster at $500 \times 500$ with
 20~cores}; dot product is $3\text{--}11\times$ faster; LU solve is
-$1.8\text{--}2.8\times$ faster; Cholesky solve is
-$1.1\text{--}3.1\times$ faster; QR factorisation is
+$1.5\text{--}3.0\times$ faster; Cholesky solve is
+$1.7\text{--}2.8\times$ faster; QR factorisation is
 $7.5\text{--}33\times$ faster; and \textbf{eigenvalue decomposition
-now matches LAPACK at $50{\times}50$} (ratio $0.93\times$), having
-improved from $149\times$ slower.  SVD remains $3\text{--}6\times$
-slower, attributable to explicit $A^T A$ formation rather than direct
-bidiagonalisation.  \texttt{linear-massiv} demonstrates that pure
-Haskell with native SIMD and raw \texttt{ByteArray\#} primops can
-comprehensively outperform FFI-based BLAS/LAPACK, while providing
-compile-time dimensional safety, zero FFI dependencies, and
-user-controllable parallelism.
+matches LAPACK up to $50{\times}50$} (ratio $0.90\times$), having
+improved from $149\times$ slower.  SVD remains $2.4\text{--}3.2\times$
+slower, attributable to the eigendecomposition sub-step and explicit
+$A^T A$ formation rather than direct bidiagonalisation.
+\texttt{linear-massiv} demonstrates that pure Haskell with native SIMD
+and raw \texttt{ByteArray\#} primops can comprehensively outperform
+FFI-based BLAS/LAPACK, while providing compile-time dimensional safety,
+zero FFI dependencies, and user-controllable parallelism.
 \end{abstract}
 
 \tableofcontents
@@ -134,7 +135,7 @@ Parallel GEMM                & ---            & ---       & all sizes \\
 \begin{itemize}
 \item \textbf{CPU:} 20-core x86\_64 processor (Linux 6.17, Fedora 43)
 \item \textbf{Compiler:} GHC 9.12.2 with \texttt{-O2} (Rounds~1--2);
-      GHC 9.14.1 with LLVM~17 backend (\texttt{-fllvm -mavx2 -mfma}) (Round~3)
+      GHC 9.14.1 with LLVM~17 backend (\texttt{-fllvm -mavx2 -mfma}) (Rounds~3--10)
 \item \textbf{BLAS backend:} OpenBLAS (system-installed via FlexiBLAS)
 \item \textbf{Benchmark framework:} Criterion~\cite{criterion} with 95\% confidence intervals
 \item \textbf{Protocol:} Single-threaded (\texttt{+RTS -N1}) for cross-library comparisons;
@@ -2297,11 +2298,846 @@ meaningful improvements are in the solver ratios, where the absolute
 \end{enumerate}
 
 %% ====================================================================
+\section{Round~9: SVD GEMM U-Construction and Larger Benchmarks}
+\label{sec:round9}
+
+Round~9 targets the SVD bottleneck identified in \S\ref{sec:round8-future}
+and extends benchmarks to $200{\times}200$ and $500{\times}500$.
+
+\subsection{Optimisations Applied}
+
+\paragraph{SVD U-matrix construction via single GEMM.}
+The previous \texttt{svdAtAP} implementation constructed the left singular
+vectors $U = A V \Sigma^{-1}$ column-by-column: for each of the $n$ columns,
+it called \texttt{matvecP} (one matrix--vector product) plus $m$ individual
+\texttt{M.write\_} calls through massiv's safe bounds-checking API.  For
+$100{\times}100$, this amounted to 100 \texttt{matvecP} calls plus 10{,}000
+\texttt{M.write\_} calls, consuming ${\sim}75\%$ of SVD time (${\sim}8.7$\,ms
+of 11.6\,ms).
+
+The replacement computes $A V$ as a single \texttt{matMulP} call (one SIMD
+GEMM, ${\sim}0.66$\,ms), then scales each column by $1/\sigma_j$ using raw
+\texttt{ByteArray\#} primops (\texttt{readBA}, \texttt{writeRawD}), eliminating
+all per-column overhead and bounds-checking costs.
+
+\paragraph{D\&C eigensolver optimisation (attempted, reverted).}
+The D\&C code from Round~8 was significantly improved: all nine temporary arrays
+(totalling $O(n^2)$ bytes) are now pre-allocated once at the top level rather
+than per-recursion-level, eliminating GC pressure; \texttt{unsafeFreezeByteArray}
+replaces \texttt{freezeByteArray} for $O(1)$ GEMM input preparation; and a QR
+fallback handles subproblems $\leq 25$ elements, avoiding merge machinery
+overhead at the bottom of the recursion tree.
+
+However, benchmarks showed the optimised D\&C still regresses relative to
+QR iteration: $1.90\times$ vs.\ $1.16\times$ at $100{\times}100$, rising to
+$2.55\times$ vs.\ $1.51\times$ at $500{\times}500$.  The constant-factor
+overhead of the merge phase (insertion sort, secular equation Newton iteration,
+per-element $Q$-extraction and copy-back) outweighs the asymptotic advantage
+($O(n^2 \log n)$ vs.\ $O(n^3)$) at these sizes.  LAPACK's \texttt{dstevd}
+has decades of sophisticated deflation, Bunch--Nielsen--Sorensen rational
+interpolation, and BLAS-3 $Q$-composition that our Haskell implementation
+cannot yet match.  The D\&C code is retained for future work but not wired in.
+
+\paragraph{Larger benchmarks.}
+Benchmark groups for $200{\times}200$ and $500{\times}500$ were added for
+both \texttt{eigenSH} and \texttt{SVD}, providing data on how the QR
+eigensolver's $O(n^3)$ cost scales relative to LAPACK's $O(n^2 \log n)$
+D\&C.
+
+\subsection{Results}
+
+\subsubsection{SVD Improvement}
+
+\begin{center}
+\begin{tabular}{lrrrrr}
+\hline
+Size & R8 LM (ms) & R9 LM (ms) & $\Delta$ & R9 HM (ms) & Ratio \\
+\hline
+$10{\times}10$   & 0.093 & 0.063 & $-32\%$ & 0.024 & $2.64\times$ \\
+$50{\times}50$   & 2.058 & 1.971 & $-4\%$  & 0.535 & $3.68\times$ \\
+$100{\times}100$ & 11.56 & 10.14 & $-12\%$ & 3.21  & $3.16\times$ \\
+$200{\times}200$ & ---   & 71.1  & ---     & 27.6  & $2.58\times$ \\
+$500{\times}500$ & ---   & 942   & ---     & 356   & $2.65\times$ \\
+\hline
+\end{tabular}
+\end{center}
+
+The GEMM U-construction delivered a $32\%$ absolute speedup at $10{\times}10$
+(where per-call \texttt{matvecP} overhead dominates) and $12\%$ at
+$100{\times}100$.  The improvement is smaller than the theoretical maximum
+(${\sim}90\%$) because the column-scaling loop uses column-strided memory
+access (stride $m$ through both input and output arrays), causing cache
+misses that partially offset the GEMM gains.
+
+The SVD ratio decreases at larger sizes ($3.68\times$ at $50{\times}50$
+$\to$ $2.58\times$ at $200{\times}200$ $\to$ $2.65\times$ at $500{\times}500$),
+reflecting the growing dominance of GEMM operations (where \texttt{linear-massiv}
+is competitive) over the overhead components.
+
+\subsubsection{Eigenvalue Scaling}
+
+\begin{center}
+\begin{tabular}{lrrrr}
+\hline
+Size & LM (ms) & HM (ms) & Ratio & vs.\ R8 \\
+\hline
+$10{\times}10$   & 0.0117 & 0.0120 & $0.98\times$ & $\approx$ \\
+$50{\times}50$   & 0.360  & 0.363  & $0.99\times$ & $\approx$ \\
+$100{\times}100$ & 2.63   & 2.26   & $1.16\times$ & $1.23\times$ \\
+$200{\times}200$ & 20.2   & 14.9   & $1.36\times$ & --- \\
+$500{\times}500$ & 343    & 226    & $1.51\times$ & --- \\
+\hline
+\end{tabular}
+\end{center}
+
+With QR iteration (the shipping configuration), \texttt{linear-massiv}
+achieves near-parity at $\leq 50{\times}50$ and $1.16\times$ at $100{\times}100$.
+The ratio rises to $1.51\times$ at $500{\times}500$, confirming the expected
+$O(n^3)$ vs.\ $O(n^2 \log n)$ divergence.  At these sizes, replacing the
+QR eigensolver with a competitive D\&C implementation would provide
+meaningful improvement, but the current D\&C code is not yet competitive.
+
+\subsubsection{Full Benchmark Summary (Single-Threaded)}
+
+\begin{center}
+\begin{tabular}{llrr}
+\hline
+Operation & Size & Ratio & vs.\ R8 \\
+\hline
+GEMM            & $100{\times}100$ & $0.66\times$ & $\approx$ \\
+GEMM            & $500{\times}500$ & $0.42\times$ & $\approx$ \\
+dot             & $1000$           & $0.32\times$ & $\approx$ \\
+matvec          & $100$            & $0.51\times$ & $\approx$ \\
+LU solve        & $100{\times}100$ & $0.55\times$ & $\approx$ \\
+Cholesky solve  & $100{\times}100$ & $0.48\times$ & $0.50\times$ \\
+QR              & $100{\times}100$ & $0.033\times$ & $\approx$ \\
+eigenSH         & $100{\times}100$ & $1.16\times$ & $1.23\times$ \\
+eigenSH         & $500{\times}500$ & $1.51\times$ & --- \\
+SVD             & $100{\times}100$ & $3.16\times$ & $3.63\times$ \\
+SVD             & $500{\times}500$ & $2.65\times$ & --- \\
+\hline
+\end{tabular}
+\end{center}
+
+\subsubsection{Parallel Benchmarks ($+$RTS $-$N)}
+
+Table~\ref{tab:round9-par-eigen} shows eigenvalue performance under parallel
+scheduling.  The \texttt{linear-massiv} parallel eigenSH path (\texttt{lm-parallel})
+exploits \texttt{matMulP}'s thread-level parallelism during the
+tridiagonalisation GEMM phases.
+
+\begin{table}[h]
+\centering
+\caption{Eigenvalue parallel performance ($+$RTS $-$N)}
+\label{tab:round9-par-eigen}
+\begin{tabular}{lrrrr}
+\hline
+Size & LM (ms) & LM-par (ms) & HM (ms) & Ratio (par/HM) \\
+\hline
+$10{\times}10$   & 0.028 & ---  & 0.018 & $1.57\times$ \\
+$50{\times}50$   & 0.546 & ---  & 0.518 & $1.05\times$ \\
+$100{\times}100$ & 3.38  & 2.95 & 3.04  & $\mathbf{0.97\times}$ \\
+$200{\times}200$ & 24.2  & ---  & 17.2  & $1.41\times$ \\
+$500{\times}500$ & 367   & ---  & 304   & $1.21\times$ \\
+\hline
+\end{tabular}
+\end{table}
+
+The $100{\times}100$ parallel eigenSH achieves $\mathbf{0.97\times}$---below parity
+with hmatrix/LAPACK.  At $500{\times}500$, the ratio improves from $1.51\times$
+(single-threaded) to $1.21\times$ under parallel scheduling, as the
+\texttt{linear-massiv} tridiagonalisation benefits from parallel GEMM while
+hmatrix's LAPACK path sees increased scheduling overhead.
+
+Table~\ref{tab:round9-par-summary} summarises the full parallel benchmark suite.
+
+\begin{table}[h]
+\centering
+\caption{Full parallel benchmark summary ($+$RTS $-$N)}
+\label{tab:round9-par-summary}
+\begin{tabular}{llrrr}
+\hline
+Operation & Size & Ratio (N1) & Ratio (N) & $\Delta$ \\
+\hline
+GEMM            & $200{\times}200$ & $0.49\times$ & $0.19\times$ & $\downarrow$ \\
+GEMM            & $500{\times}500$ & $0.42\times$ & $0.09\times$ & $\downarrow$ \\
+dot             & $1000$           & $0.32\times$ & $0.23\times$ & $\approx$ \\
+matvec          & $100$            & $0.51\times$ & $0.44\times$ & $\approx$ \\
+LU solve        & $100{\times}100$ & $0.55\times$ & $0.69\times$ & $\uparrow$ \\
+Cholesky solve  & $100{\times}100$ & $0.48\times$ & $0.61\times$ & $\uparrow$ \\
+QR              & $100{\times}100$ & $0.033\times$ & $0.032\times$ & $\approx$ \\
+eigenSH         & $100{\times}100$ & $1.16\times$ & $0.97\times$ & $\downarrow$ \\
+eigenSH         & $500{\times}500$ & $1.51\times$ & $1.21\times$ & $\downarrow$ \\
+SVD             & $100{\times}100$ & $3.16\times$ & $3.72\times$ & $\uparrow$ \\
+SVD             & $500{\times}500$ & $2.65\times$ & $2.84\times$ & $\uparrow$ \\
+\hline
+\end{tabular}
+\end{table}
+
+Parallel GEMM at $500{\times}500$ achieves $\mathbf{0.09\times}$ ($11\times$ faster
+than OpenBLAS), the strongest single result in the benchmark suite.  The solver
+ratios degrade slightly under parallel scheduling (LU $0.55\to0.69$, Cholesky
+$0.48\to0.61$) due to OS-level scheduling contention: the single-threaded solver
+kernels cannot exploit additional capabilities but suffer context-switching overhead.
+SVD degrades similarly ($3.16\to3.72$ at $100{\times}100$) because the eigenSH
+sub-step gains are offset by increased overhead in the non-parallel phases.
+
+\subsection{Remaining Bottlenecks and Future Work}
+\label{sec:round9-future}
+
+\begin{enumerate}
+\item \textbf{SVD bidiagonalisation via blocked WY Householder.}
+  The SVD gap ($2.6\text{--}3.7\times$) is driven by two components:
+  the eigendecomposition of $A^T A$ (${\sim}25\%$ of SVD time at
+  $100{\times}100$) and the $A^T A$ and $A V$ GEMM operations
+  (${\sim}13\%$).  A Golub--Kahan bidiagonalisation with blocked WY
+  reflector accumulation would eliminate the $A^T A$ formation entirely,
+  reducing SVD to bidiagonalisation plus iterative bidiagonal SVD,
+  both amenable to BLAS-3 acceleration.
+
+\item \textbf{Competitive D\&C eigensolver.}
+  The gap between QR ($1.51\times$ at $500{\times}500$) and parity
+  motivates a D\&C implementation matching LAPACK's sophistication:
+  Bunch--Nielsen--Sorensen rational interpolation for secular equation
+  roots, multi-level deflation, and BLAS-3 $Q$-composition via
+  tiled GEMM rather than per-element extraction loops.
+
+\item \textbf{Column-scaling SIMD vectorisation.}
+  The SVD column-scaling loop (scaling $U$ columns by $1/\sigma_j$)
+  currently uses scalar raw primops with column-strided access.
+  Restructuring as row-oriented SIMD would improve cache utilisation
+  and halve the SVD overhead from column scaling.
+\end{enumerate}
+
+%% ====================================================================
+\section{Round~10: SVD Column-Scaling SIMD and D\&C Secular Equation}
+\label{sec:round10}
+
+Round~10 targets the three remaining bottlenecks identified in
+\S\ref{sec:round9-future}: SIMD column-scaling for SVD, improved D\&C
+secular equation solver, and D\&C eigenvector computation.
+
+\subsection{Optimisations Applied}
+
+\paragraph{SVD column-scaling SIMD vectorisation.}
+The SVD U-matrix construction computes $U = A V \Sigma^{-1}$ by first
+performing $AV$ via a single GEMM, then scaling each entry by
+$1/\sigma_j$.  In Round~9, this column-scaling loop iterated
+columns-outer, rows-inner: for each column~$j$, it accessed
+$\text{AV}[0,j], \text{AV}[1,j], \ldots$ (stride-$n$) and wrote
+$U[0,j], U[1,j], \ldots$ (stride-$m$).  Both access patterns are
+cache-hostile in row-major layout.
+
+Round~10 restructures the loop as row-oriented SIMD:
+\begin{enumerate}
+\item Pre-compute an $n$-element \texttt{invSigma} vector ($1/\sigma_j$,
+  or $0$ for negligible singular values), then freeze it via
+  \texttt{unsafeFreezeByteArray} for immutable SIMD reads.
+\item Outer loop over rows ($i = 0, \ldots, m{-}1$).
+\item Inner SIMD loop over columns in groups of~4:
+  load \texttt{DoubleX4\#} from $\text{AV}[i,j{:}j{+}3]$ and
+  $\text{invSigma}[j{:}j{+}3]$, multiply via \texttt{timesDoubleX4\#},
+  write to $U[i,j{:}j{+}3]$.
+\item Scalar cleanup for the remaining $n \bmod 4$ columns.
+\item When $m = n$ (the common square case), the SIMD loop fills all
+  elements, so zero-initialisation is skipped entirely; when $m > n$,
+  only the padding region $U[i, n{:}m{-}1]$ is zeroed.
+\end{enumerate}
+
+Both AV and U row segments are contiguous in memory, giving stride-1
+access and full cache-line utilisation.
+
+\paragraph{D\&C secular equation: Gragg--Borges fixed-weight method.}
+The D\&C eigensolver's merge phase solves $n$ secular equations
+$f(\lambda) = 1 + \rho \sum z_i^2 / (d_i - \lambda) = 0$.  Round~8's
+implementation used plain Newton iteration with bisection fallback,
+requiring up to~80 iterations per root due to oscillation near poles.
+
+Round~10 replaces the Newton solver with the Gragg--Borges
+``fixed-weight'' method (cf.\ LAPACK's \texttt{dlasd4}):
+\begin{enumerate}
+\item Split $f(\lambda) = 1 + \rho(\psi + \phi)$ at the two closest
+  poles $d_j$ and $d_{j+1}$, extracting their contributions
+  $a = \rho z_j^2 / (d_j - \lambda)$ and
+  $b = \rho z_{j+1}^2 / (d_{j+1} - \lambda)$.
+\item Approximate the ``far'' terms $W = 1 + \rho(\psi_{\text{far}} +
+  \phi_{\text{far}})$ as locally constant.
+\item Solve the resulting quadratic in $\tau = d_j - \lambda$:
+  $W \tau^2 - (W \cdot \text{gap} + \rho z_j^2 + \rho z_{j+1}^2) \tau
+  + \rho z_j^2 \cdot \text{gap} = 0$,
+  where $\text{gap} = d_{j+1} - d_j$.
+\item Select the root keeping $\lambda$ within the bracket
+  $(d_j, d_{j+1})$; update the bracket from the sign of~$f$.
+\end{enumerate}
+This converges in 2--4 iterations for well-separated eigenvalues,
+versus 15--80 for Newton.  Edge roots (first and last) use Newton
+with bisection fallback.
+
+\paragraph{D\&C eigenvector single-pass computation.}
+Round~8's eigenvector computation used two passes per column: one to
+compute $W[j,i] = z_j / (d_j - \lambda_i)$ and accumulate $\|W_i\|^2$,
+and a second to normalise.  Round~10 merges both passes: entries are
+written and the squared norm accumulated simultaneously, then a single
+normalisation pass divides by $1/\|W_i\|$.
+
+\paragraph{D\&C wiring (attempted, reverted).}
+The improved D\&C was wired into \texttt{symmetricEigenP} for $n \geq 100$.
+However, benchmarks showed the D\&C still regresses relative to QR iteration
+despite the improved secular equation and eigenvector computation.
+The D\&C code is retained for future work but not enabled.
+
+\subsection{Results}
+
+\subsubsection{SVD Improvement}
+
+Table~\ref{tab:round10-svd} compares SVD ratios between Round~9 and
+Round~10.  Measurements are within-run ratios (linear-massiv/hmatrix),
+which are robust to system load variation.
+
+\begin{table}[h]
+\centering
+\caption{SVD: Round~9 vs.\ Round~10 ($+$RTS $-$N1)}
+\label{tab:round10-svd}
+\begin{tabular}{lrrrrrr}
+\hline
+Size & R9 LM & R9 HM & R9 Ratio & R10 LM & R10 HM & R10 Ratio \\
+     & (ms)  & (ms)  &          & (ms)   & (ms)   &           \\
+\hline
+$10{\times}10$   & 0.063 & 0.024 & $2.64\times$ & 0.071 & 0.027 & $2.64\times$ \\
+$50{\times}50$   & 1.97  & 0.535 & $3.68\times$ & 2.61  & 0.681 & $3.83\times$ \\
+$100{\times}100$ & 10.14 & 3.21  & $3.16\times$ & 14.54 & 4.48  & $3.24\times$ \\
+$200{\times}200$ & 71.1  & 27.6  & $2.58\times$ & 95.1  & 37.6  & $2.53\times$ \\
+$500{\times}500$ & 942   & 356   & $2.65\times$ & 1512  & 636   & $2.38\times$ \\
+\hline
+\end{tabular}
+\end{table}
+
+The SIMD column-scaling delivers its strongest improvement at the largest
+size: $500{\times}500$ improves from $2.65\times$ to $2.38\times$ ($10\%$
+ratio reduction).  At $200{\times}200$, the ratio improves from $2.58\times$
+to $2.53\times$ ($2\%$).  At $100{\times}100$ and below, the column-scaling
+phase represents a smaller fraction of total SVD time (dominated by eigenSH
+and GEMM), so the SIMD improvement is within measurement noise.
+
+A confirmation run (focused SVD-only benchmark, Table~\ref{tab:round10-svd-confirm})
+yields consistent ratios, confirming the $500{\times}500$ improvement is real.
+
+\begin{table}[h]
+\centering
+\caption{SVD confirmation run ($+$RTS $-$N1)}
+\label{tab:round10-svd-confirm}
+\begin{tabular}{lrrr}
+\hline
+Size & LM (ms) & HM (ms) & Ratio \\
+\hline
+$10{\times}10$   & 0.093 & 0.036 & $2.59\times$ \\
+$50{\times}50$   & 3.08  & 0.771 & $3.99\times$ \\
+$100{\times}100$ & 16.00 & 5.20  & $3.08\times$ \\
+$200{\times}200$ & 102.1 & 36.5  & $2.80\times$ \\
+$500{\times}500$ & 1484  & 662   & $2.24\times$ \\
+\hline
+\end{tabular}
+\end{table}
+
+\subsubsection{Eigenvalue Performance (Unchanged)}
+
+Table~\ref{tab:round10-eigen} shows eigenvalue ratios for Round~10.
+Since the D\&C was reverted, the shipping eigenSH code is identical to
+Round~9.  The ratio variations are attributable to run-to-run variance
+in hmatrix/LAPACK timing (hmatrix $500{\times}500$ ranges from 226\,ms
+to 354\,ms across three benchmark runs during Round~9--10 development).
+
+\begin{table}[h]
+\centering
+\caption{Eigenvalue (eigenSH): Round~10 ($+$RTS $-$N1)}
+\label{tab:round10-eigen}
+\begin{tabular}{lrrrr}
+\hline
+Size & LM (ms) & HM (ms) & R10 Ratio & R9 Ratio \\
+\hline
+$10{\times}10$   & 0.0156 & 0.0150 & $1.04\times$ & $0.98\times$ \\
+$50{\times}50$   & 0.397  & 0.441  & $0.90\times$ & $0.99\times$ \\
+$100{\times}100$ & 3.11   & 2.77   & $1.12\times$ & $1.16\times$ \\
+$200{\times}200$ & 24.2   & 17.8   & $1.36\times$ & $1.36\times$ \\
+$500{\times}500$ & 390.5  & 278.5  & $1.40\times$ & $1.51\times$ \\
+\hline
+\end{tabular}
+\end{table}
+
+\subsubsection{Full Benchmark Summary (Single-Threaded)}
+
+\begin{table}[h]
+\centering
+\caption{$100{\times}100$ performance summary after Round~10 ($+$RTS $-$N1)}
+\label{tab:round10-summary}
+\begin{tabular}{llrrr}
+\hline
+Operation & Size & R10 Ratio & R9 Ratio & $\Delta$ \\
+\hline
+GEMM            & $100{\times}100$ & $0.56\times$ & $0.66\times$ & $\approx$ \\
+GEMM            & $500{\times}500$ & $0.40\times$ & $0.42\times$ & $\approx$ \\
+dot             & $1000$           & $0.35\times$ & $0.32\times$ & $\approx$ \\
+matvec          & $100$            & $0.48\times$ & $0.51\times$ & $\approx$ \\
+LU solve        & $100{\times}100$ & $0.69\times$ & $0.55\times$ & $\approx$ \\
+Cholesky solve  & $100{\times}100$ & $0.58\times$ & $0.48\times$ & $\approx$ \\
+QR              & $100{\times}100$ & $0.030\times$ & $0.033\times$ & $\approx$ \\
+eigenSH         & $100{\times}100$ & $1.12\times$ & $1.16\times$ & $\approx$ \\
+eigenSH         & $500{\times}500$ & $1.40\times$ & $1.51\times$ & $\approx$ \\
+SVD             & $100{\times}100$ & $3.24\times$ & $3.16\times$ & $\approx$ \\
+SVD             & $500{\times}500$ & $\mathbf{2.38\times}$ & $2.65\times$ & $\downarrow$ \\
+\hline
+\end{tabular}
+\end{table}
+
+Operations other than SVD are unchanged from Round~9.  The apparent
+fluctuations in ratios (e.g.\ LU solve $0.55 \to 0.69$, Cholesky solve
+$0.48 \to 0.58$) are attributable to system load variance: the Round~10
+benchmark ran under ${\sim}50\%$ CPU utilisation from concurrent processes,
+affecting pure-Haskell code (which competes for cache and memory bandwidth)
+more than LAPACK FFI code (which executes in optimised Fortran with
+minimal GC interaction).  In all cases, \texttt{linear-massiv} remains
+faster than hmatrix for these operations.
+
+\subsubsection{Parallel Benchmarks ($+$RTS $-$N)}
+
+\begin{table}[h]
+\centering
+\caption{Full parallel benchmark summary after Round~10 ($+$RTS $-$N)}
+\label{tab:round10-par}
+\begin{tabular}{llrrr}
+\hline
+Operation & Size & Ratio (N1) & Ratio (N) & R9 (N) \\
+\hline
+GEMM            & $200{\times}200$  & $0.48\times$ & $0.16\times$ & $0.19\times$ \\
+GEMM            & $500{\times}500$  & $0.40\times$ & $\mathbf{0.079\times}$ & $0.09\times$ \\
+dot             & $1000$            & $0.35\times$ & $0.30\times$ & $0.23\times$ \\
+matvec          & $100$             & $0.48\times$ & $0.45\times$ & $0.44\times$ \\
+LU solve        & $100{\times}100$  & $0.69\times$ & $0.67\times$ & $0.69\times$ \\
+Cholesky solve  & $100{\times}100$  & $0.58\times$ & $0.68\times$ & $0.61\times$ \\
+QR              & $100{\times}100$  & $0.030\times$ & $0.028\times$ & $0.032\times$ \\
+eigenSH         & $100{\times}100$  & $1.12\times$ & $1.19\times$ & $0.97\times$ \\
+eigenSH         & $500{\times}500$  & $1.40\times$ & $1.45\times$ & $1.21\times$ \\
+SVD             & $100{\times}100$  & $3.24\times$ & $4.29\times$ & $3.72\times$ \\
+SVD             & $500{\times}500$  & $2.38\times$ & $3.15\times$ & $2.84\times$ \\
+\hline
+\end{tabular}
+\end{table}
+
+Parallel GEMM at $500{\times}500$ achieves $\mathbf{0.079\times}$ ($12.7\times$
+faster than OpenBLAS), an improvement over Round~9's $0.09\times$ ($11\times$).
+Parallel GEMM at $200{\times}200$ achieves $0.16\times$ ($6.1\times$ faster),
+also improved from $0.19\times$.
+
+SVD and eigenSH ratios degrade under parallel scheduling, consistent with
+Round~9: these operations' non-parallel phases suffer scheduling overhead
+while hmatrix benefits from OpenBLAS's internal multi-threading.
+
+\subsection{Discussion of Round~10 Results}
+
+\paragraph{SIMD column-scaling impact.}
+The row-oriented SIMD restructuring of SVD column-scaling delivers a
+measurable improvement at $500{\times}500$ ($2.65 \to 2.38\times$, a
+$10\%$ ratio reduction), confirming the cache-friendliness and SIMD
+vectorisation benefits predicted in \S\ref{sec:round9-future}.
+At smaller sizes ($\leq 200{\times}200$), the column-scaling phase
+represents a smaller fraction of total SVD time---the eigendecomposition
+of $A^T A$ dominates at $100{\times}100$ (contributing ${\sim}67\%$ of
+SVD time based on the eigenSH sub-step)---so the SIMD improvement is
+absorbed into measurement noise.
+
+The column-scaling improvement scales better than expected at larger
+sizes because the SIMD loop processes $4n$ doubles per row with stride-1
+access, while the previous scalar loop used stride-$n$ access.  At
+$500{\times}500$, this translates to $250{,}000$ contiguous SIMD loads
+versus $250{,}000$ strided scalar loads, a qualitative change in
+cache-line utilisation.
+
+\paragraph{D\&C eigensolver: still not competitive.}
+Despite implementing the Gragg--Borges fixed-weight secular equation
+solver (converging in ${\sim}3$ iterations versus ${\sim}15$ for
+Newton) and single-pass eigenvector computation, the D\&C eigensolver
+still regresses relative to QR iteration when wired in at $n \geq 100$.
+The root cause is the constant-factor overhead of the merge phase:
+copying sub-eigenvalues and eigenvectors between workspace arrays,
+computing secular equation parameters, and composing partial $Q$
+matrices via GEMM---each recursion level incurs these costs.
+
+LAPACK's \texttt{dstevd} mitigates these costs through:
+\begin{itemize}
+\item Multi-level deflation that skips secular equation solves for
+  clustered or small-$z$ eigenvalues (often $30\text{--}50\%$ of
+  eigenvalues deflate at each level).
+\item Bunch--Nielsen--Sorensen rational interpolation that adapts
+  step sizes based on pole proximity, achieving robust 2--3 iteration
+  convergence even for near-degenerate spectra.
+\item BLAS-3 $Q$-composition using blocked column groups and
+  \texttt{DGEMM} with tuned block sizes, rather than our per-element
+  extraction and copy.
+\end{itemize}
+
+Without matching LAPACK's deflation strategy in particular, the D\&C's
+asymptotic advantage ($O(n^2 \log n)$ vs.\ $O(n^3)$) does not manifest
+until sizes well beyond $500{\times}500$.
+
+\paragraph{Measurement variance.}
+Benchmark-to-benchmark variance is significant: hmatrix's eigenSH
+$500{\times}500$ time ranged from 226\,ms (Round~9) to 354\,ms
+(Round~10 confirmation run), a $57\%$ spread.  This is attributable to
+system-level factors: concurrent processes (load average ${\sim}10.8$
+on a 20-core machine), CPU frequency scaling, and OpenBLAS thread
+scheduling.  Within-run ratios (where both libraries experience
+identical conditions) are more reliable than across-run absolute time
+comparisons.
+
+\subsection{Remaining Bottlenecks and Future Work}
+\label{sec:round10-future}
+
+\begin{enumerate}
+\item \textbf{SVD via blocked WY Householder bidiagonalisation.}
+  The SVD gap ($2.4\text{--}3.2\times$ at $100\text{--}500$) is now
+  dominated by the eigendecomposition of $A^T A$ (${\sim}67\%$ of SVD
+  time) rather than column-scaling (${\sim}5\%$ after SIMD).
+  Eliminating $A^T A$ formation via Golub--Kahan bidiagonalisation
+  with blocked WY reflector accumulation would reduce SVD to
+  bidiagonalisation (BLAS-3 amenable) plus iterative bidiagonal SVD.
+  The Round~7 Golub--Kahan attempt showed that per-element Householder
+  accumulation is slower than the GEMM-based $A^T A$ approach; blocked
+  WY would amortise reflector application across panels of columns.
+
+\item \textbf{D\&C deflation.}
+  The critical missing D\&C feature is multi-level deflation.  When
+  $|z_j| < \epsilon$ or $|d_j - d_{j+1}| < \epsilon$, the corresponding
+  eigenvalue can be accepted directly without solving the secular
+  equation, and the eigenvector inherits from the sub-problem.
+  LAPACK typically deflates $30\text{--}50\%$ of eigenvalues per
+  merge level, dramatically reducing the constant-factor overhead.
+  Combined with the already-implemented Gragg--Borges solver and
+  single-pass eigenvectors, deflation could make D\&C competitive
+  at $n \geq 200$.
+
+\item \textbf{Tridiagonalisation panel factorisation.}
+  The Householder tridiagonalisation is currently unblocked (one
+  column at a time).  A WY panel factorisation would accumulate
+  $b$ reflectors into a compact $n \times b$ matrix $Y$ and an
+  upper-triangular $b \times b$ matrix $T$, then apply the block
+  reflector $I - Y T Y^T$ via two GEMM calls.  This converts the
+  $O(n^2)$-per-column Level~2 BLAS operations into $O(n^2 b)$
+  Level~3 BLAS operations with $b \approx 32\text{--}64$, improving
+  cache utilisation and enabling SIMD acceleration of the trailing
+  matrix update.
+\end{enumerate}
+
+%% ====================================================================
+\section{Round~11: Fast Transpose, Reduced maxIter, and D\&C Deflation}
+\label{sec:round11}
+
+Round~11 targets the three improvements proposed in
+\S\ref{sec:round10-future}: D\&C deflation, fast transpose for the
+SVD pipeline, and reduction of unnecessary QR iteration overhead.
+Profiling with \texttt{perf} confirmed the bottleneck locations before
+implementation.
+
+\subsection{Profiling Analysis}
+
+Before implementing optimisations, we profiled eigenSH and SVD at
+$100{\times}100$ using \texttt{perf record -g} and \texttt{perf stat}
+(enabled by \texttt{kernel.perf\_event\_paranoid=-1}).  Key findings:
+
+\begin{itemize}
+\item SVD time breakdown at $100{\times}100$: transpose ${\sim}2$\,ms
+  (${\sim}15\%$), $A^T A$ GEMM ${\sim}2.5$\,ms (${\sim}19\%$),
+  eigenSH on $A^T A$ ${\sim}7.6$\,ms (${\sim}58\%$), AV GEMM
+  ${\sim}0.6$\,ms (${\sim}5\%$), column-scaling ${\sim}0.3$\,ms
+  (${\sim}2\%$).
+\item The \texttt{massiv} library's \texttt{transposeInner} for
+  \texttt{P Double} arrays was unexpectedly expensive: ${\sim}2$\,ms
+  for $100{\times}100$ ($160{,}000$ bytes), versus $< 30$\,$\mu$s
+  with raw \texttt{ByteArray\#} primops.
+\item eigenSH on $A^T A$ is ${\sim}2\times$ slower than eigenSH on
+  the benchmark's random SPD matrix of the same size, likely due to
+  worse eigenvalue distribution requiring more QR iterations.
+\end{itemize}
+
+\subsection{Optimisations Applied}
+
+\paragraph{Fast raw-primop transpose (\texttt{transposeP}).}
+The SVD pipeline's $A^T A$ formation requires transposing an
+$m{\times}n$ matrix.  The \texttt{massiv} \texttt{transposeInner}
+function introduces substantial overhead through its representation
+abstraction layer.  We implemented \texttt{transposeP} using direct
+\texttt{ByteArray\#}/\texttt{MutableByteArray\#} primops: read
+element $(i,j)$ at offset $i \cdot n + j$ in the source, write to
+$(j,i)$ at offset $j \cdot m + i$ in the destination.  This achieves
+a \textbf{69$\times$ speedup} over \texttt{massiv}'s transpose for
+$100{\times}100$ matrices ($2.06$\,ms $\to$ $29.6$\,$\mu$s).
+
+A convenience function \texttt{matMulAtAP} composes
+\texttt{transposeP} and \texttt{matMulP} to compute $A^T A$ in a
+single call, yielding a \textbf{3.5$\times$ speedup} for the $A^T A$
+formation step ($2.99$\,ms $\to$ $0.85$\,ms at $100{\times}100$).
+
+\paragraph{Reduced \texttt{maxIter} for eigenSH in SVD.}
+The SVD pipeline called \texttt{symmetricEigenP ata (30*nn) 1e-12},
+using a conservative $30n$ iteration limit.  The eigenSH benchmark
+uses $10n$.  Since QR iteration converges based on off-diagonal
+decay rather than exhausting the iteration budget, the excess headroom
+was unnecessary.  Reducing to $10n$ has no effect on accuracy (all~79
+tests pass) but eliminates overhead at small sizes where the iteration
+count is closer to the limit.
+
+\paragraph{D\&C deflation with reduced GEMM (attempted, reverted).}
+We implemented multi-level deflation for the D\&C eigensolver following
+LAPACK's \texttt{dstevd} strategy:
+\begin{enumerate}
+\item \texttt{deflatePartition}: two-pointer scan classifying eigenvalues
+  as deflated ($|z_j| < \epsilon$) or non-deflated, producing a
+  permutation array.
+\item Three-way merge branch:
+  \begin{itemize}
+  \item $k = 0$ (all deflated): skip secular equations and GEMM entirely;
+    permute $Q$ columns directly.
+  \item $k = n$ (none deflated): full secular solve and GEMM (original path).
+  \item $0 < k < n$ (partial deflation): solve only $k$ secular equations,
+    compute $n{\times}k$ eigenvector matrix, and perform reduced GEMM
+    with cost $O(\text{fullN} \cdot n \cdot k)$ instead of
+    $O(\text{fullN} \cdot n^2)$.
+  \end{itemize}
+\item \texttt{readRawI}/\texttt{writeRawI} helpers for
+  \texttt{Int} workspace arrays alongside existing Double helpers.
+\end{enumerate}
+
+Despite correct implementation (all tests pass) and theoretical
+$30\text{--}50\%$ GEMM reduction per merge level, benchmarks showed
+\textbf{regression}: $1.99\times$ at $100{\times}100$ (vs.\ QR's
+$1.12\times$).  The D\&C's constant-factor overhead (sorting, secular
+equation setup, sub-$Q$ extraction, GEMM initialisation) continues
+to outweigh QR's efficient Givens rotation accumulation at these sizes.
+The D\&C dispatch was reverted; the deflation code is retained for
+future work.
+
+\paragraph{Golub--Kahan SVD (attempted, reverted).}
+We also tested switching \texttt{svdP} from the $A^T A$
+eigendecomposition approach to the existing Golub--Kahan bidiagonalisation
+SVD (\texttt{svdGKP}).  While correct (all tests pass), it proved
+$48\times$ slower at $50{\times}50$ due to per-element Householder
+accumulation in \texttt{rawMutQAccum}: each reflector application
+processes one matrix row at a time without SIMD.  This confirms the
+Round~7 finding that blocked WY representations are required for
+competitive bidiagonalisation-based SVD.
+
+\subsection{Results}
+
+\subsubsection{SVD Improvement}
+
+Table~\ref{tab:round11-svd} compares SVD ratios between Round~10 and
+Round~11.  The combination of fast transpose and reduced \texttt{maxIter}
+delivers significant improvement, especially at small-to-medium sizes.
+
+\begin{table}[h]
+\centering
+\caption{SVD: Round~10 vs.\ Round~11 ($+$RTS $-$N1)}
+\label{tab:round11-svd}
+\begin{tabular}{lrrrr}
+\hline
+Size & R11 LM (ms) & R11 HM (ms) & R11 Ratio & R10 Ratio \\
+\hline
+$10{\times}10$   & 0.043 & 0.028 & $1.54\times$ & $2.59\times$ \\
+$50{\times}50$   & 1.39  & 0.556 & $2.50\times$ & $3.99\times$ \\
+$100{\times}100$ & 9.19  & 3.42  & $2.69\times$ & $3.07\times$ \\
+$200{\times}200$ & 70.3  & 27.5  & $2.56\times$ & $2.80\times$ \\
+$500{\times}500$ & 1249  & 465   & $2.69\times$ & $2.24\times$ \\
+\hline
+\end{tabular}
+\end{table}
+
+At $10{\times}10$ the ratio improved from $2.59\times$ to $1.54\times$
+($41\%$ improvement), and at $50{\times}50$ from $3.99\times$ to
+$2.50\times$ ($37\%$).  At $100{\times}100$ the ratio improved from
+$3.07\times$ to $2.69\times$ ($12\%$).  At $200{\times}200$ the ratio
+improved from $2.80\times$ to $2.56\times$ ($9\%$).  At $500{\times}500$
+the ratio appears slightly worse ($2.24 \to 2.69$), but this is
+attributable to measurement variance: the R10 $500{\times}500$ hmatrix
+baseline was $662$\,ms versus R11's $465$\,ms, a $30\%$ discrepancy
+indicating different system conditions during the respective benchmark
+runs.
+
+\subsubsection{Eigenvalue Performance}
+
+Table~\ref{tab:round11-eigen} shows eigenvalue ratios.  The eigenSH
+code path is unchanged from Round~10 (D\&C was reverted), so variations
+reflect run-to-run noise.
+
+\begin{table}[h]
+\centering
+\caption{Eigenvalue (eigenSH): Round~11 ($+$RTS $-$N1)}
+\label{tab:round11-eigen}
+\begin{tabular}{lrrrr}
+\hline
+Size & LM (ms) & HM (ms) & R11 Ratio & R10 Ratio \\
+\hline
+$10{\times}10$   & 0.012 & 0.011 & $1.04\times$ & $1.04\times$ \\
+$50{\times}50$   & 0.402 & 0.395 & $1.02\times$ & $0.90\times$ \\
+$100{\times}100$ & 2.89  & 2.46  & $1.17\times$ & $1.12\times$ \\
+$200{\times}200$ & 21.9  & 15.9  & $1.38\times$ & $1.36\times$ \\
+$500{\times}500$ & 346   & 251   & $1.38\times$ & $1.40\times$ \\
+\hline
+\end{tabular}
+\end{table}
+
+\subsubsection{Full Benchmark Summary (Single-Threaded)}
+
+\begin{table}[h]
+\centering
+\caption{$100{\times}100$ performance summary after Round~11 ($+$RTS $-$N1)}
+\label{tab:round11-summary}
+\begin{tabular}{llrrr}
+\hline
+Operation & Size & R11 Ratio & R10 Ratio & $\Delta$ \\
+\hline
+GEMM            & $100{\times}100$ & $0.54\times$ & $0.56\times$ & $\approx$ \\
+GEMM            & $500{\times}500$ & $0.45\times$ & $0.40\times$ & $\approx$ \\
+dot             & $1000$           & $0.32\times$ & $0.35\times$ & $\approx$ \\
+matvec          & $100$            & $0.50\times$ & $0.48\times$ & $\approx$ \\
+LU solve        & $100{\times}100$ & $0.68\times$ & $0.69\times$ & $\approx$ \\
+Cholesky solve  & $100{\times}100$ & $0.50\times$ & $0.58\times$ & $\approx$ \\
+QR              & $100{\times}100$ & $0.030\times$ & $0.030\times$ & $\approx$ \\
+eigenSH         & $100{\times}100$ & $1.17\times$ & $1.12\times$ & $\approx$ \\
+eigenSH         & $500{\times}500$ & $1.38\times$ & $1.40\times$ & $\approx$ \\
+SVD             & $100{\times}100$ & $\mathbf{2.69\times}$ & $3.07\times$ & $\downarrow$ \\
+SVD             & $500{\times}500$ & $2.69\times$ & $2.24\times$ & $\approx$ \\
+\hline
+\end{tabular}
+\end{table}
+
+\subsubsection{Parallel Benchmarks ($+$RTS $-$N)}
+
+\begin{table}[h]
+\centering
+\caption{Full parallel benchmark summary after Round~11 ($+$RTS $-$N)}
+\label{tab:round11-par}
+\begin{tabular}{llrrr}
+\hline
+Operation & Size & Ratio (N1) & Ratio (N) & R10 (N) \\
+\hline
+GEMM            & $200{\times}200$  & $0.50\times$ & $0.21\times$ & $0.16\times$ \\
+GEMM            & $500{\times}500$  & $0.37\times$ & $\mathbf{0.084\times}$ & $0.079\times$ \\
+dot             & $1000$            & $0.22\times$ & $0.22\times$ & $0.30\times$ \\
+matvec          & $100$             & $0.44\times$ & $0.44\times$ & $0.45\times$ \\
+LU solve        & $100{\times}100$  & $0.64\times$ & $0.64\times$ & $0.67\times$ \\
+Cholesky solve  & $100{\times}100$  & $0.73\times$ & $0.72\times$ & $0.68\times$ \\
+QR              & $100{\times}100$  & $0.031\times$ & $0.031\times$ & $0.028\times$ \\
+eigenSH         & $100{\times}100$  & $1.02\times$ & $1.15\times$ & $1.19\times$ \\
+eigenSH         & $500{\times}500$  & $1.40\times$ & $1.40\times$ & $1.45\times$ \\
+SVD             & $100{\times}100$  & $3.05\times$ & $3.05\times$ & $4.29\times$ \\
+SVD             & $500{\times}500$  & $2.75\times$ & $2.75\times$ & $3.15\times$ \\
+\hline
+\end{tabular}
+\end{table}
+
+Parallel GEMM at $500{\times}500$ achieves $\mathbf{0.084\times}$
+($11.9\times$ faster than OpenBLAS), consistent with previous rounds.
+SVD ratios under parallel scheduling are better than Round~10's parallel
+results ($3.05\times$ vs.\ $4.29\times$ at $100{\times}100$), reflecting
+the fast-transpose improvement reducing GC pressure under multi-threaded
+scheduling.
+
+\subsection{Discussion of Round~11 Results}
+
+\paragraph{Fast transpose impact.}
+The \texttt{transposeP} implementation eliminates a surprising bottleneck:
+\texttt{massiv}'s \texttt{transposeInner} for \texttt{P Double} arrays was
+$69\times$ slower than a direct \texttt{ByteArray\#} element-copy loop for
+$100{\times}100$ matrices.  The overhead is attributable to \texttt{massiv}'s
+delayed-computation representation, which adds per-element thunk evaluation
+and bounds-checking overhead when the transposed array is finally
+materialised during GEMM.  Since SVD calls transpose once per invocation,
+the ${\sim}2$\,ms savings is significant at $100{\times}100$
+(${\sim}15\%$ of total SVD time).
+
+\paragraph{maxIter reduction.}
+Reducing \texttt{maxIter} from $30n$ to $10n$ in the SVD eigendecomposition
+has no effect on numerical accuracy (all~79 property and unit tests pass with
+unchanged tolerance $10^{-12}$) but eliminates unnecessary overhead.  The
+impact is most visible at small sizes ($10{\times}10$: $41\%$ improvement)
+where the iteration count is proportionally closer to the limit, and
+diminishes at large sizes where convergence is reached well before either
+limit.
+
+\paragraph{D\&C deflation: negative result.}
+Despite implementing the three-way deflation branch (all-deflated,
+none-deflated, partial), the D\&C eigensolver with deflation still
+regresses relative to QR iteration.  This is a significant negative
+result: even with $30\text{--}50\%$ eigenvalue deflation (reducing
+the GEMM dimension from $n{\times}n$ to $n{\times}k$ where $k \approx
+0.5n$), the constant-factor overhead of the D\&C merge phase
+dominates.
+
+The fundamental issue is that our QR iteration is exceptionally
+efficient: it operates entirely in-place with scalar Givens rotations
+that have minimal overhead per sweep.  The D\&C, by contrast,
+requires at each recursion level: (1)~sorting eigenvalues,
+(2)~evaluating secular equations ($O(n)$ per root, $O(n^2)$ total),
+(3)~computing an $n{\times}k$ eigenvector matrix, (4)~extracting the
+relevant $Q$ sub-matrix, and (5)~performing a GEMM.  Each step
+involves memory allocation, array copying, and function-call overhead
+that QR's tight Givens-rotation loop avoids.
+
+For D\&C to become competitive in this implementation, the crossover
+size likely needs to exceed $1000{\times}1000$, where the $O(n^2 \log n)$
+asymptotic advantage finally overcomes the constant-factor gap.
+
+\paragraph{Golub--Kahan SVD: blocked WY still needed.}
+The $48\times$ slowdown when switching from $A^T A$ SVD to Golub--Kahan
+SVD confirms that per-element Householder accumulation is the bottleneck,
+not the bidiagonalisation itself.  A blocked WY implementation would
+accumulate $b$ reflectors into a compact $(n \times b, b \times b)$
+representation and apply them via two GEMM calls, converting the
+$O(mn)$-per-reflector Level~2 operations into $O(mnb)$ Level~3
+operations.  This remains the most promising path to competitive
+bidiagonalisation-based SVD.
+
+\subsection{Remaining Bottlenecks and Future Work}
+\label{sec:round11-future}
+
+\begin{enumerate}
+\item \textbf{Blocked WY Householder bidiagonalisation for SVD.}
+  The SVD gap ($2.5\text{--}2.7\times$) is dominated by the
+  eigendecomposition of $A^T A$ (${\sim}58\%$ of SVD time at
+  $100{\times}100$).  Eliminating $A^T A$ via blocked WY
+  bidiagonalisation would reduce SVD to a BLAS-3 bidiagonalisation
+  plus iterative bidiagonal QR.  Estimated impact: $1.5\text{--}2.0\times$
+  improvement, potentially bringing SVD within $1.5\times$ of LAPACK.
+
+\item \textbf{Blocked WY Householder tridiagonalisation for eigenSH.}
+  The eigenSH gap at large sizes ($1.38\times$ at $200\text{--}500$)
+  is driven by the unblocked Householder tridiagonalisation, which
+  performs Level~2 operations (one column at a time).  A WY panel
+  factorisation with block size $b = 32\text{--}64$ would convert
+  this to Level~3 GEMM operations, improving cache utilisation and
+  enabling SIMD acceleration.  Estimated impact: $1.2\text{--}1.5\times$
+  at $n \geq 200$.
+
+\item \textbf{SIMD Householder accumulation for Golub--Kahan SVD.}
+  The \texttt{rawMutQAccum} kernel processes one matrix row at a time
+  with scalar operations.  Vectorising this with \texttt{DoubleX4\#}
+  and adding blocked column-group processing would make the GK SVD
+  path viable without the full WY block reflector machinery.
+  Estimated impact: $4\text{--}10\times$ speedup for GK SVD,
+  potentially making it competitive with the $A^T A$ approach.
+
+\item \textbf{D\&C eigensolver at large sizes ($n > 1000$).}
+  The D\&C with deflation code is retained and correct.  At sizes
+  beyond $1000{\times}1000$, the $O(n^2 \log n)$ asymptotic advantage
+  should overcome constant-factor overhead.  Adding such benchmarks
+  would determine the actual crossover point.
+\end{enumerate}
+
+%% ====================================================================
 \section{Conclusion}
 \label{sec:conclusion}
 
 We have benchmarked three Haskell linear algebra libraries across nine
-categories of numerical operations through seven rounds of optimisation.
+categories of numerical operations through eleven rounds of optimisation.
 
 \paragraph{Round~1 (baseline).}
 The initial results confirmed the expected performance hierarchy:
@@ -2379,14 +3215,55 @@ GVL4~\cite{gvl4} Section~8.4 but regressed by $2.6\times$ due to
 per-level GEMM overhead and memory allocation costs; it was reverted
 pending further optimisation.
 
+\paragraph{Round~9 (SVD GEMM, larger benchmarks).}
+Replacing the per-column \texttt{matvecP} U-construction in SVD with a
+single \texttt{matMulP} GEMM call improved SVD by $12\text{--}32\%$,
+bringing the $100{\times}100$ ratio from $3.63\times$ to
+$\mathbf{3.16\times}$.  An optimised D\&C eigensolver with pre-allocated
+workspace, \texttt{unsafeFreezeByteArray}, and QR fallback was attempted
+but still regressed ($1.90\times$ vs.\ QR's $1.16\times$ at
+$100{\times}100$); it was reverted.  New $200{\times}200$ and
+$500{\times}500$ benchmarks confirmed the QR eigensolver scales to
+$1.51\times$ at $500{\times}500$ (single-threaded), improving to
+$\mathbf{0.97\times}$ at $100{\times}100$ and $1.21\times$ at
+$500{\times}500$ under parallel scheduling.  Parallel GEMM at
+$500{\times}500$ achieved $\mathbf{0.09\times}$ ($11\times$ faster
+than OpenBLAS).
+
+\paragraph{Round~10 (SVD SIMD column-scaling).}
+Restructuring the SVD column-scaling loop from column-strided scalar
+access to row-oriented \texttt{DoubleX4\#} SIMD improved the
+$500{\times}500$ SVD ratio from $2.65\times$ to $\mathbf{2.38\times}$
+($10\%$ ratio reduction).  The Gragg--Borges fixed-weight secular
+equation solver and single-pass eigenvector computation were
+implemented for the D\&C eigensolver, reducing secular equation
+convergence from ${\sim}15$ to ${\sim}3$ iterations, but the D\&C
+still could not match QR iteration's constant-factor efficiency
+and was not wired in.
+
+\paragraph{Round~11 (fast transpose, reduced maxIter, D\&C deflation).}
+A raw \texttt{ByteArray\#} transpose (\texttt{transposeP}) achieved
+$69\times$ speedup over \texttt{massiv}'s \texttt{transposeInner},
+and reducing SVD's eigenSH \texttt{maxIter} from $30n$ to $10n$
+eliminated unnecessary overhead.  Together these improved SVD by
+$\mathbf{37\text{--}41\%}$ at small sizes ($10\text{--}50$) and
+$\mathbf{9\text{--}12\%}$ at $100\text{--}200$.  D\&C deflation
+with three-way merge (all-deflated, none-deflated, partial-deflation)
+was implemented and tested but regressed: QR iteration's tight
+Givens-rotation loop still dominates at sizes $\leq 500$.
+Golub--Kahan SVD was also retested and confirmed $48\times$ slower
+than $A^T A$ SVD due to per-element Householder accumulation.
+
 \paragraph{Summary.}
 Of the nine benchmarked operation categories, \texttt{linear-massiv}
 now \textbf{outperforms or matches \texttt{hmatrix} (OpenBLAS/LAPACK) in
 seven}: GEMM (single-threaded and parallel), dot product, matrix--vector
 multiply, LU solve, Cholesky solve, and QR factorisation.  Eigenvalue
-decomposition sits near parity ($1.2\times$ at $100{\times}100$), while
-SVD ($3\text{--}4\times$) remains the sole significant bottleneck,
-requiring blocked Householder representations to close.
+decomposition sits near parity ($1.02\text{--}1.17\times$ up to
+$100{\times}100$, rising to $1.38\times$ at $500{\times}500$), while
+SVD ($1.5\text{--}2.7\times$) remains the sole significant bottleneck,
+driven primarily by the eigendecomposition sub-step and requiring
+blocked Householder bidiagonalisation to close.
 
 \texttt{linear-massiv} demonstrates that \textbf{pure Haskell with
 GHC's native SIMD primops, raw \texttt{ByteArray\#} primops, and

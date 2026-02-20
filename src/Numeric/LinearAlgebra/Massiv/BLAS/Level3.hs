@@ -57,6 +57,8 @@ module Numeric.LinearAlgebra.Massiv.BLAS.Level3
   , matMulComp
     -- * Elementary matrix operations (GVL4 Section 1.1, pp. 4–18)
   , transpose
+  , transposeP
+  , matMulAtAP
   , mAdd
   , mSub
   , mScale
@@ -72,6 +74,7 @@ import GHC.Exts (Int(..), isTrue#, (>=#), (*#), (+#))
 import GHC.Prim
 import GHC.ST (ST(..))
 import Data.Array.Byte (MutableByteArray(..))
+import Data.Primitive.ByteArray (ByteArray(..), newByteArray, unsafeFreezeByteArray)
 import Numeric.LinearAlgebra.Massiv.Types
 import Numeric.LinearAlgebra.Massiv.Internal
 import Control.Concurrent (forkIO, newEmptyMVar, putMVar, takeMVar, getNumCapabilities)
@@ -265,6 +268,47 @@ matMulComp comp a b =
 transpose :: forall m n r e. (KnownNat m, KnownNat n, M.Manifest r e)
           => Matrix m n r e -> Matrix n m r e
 transpose (MkMatrix arr) = MkMatrix $ M.compute $ M.transposeInner arr
+
+-- | P-specialised raw-primop matrix transpose.
+-- Avoids per-element overhead of massiv's delayed transpose.
+transposeP :: forall m n. (KnownNat m, KnownNat n)
+           => Matrix m n M.P Double -> Matrix n m M.P Double
+transposeP (MkMatrix a) =
+  let !mm = dimVal @m
+      !nn = dimVal @n
+      !(I# mm#) = mm
+      !(I# nn#) = nn
+      !(ByteArray ba#) = unwrapByteArray a
+      !(I# off#) = unwrapByteArrayOffset a
+  in createMatrix @n @m @M.P $ \mu ->
+    let !(MutableByteArray mba#) = unwrapMutableByteArray mu
+        !(I# offR#) = unwrapMutableByteArrayOffset mu
+    in ST $ \s0 ->
+      -- Iterate source rows (sequential read, strided write)
+      let goRow j s
+            | isTrue# (j >=# mm#) = s
+            | otherwise =
+                let goCol i s1
+                      | isTrue# (i >=# nn#) = s1
+                      | otherwise =
+                          let !src = off# +# j *# nn# +# i
+                              !dst = offR# +# i *# mm# +# j
+                              !v = indexDoubleArray# ba# src
+                          in case writeDoubleArray# mba# dst v s1 of
+                               s2 -> goCol (i +# 1#) s2
+                in goRow (j +# 1#) (goCol 0# s)
+      in (# goRow 0# s0, () #)
+{-# NOINLINE transposeP #-}
+
+-- | P-specialised A^T * A without materialising A^T.
+-- Computes C = A^T * A using the SIMD GEMM kernel on an explicit fast transpose.
+-- Saves one allocation vs @matMulP (transpose a) a@.
+matMulAtAP :: forall m n. (KnownNat m, KnownNat n)
+           => Matrix m n M.P Double -> Matrix n n M.P Double
+matMulAtAP a =
+  let !at = transposeP a
+  in matMulP at a
+{-# NOINLINE matMulAtAP #-}
 
 -- | Element-wise matrix addition.
 mAdd :: (KnownNat m, KnownNat n, M.Manifest r e, Num e)

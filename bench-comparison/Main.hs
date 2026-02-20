@@ -144,6 +144,7 @@ main = do
       hv100 = mkVecHM 100; hv1000 = mkVecHM 1000
       dd10 = mkDDHM 10; dd50 = mkDDHM 50; dd100 = mkDDHM 100
       spd10 = mkSPDHM 10; spd50 = mkSPDHM 50; spd100 = mkSPDHM 100
+      spd200 = mkSPDHM 200; spd500 = mkSPDHM 500
 
   defaultMain
     [ bgroup "GEMM"
@@ -272,6 +273,14 @@ main = do
         , bench "linear-massiv" $ nf (\a -> symmetricEigenP a 1000 1e-12) (mkSPDLM @100)
         , bench "lm-parallel"   $ nf (\a -> symmetricEigenPPar a 1000 1e-12) (mkSPDLM @100)
         ]
+      , bgroup "200x200"
+        [ bench "hmatrix"       $ nf (H.eigSH . H.trustSym) spd200
+        , bench "linear-massiv" $ nf (\a -> symmetricEigenP a 2000 1e-12) (mkSPDLM @200)
+        ]
+      , bgroup "500x500"
+        [ bench "hmatrix"       $ nf (H.eigSH . H.trustSym) spd500
+        , bench "linear-massiv" $ nf (\a -> symmetricEigenP a 5000 1e-12) (mkSPDLM @500)
+        ]
       ]
     , bgroup "SVD"
       [ bgroup "10x10"
@@ -287,6 +296,14 @@ main = do
       , bgroup "100x100"
         [ bench "hmatrix"       $ nf H.svd hm100
         , bench "linear-massiv" $ nf svdP (mkMatLM @100 @100)
+        ]
+      , bgroup "200x200"
+        [ bench "hmatrix"       $ nf H.svd hm200
+        , bench "linear-massiv" $ nf svdP (mkMatLM @200 @200)
+        ]
+      , bgroup "500x500"
+        [ bench "hmatrix"       $ nf H.svd hm500
+        , bench "linear-massiv" $ nf svdP (mkMatLM @500 @500)
         ]
       ]
     ]
