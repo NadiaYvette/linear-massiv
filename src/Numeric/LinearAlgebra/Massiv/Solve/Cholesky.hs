@@ -75,7 +75,7 @@ import Numeric.LinearAlgebra.Massiv.Internal
 import Numeric.LinearAlgebra.Massiv.Solve.Triangular (forwardSub, backSub)
 import Numeric.LinearAlgebra.Massiv.BLAS.Level3 (transpose)
 import Numeric.LinearAlgebra.Massiv.Internal.Kernel
-  (rawCholColumn, rawForwardSubCholPacked, rawBackSubCholTPacked)
+  (rawCholColumnSIMD, rawForwardSubCholPacked, rawBackSubCholTPacked)
 
 -- | Outer-product Cholesky factorization (GVL4 Algorithm 4.2.1, p. 164).
 --
@@ -246,8 +246,8 @@ choleskySolveP (MkMatrix a) (MkVector b) =
     -- Copy lower triangle using raw primops
     copyLowerTriangle a mbaG offG nn
 
-    -- Phase 1: Cholesky factorisation column by column
-    mapM_ (rawCholColumn mbaG offG nn) [0..nn-1]
+    -- Phase 1: Cholesky factorisation column by column (SIMD dot-product kernel)
+    mapM_ (rawCholColumnSIMD mbaG offG nn) [0..nn-1]
 
     -- Phase 2: Freeze G and prepare RHS
     frozenG <- M.freezeS mg

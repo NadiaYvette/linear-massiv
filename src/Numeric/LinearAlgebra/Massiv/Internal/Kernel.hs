@@ -32,6 +32,7 @@ module Numeric.LinearAlgebra.Massiv.Internal.Kernel
   , rawBackSubPacked
     -- * Cholesky kernels
   , rawCholColumn
+  , rawCholColumnSIMD
   , rawForwardSubCholPacked
   , rawBackSubCholTPacked
     -- * QR mutable kernels
@@ -45,6 +46,9 @@ module Numeric.LinearAlgebra.Massiv.Internal.Kernel
   , rawMutTridiagQAccum
     -- * Eigen mutable kernels
   , rawMutApplyGivensColumns
+    -- * SVD / bidiagonalisation kernels
+  , rawMutHouseholderApplyRow
+  , rawMutSumSqRow
   ) where
 
 import GHC.Exts
@@ -886,6 +890,132 @@ rawMutApplyGivensColumns (MutableByteArray mba) (I# off) (I# ncols)
                                     s4 -> go (row +# 1#) s4
   in (# go 0# s0, () #)
 {-# INLINE rawMutApplyGivensColumns #-}
+
+-- --------------------------------------------------------------------------
+-- SVD / bidiagonalisation kernels
+-- --------------------------------------------------------------------------
+
+-- | Apply a right Householder reflector to one row of a mutable matrix.
+-- The Householder vector v is stored in row hvRow of the matrix,
+-- columns [hvStart..hvEnd-1], with implicit v[hvStart] = 1.0.
+-- Updates row targetRow: R[targetRow, hvStart..hvEnd-1] -= w * v
+-- where w = beta * (R[targetRow,hvStart] + Σ_{l=hvStart+1}^{hvEnd-1} R[targetRow,l] * R[hvRow,l])
+rawMutHouseholderApplyRow :: MutableByteArray s -> Int -> Int
+                          -> Double -> Int -> Int -> Int -> Int -> ST s ()
+rawMutHouseholderApplyRow (MutableByteArray mba) (I# off) (I# ncols) (D# beta)
+                          (I# hvRow) (I# hvStart) (I# hvEnd) (I# targetRow) = ST $ \s0 ->
+  let trOff = off +# targetRow *# ncols
+      hvOff = off +# hvRow *# ncols
+  -- Phase 1: w = beta * (R[targetRow,hvStart] + Σ R[targetRow,l] * R[hvRow,l])
+  in case readDoubleArray# mba (trOff +# hvStart) s0 of
+       (# s1, r0 #) ->
+         let goSum l acc s
+               | isTrue# (l >=# hvEnd) = (# s, beta *## (r0 +## acc) #)
+               | otherwise =
+                   case readDoubleArray# mba (trOff +# l) s of
+                     (# s', rl #) ->
+                       case readDoubleArray# mba (hvOff +# l) s' of
+                         (# s'', vl #) -> goSum (l +# 1#) (acc +## rl *## vl) s''
+         in case goSum (hvStart +# 1#) 0.0## s1 of
+              (# s2, w #) ->
+                -- Phase 2: R[targetRow,hvStart] -= w (implicit v[hvStart]=1)
+                case writeDoubleArray# mba (trOff +# hvStart) (r0 -## w) s2 of
+                  s3 ->
+                    let goUpdate l s
+                          | isTrue# (l >=# hvEnd) = s
+                          | otherwise =
+                              case readDoubleArray# mba (hvOff +# l) s of
+                                (# s', vl #) ->
+                                  case readDoubleArray# mba (trOff +# l) s' of
+                                    (# s'', rl #) ->
+                                      case writeDoubleArray# mba (trOff +# l) (rl -## w *## vl) s'' of
+                                        s''' -> goUpdate (l +# 1#) s'''
+                    in (# goUpdate (hvStart +# 1#) s3, () #)
+{-# INLINE rawMutHouseholderApplyRow #-}
+
+-- | Sum of squares of a row slice in a mutable row-major matrix.
+-- Σ A[row,j]² for j in [startCol..endCol-1].
+rawMutSumSqRow :: MutableByteArray s -> Int -> Int -> Int -> Int -> Int -> ST s Double
+rawMutSumSqRow (MutableByteArray mba) (I# off) (I# ncols) (I# row) (I# startCol) (I# endCol) = ST $ \s0 ->
+  let rowOff = off +# row *# ncols
+      go j acc s
+        | isTrue# (j >=# endCol) = (# s, D# acc #)
+        | otherwise =
+            case readDoubleArray# mba (rowOff +# j) s of
+              (# s', v #) -> go (j +# 1#) (acc +## v *## v) s'
+  in go startCol 0.0## s0
+{-# INLINE rawMutSumSqRow #-}
+
+-- --------------------------------------------------------------------------
+-- Cholesky SIMD kernel
+-- --------------------------------------------------------------------------
+
+-- | SIMD-vectorised Cholesky column kernel.
+-- Restructures the inner loop as a dot product of contiguous row segments:
+--   G[i,j] -= Σ_{k=0}^{j-1} G[i,k] * G[j,k]
+-- which is a dot product of row[i][0..j-1] and row[j][0..j-1].
+-- Since rows are contiguous in row-major storage, this enables DoubleX4# SIMD.
+rawCholColumnSIMD :: MutableByteArray s -> Int -> Int -> Int -> ST s ()
+rawCholColumnSIMD (MutableByteArray mba) (I# off) (I# n) (I# j) = ST $ \s0 ->
+  let jRowOff = off +# j *# n
+      -- For each row i in [j..n-1], subtract dot(row[i][0..j-1], row[j][0..j-1])
+      j4 = j -# (j `remInt#` 4#)  -- SIMD boundary for dot of length j
+
+      goI i s
+        | isTrue# (i >=# n) = s
+        | otherwise =
+            let iRowOff = off +# i *# n
+            in case mutRowDot iRowOff jRowOff 0# j4 j s of
+                 (# s', dot #) ->
+                   case readDoubleArray# mba (iRowOff +# j) s' of
+                     (# s'', gij #) ->
+                       case writeDoubleArray# mba (iRowOff +# j) (gij -## dot) s'' of
+                         s''' -> goI (i +# 1#) s'''
+
+      -- Dot product of two mutable row segments using SIMD
+      mutRowDot r1 r2 k k4End kEnd s
+        -- SIMD phase
+        | isTrue# (k <# k4End) =
+            case goSimd r1 r2 k k4End (broadcastDoubleX4# 0.0##) s of
+              (# s', acc4 #) ->
+                let !(# a, b, c, d #) = unpackDoubleX4# acc4
+                    simdSum = a +## b +## c +## d
+                in mutRowDotScalar r1 r2 k4End kEnd simdSum s'
+        | otherwise = mutRowDotScalar r1 r2 k kEnd 0.0## s
+
+      goSimd r1 r2 k k4End acc s
+        | isTrue# (k >=# k4End) = (# s, acc #)
+        | otherwise =
+            case readDoubleArrayAsDoubleX4# mba (r1 +# k) s of
+              (# s1, v1 #) ->
+                case readDoubleArrayAsDoubleX4# mba (r2 +# k) s1 of
+                  (# s2, v2 #) -> goSimd r1 r2 (k +# 4#) k4End (fmaddDoubleX4# v1 v2 acc) s2
+
+      mutRowDotScalar r1 r2 k kEnd acc s
+        | isTrue# (k >=# kEnd) = (# s, acc #)
+        | otherwise =
+            case readDoubleArray# mba (r1 +# k) s of
+              (# s1, v1 #) ->
+                case readDoubleArray# mba (r2 +# k) s1 of
+                  (# s2, v2 #) -> mutRowDotScalar r1 r2 (k +# 1#) kEnd (acc +## v1 *## v2) s2
+
+  in case goI j s0 of
+       s1 ->
+         -- Scale column: G[j,j] = sqrt(G[j,j]); G[i,j] /= G[j,j] for i > j
+         case readDoubleArray# mba (jRowOff +# j) s1 of
+           (# s2, gjj #) ->
+             let sjj = sqrtDouble# gjj
+             in case writeDoubleArray# mba (jRowOff +# j) sjj s2 of
+                  s3 ->
+                    let goScale i s
+                          | isTrue# (i >=# n) = s
+                          | otherwise =
+                              case readDoubleArray# mba (off +# i *# n +# j) s of
+                                (# s4, gij #) ->
+                                  case writeDoubleArray# mba (off +# i *# n +# j) (gij /## sjj) s4 of
+                                    s5 -> goScale (i +# 1#) s5
+                    in (# goScale (j +# 1#) s3, () #)
+{-# INLINE rawCholColumnSIMD #-}
 
 -- --------------------------------------------------------------------------
 -- Utilities

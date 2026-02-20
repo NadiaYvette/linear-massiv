@@ -1,6 +1,7 @@
 {-# LANGUAGE AllowAmbiguousTypes #-}
 {-# LANGUAGE BangPatterns #-}
 {-# LANGUAGE MagicHash #-}
+{-# LANGUAGE UnboxedTuples #-}
 
 -- |
 -- Module      : Numeric.LinearAlgebra.Massiv.Eigen.SVD
@@ -26,40 +27,39 @@
 --
 -- The \(\sigma_i\) are the /singular values/ of \(A\) and equal the
 -- non-negative square roots of the eigenvalues of \(A^T A\).
---
--- __Implementation note:__  Rather than the full Golub--Kahan
--- bidiagonalisation pipeline (GVL4 Algorithm 8.6.1, p. 504), this module
--- takes a simpler (though less efficient) approach: it forms the symmetric
--- positive semi-definite matrix \(A^T A\), computes its eigendecomposition
--- via 'Numeric.LinearAlgebra.Massiv.Eigen.Symmetric.symmetricEigen', and
--- recovers the singular values as \(\sigma_i = \sqrt{\max(0, \lambda_i)}\)
--- and the left singular vectors as \(u_i = A v_i / \sigma_i\).  This is
--- adequate for moderate-sized matrices but may lose accuracy for matrices
--- with a large condition number, because the condition number of \(A^T A\)
--- is the /square/ of that of \(A\).
 module Numeric.LinearAlgebra.Massiv.Eigen.SVD
   ( -- * Full SVD
     svd
   , svdP
+  , svdAtAP
+  , svdGKP
     -- * Singular values only
   , singularValues
   , singularValuesP
   ) where
 
 import qualified Data.Massiv.Array as M
-import Data.Massiv.Array (Ix2(..), Sz(..), unwrapByteArray, unwrapByteArrayOffset)
-import Data.Primitive.ByteArray (ByteArray(..))
+import Data.Massiv.Array (Ix2(..), Sz(..), unwrapByteArray, unwrapByteArrayOffset,
+                          unwrapMutableByteArray, unwrapMutableByteArrayOffset)
+import Data.Primitive.ByteArray (ByteArray(..), MutableByteArray(..), newByteArray)
 import GHC.TypeNats (KnownNat)
-import Control.Monad (forM_)
+import Control.Monad (forM_, when)
+import Control.Monad.ST (runST)
 import Data.List (sortBy)
-import Data.Ord (Down(..))
+import Data.Ord (Down)
 import GHC.Exts
+import GHC.ST (ST(..))
 
 import Numeric.LinearAlgebra.Massiv.Types
 import Numeric.LinearAlgebra.Massiv.Internal
 import Numeric.LinearAlgebra.Massiv.BLAS.Level3 (matMul, matMulP, transpose)
 import Numeric.LinearAlgebra.Massiv.BLAS.Level2 (matvecP)
 import Numeric.LinearAlgebra.Massiv.Eigen.Symmetric (symmetricEigen, symmetricEigenP)
+import Numeric.LinearAlgebra.Massiv.Internal.Kernel
+  ( rawMutSumSqColumn, rawMutSumSqRow
+  , rawMutHouseholderApply, rawMutHouseholderApplyRow
+  , rawMutQAccum
+  , rawMutApplyGivensColumns )
 
 -- | Compute the full Singular Value Decomposition (GVL4 Theorem 8.6.1,
 -- p. 499).
@@ -92,8 +92,7 @@ svd :: forall m n r e. (KnownNat m, KnownNat n, M.Manifest r e, Floating e, Ord 
     => Matrix m n r e
     -> (Matrix m m r e, Vector n r e, Matrix n n r e)
 svd a =
-  let mm = dimVal @m
-      nn = dimVal @n
+  let nn = dimVal @n
       at = transpose a
       ata = matMul at a  -- n×n symmetric positive semidefinite
       -- Eigendecomposition of AᵀA
@@ -125,7 +124,16 @@ svd a =
 svdP :: forall m n. (KnownNat m, KnownNat n)
      => Matrix m n M.P Double
      -> (Matrix m m M.P Double, Vector n M.P Double, Matrix n n M.P Double)
-svdP a =
+svdP = svdAtAP
+{-# NOINLINE svdP #-}
+
+-- | SVD via A^T A eigendecomposition.
+-- Forms A^T A, eigendecomposes via 'symmetricEigenP', recovers singular
+-- values as square roots and left singular vectors via matrix-vector products.
+svdAtAP :: forall m n. (KnownNat m, KnownNat n)
+        => Matrix m n M.P Double
+        -> (Matrix m m M.P Double, Vector n M.P Double, Matrix n n M.P Double)
+svdAtAP a =
   let !mm = dimVal @m
       !nn = dimVal @n
       at = transpose a
@@ -162,7 +170,7 @@ svdP a =
           forM_ [0..mm-1] $ \i ->
             M.write_ mu (i :. j) (if i == j then 1 else 0)
   in (u, sigma, v)
-{-# NOINLINE svdP #-}
+{-# NOINLINE svdAtAP #-}
 
 -- | Read a Double from an immutable ByteArray at element index.
 readBA :: ByteArray -> Int -> Int -> Double
@@ -171,15 +179,6 @@ readBA (ByteArray ba) (I# off) (I# i) =
 {-# INLINE readBA #-}
 
 -- | Compute only the singular values of \(A\), sorted in descending order.
---
--- \[
---   \sigma_i = \sqrt{\max(0,\, \lambda_i(A^T A))}, \qquad i = 1, \ldots, n
--- \]
---
--- This is a convenience function that avoids constructing the full \(U\) and
--- \(V\) matrices.  It forms \(A^T A\), computes its eigenvalues via
--- 'Numeric.LinearAlgebra.Massiv.Eigen.Symmetric.symmetricEigen', and returns
--- their non-negative square roots in descending order.
 singularValues :: forall m n r e. (KnownNat m, KnownNat n, M.Manifest r e, Floating e, Ord e)
                => Matrix m n r e -> Vector n r e
 singularValues a =
@@ -207,3 +206,418 @@ singularValuesP a =
   in makeVector @n @M.P $ \i ->
     let ev = sorted !! i
     in if ev > 0 then sqrt ev else 0
+
+-- ============================================================================
+-- Golub-Kahan bidiagonalisation SVD (GVL4 Algorithm 5.4.2 + 8.6.2)
+-- ============================================================================
+
+-- | Full Golub-Kahan SVD pipeline.
+-- Phase 1: Bidiagonalise A → U₀ B V₀^T
+-- Phase 2: Implicit-shift QR on bidiagonal B, accumulating rotations into U, V
+-- Phase 3: Assemble final U, sigma, V; ensure σᵢ ≥ 0; sort descending
+svdGKP :: forall m n. (KnownNat m, KnownNat n)
+       => Matrix m n M.P Double
+       -> (Matrix m m M.P Double, Vector n M.P Double, Matrix n n M.P Double)
+svdGKP (MkMatrix a_) = runST $ do
+  let !mm = dimVal @m
+      !nn = dimVal @n
+
+  -- Copy input into mutable working storage
+  mA <- M.thawS a_
+  let mbaA = unwrapMutableByteArray mA
+      offA = unwrapMutableByteArrayOffset mA
+
+  -- Allocate arrays for Householder betas
+  mbaBetaL <- newByteArray (nn * 8)  -- left Householder betas
+  mbaBetaR <- newByteArray (nn * 8)  -- right Householder betas
+
+  -- Phase 1: Bidiagonalise A in-place
+  bidiagonalizeP mbaA offA mm nn mbaBetaL mbaBetaR
+
+  -- Extract diagonal d and superdiagonal e from bidiagonalised A
+  mbaD <- newByteArray (nn * 8)
+  mbaE <- newByteArray (nn * 8)
+  forM_ [0..nn-1] $ \k -> do
+    dk <- readRawD mbaA offA (k * nn + k)
+    writeRawD mbaD 0 k dk
+  forM_ [0..nn-2] $ \k -> do
+    ek <- readRawD mbaA offA (k * nn + (k+1))
+    writeRawD mbaE 0 k ek
+
+  -- Freeze A for Householder vector extraction
+  frozenA <- M.freezeS mA
+
+  -- Phase 2: Accumulate U₀ and V₀ from stored Householder vectors
+  -- U₀ = H₀ H₁ ... H_{n-1} (left reflectors, stored in columns of A)
+  mU <- M.newMArray @M.P (Sz (mm :. mm)) (0 :: Double)
+  let mbaU = unwrapMutableByteArray mU
+      offU = unwrapMutableByteArrayOffset mU
+  -- Initialise U = I
+  forM_ [0..mm-1] $ \i ->
+    writeRawD mbaU offU (i * mm + i) 1.0
+
+  let baA = unwrapByteArray frozenA
+      offFA = unwrapByteArrayOffset frozenA
+
+  -- Accumulate left Householder reflectors into U (backward)
+  -- Left reflector k: v stored in column k of A, rows k+1..m-1, with v[k]=1 implicit
+  forM_ (reverse [0..nn-1]) $ \k -> do
+    betaK <- readRawD mbaBetaL 0 k
+    when (betaK /= 0) $
+      forM_ [0..mm-1] $ \row ->
+        rawMutQAccum mbaU offU mm baA offFA nn betaK k mm row
+
+  -- V₀ = G₁ G₂ ... G_{n-3} (right reflectors)
+  mV <- M.newMArray @M.P (Sz (nn :. nn)) (0 :: Double)
+  let mbaV = unwrapMutableByteArray mV
+      offV = unwrapMutableByteArrayOffset mV
+  -- Initialise V = I
+  forM_ [0..nn-1] $ \i ->
+    writeRawD mbaV offV (i * nn + i) 1.0
+
+  -- Accumulate right Householder reflectors into V (backward)
+  -- Right reflector k: v stored in row k of A, cols k+2..n-1, with v[k+1]=1 implicit
+  when (nn >= 3) $
+    forM_ (reverse [0..nn-3]) $ \k -> do
+      betaK <- readRawD mbaBetaR 0 k
+      when (betaK /= 0) $
+        forM_ [0..nn-1] $ \row ->
+          rightQAccum mbaV offV nn baA offFA nn betaK k nn row
+
+  -- Phase 3: Implicit-shift bidiagonal QR iteration
+  bidiagQRIterP mbaD 0 mbaE 0 mbaU offU mm mbaV offV nn nn (30 * nn)
+
+  -- Phase 4: Ensure σᵢ ≥ 0 (flip sign of U column if needed)
+  forM_ [0..nn-1] $ \k -> do
+    dk <- readRawD mbaD 0 k
+    when (dk < 0) $ do
+      writeRawD mbaD 0 k (negate dk)
+      -- Flip column k of U
+      forM_ [0..mm-1] $ \i -> do
+        uik <- readRawD mbaU offU (i * mm + k)
+        writeRawD mbaU offU (i * mm + k) (negate uik)
+
+  -- Phase 5: Sort singular values descending and permute U, V columns
+  pairs <- mapM (\k -> do dk <- readRawD mbaD 0 k; return (dk, k)) [0..nn-1]
+  let !sorted = sortBy (\(a1,_) (b1,_) -> compare (Down a1) (Down b1)) pairs
+
+  frozenU <- M.freezeS mU
+  frozenV <- M.freezeS mV
+  let baU = unwrapByteArray frozenU
+      offFU = unwrapByteArrayOffset frozenU
+      baV = unwrapByteArray frozenV
+      offFV = unwrapByteArrayOffset frozenV
+
+  let !sigmaVec = makeVector @n @M.P $ \i -> fst (sorted !! i)
+      !uMat = makeMatrix @m @m @M.P $ \i j ->
+        if j < nn
+          then let origCol = snd (sorted !! j)
+               in readBA baU offFU (i * mm + origCol)
+          else if i == j then 1 else 0
+      !vMat = makeMatrix @n @n @M.P $ \i j ->
+        let origCol = snd (sorted !! j)
+        in readBA baV offFV (i * nn + origCol)
+
+  return (uMat, sigmaVec, vMat)
+{-# NOINLINE svdGKP #-}
+
+-- | In-place bidiagonalisation of an m×n matrix stored in a MutableByteArray.
+-- GVL4 Algorithm 5.4.2, p. 284.
+--
+-- After this, the matrix has:
+-- - Diagonal d[k] = A[k,k]
+-- - Superdiagonal e[k] = A[k,k+1]
+-- - Left Householder vectors stored in column k below diagonal (rows k+1..m-1)
+-- - Right Householder vectors stored in row k right of superdiag (cols k+2..n-1)
+-- - Householder betas stored in mbaBetaL and mbaBetaR
+bidiagonalizeP :: MutableByteArray s -> Int -> Int -> Int
+               -> MutableByteArray s -> MutableByteArray s -> ST s ()
+bidiagonalizeP mbaA offA mm nn mbaBetaL mbaBetaR = do
+  forM_ [0..nn-1] $ \k -> do
+    -- Left Householder: zero out A[k+1:m, k]
+    -- Compute Householder vector for column k, rows k..m-1
+    if k < mm - 1
+      then do
+        -- sigma = Σ A[i,k]² for i in k+1..m-1
+        sigma <- rawMutSumSqColumn mbaA offA nn (k+1) mm k
+        x0 <- readRawD mbaA offA (k * nn + k)
+        if sigma < 1e-300
+          then writeRawD mbaBetaL 0 k 0
+          else do
+            let mu = sqrt (x0 * x0 + sigma)
+                v0 = if x0 <= 0 then x0 - mu else -sigma / (x0 + mu)
+                beta = 2 * v0 * v0 / (sigma + v0 * v0)
+            -- Store v: normalise by v0
+            -- v[k] will become 1 (implicit), v[k+1..m-1] = A[i,k]/v0
+            forM_ [k+1..mm-1] $ \i -> do
+              aik <- readRawD mbaA offA (i * nn + k)
+              writeRawD mbaA offA (i * nn + k) (aik / v0)
+            -- Set A[k,k] = mu (the diagonal value after reflection)
+            writeRawD mbaA offA (k * nn + k) mu
+            writeRawD mbaBetaL 0 k beta
+            -- Apply left Householder to columns k+1..n-1
+            -- Using rawMutHouseholderApply which reads v from column k, rows k+1..m-1
+            forM_ [k+1..nn-1] $ \col ->
+              rawMutHouseholderApply mbaA offA nn beta k mm col
+      else
+        writeRawD mbaBetaL 0 k 0
+
+    -- Right Householder: zero out A[k, k+2:n]
+    if k < nn - 2
+      then do
+        -- sigma = Σ A[k,j]² for j in k+2..n-1
+        sigma <- rawMutSumSqRow mbaA offA nn k (k+2) nn
+        x0 <- readRawD mbaA offA (k * nn + (k+1))
+        if sigma < 1e-300
+          then writeRawD mbaBetaR 0 k 0
+          else do
+            let mu = sqrt (x0 * x0 + sigma)
+                v0 = if x0 <= 0 then x0 - mu else -sigma / (x0 + mu)
+                beta = 2 * v0 * v0 / (sigma + v0 * v0)
+            -- Store v: normalise by v0
+            -- v[k+1] will become 1 (implicit), v[k+2..n-1] = A[k,j]/v0
+            forM_ [k+2..nn-1] $ \j -> do
+              akj <- readRawD mbaA offA (k * nn + j)
+              writeRawD mbaA offA (k * nn + j) (akj / v0)
+            -- Set A[k,k+1] = mu (the superdiagonal value)
+            writeRawD mbaA offA (k * nn + (k+1)) mu
+            writeRawD mbaBetaR 0 k beta
+            -- Apply right Householder to rows k+1..m-1
+            -- v is stored in row k, cols k+2..n-1, with implicit v[k+1]=1
+            forM_ [k+1..mm-1] $ \row ->
+              rawMutHouseholderApplyRow mbaA offA nn beta k (k+1) nn row
+      else
+        when (k < nn - 1) $ writeRawD mbaBetaR 0 k 0
+{-# NOINLINE bidiagonalizeP #-}
+
+-- | Implicit-shift bidiagonal QR iteration (GVL4 Algorithm 8.6.2).
+-- Operates on diagonal d and superdiagonal e of an upper bidiagonal matrix.
+-- Accumulates left rotations into U (m×n columns) and right rotations into V (n×n).
+bidiagQRIterP :: MutableByteArray s -> Int  -- d + offset
+              -> MutableByteArray s -> Int  -- e + offset
+              -> MutableByteArray s -> Int -> Int  -- U + offset + ucols
+              -> MutableByteArray s -> Int -> Int  -- V + offset + vcols
+              -> Int -> Int  -- n, maxIter
+              -> ST s ()
+bidiagQRIterP mbaD offD mbaE offE mbaU offU ucols mbaV offV vcols nn maxIter = go 0 0 (nn - 1)
+  where
+    go !iter !lo !hi
+      | iter >= maxIter = return ()
+      | hi <= lo = return ()
+      | otherwise = do
+          -- Check if e[hi-1] is negligible → deflation
+          ehi <- readRawD mbaE offE (hi - 1)
+          dhi <- readRawD mbaD offD hi
+          dhi1 <- readRawD mbaD offD (hi - 1)
+          let tol = 1e-14 * (abs dhi1 + abs dhi)
+          if abs ehi <= tol
+            then do
+              writeRawD mbaE offE (hi - 1) 0
+              go iter lo (hi - 1)
+            else do
+              -- Check if e[lo] is negligible → advance lo
+              elo <- readRawD mbaE offE lo
+              dlo <- readRawD mbaD offD lo
+              dlo1 <- readRawD mbaD offD (lo + 1)
+              let tolLo = 1e-14 * (abs dlo + abs dlo1)
+              if abs elo <= tolLo && lo < hi - 1
+                then do
+                  writeRawD mbaE offE lo 0
+                  go iter (lo + 1) hi
+                else do
+                  -- Find split points
+                  mSplit <- findSplit mbaE offE mbaD offD lo hi
+                  case mSplit of
+                    Just q -> do
+                      writeRawD mbaE offE q 0
+                      -- Check if zero is on diagonal — special zero-shift chase
+                      mZeroDiag <- findZeroDiag mbaD offD lo hi
+                      case mZeroDiag of
+                        Just _ -> go iter lo hi  -- re-enter with split
+                        Nothing -> go iter lo hi  -- re-enter with split
+                    Nothing -> do
+                      -- Implicit-shift QR step
+                      bidiagQRStep mbaD offD mbaE offE mbaU offU ucols mbaV offV vcols lo hi
+                      go (iter + 1) lo hi
+
+    findSplit mbaE_ offE_ mbaD_ offD_ lo_ hi_ = go' (hi_ - 1)
+      where
+        go' q
+          | q <= lo_ = return Nothing
+          | otherwise = do
+              eq <- readRawD mbaE_ offE_ q
+              dq <- readRawD mbaD_ offD_ q
+              dq1 <- readRawD mbaD_ offD_ (q + 1)
+              let tol = 1e-14 * (abs dq + abs dq1)
+              if abs eq <= tol
+                then return (Just q)
+                else go' (q - 1)
+
+    findZeroDiag mbaD_ offD_ lo_ hi_ = go' lo_
+      where
+        go' i
+          | i > hi_ = return Nothing
+          | otherwise = do
+              di <- readRawD mbaD_ offD_ i
+              if abs di < 1e-300
+                then return (Just i)
+                else go' (i + 1)
+{-# NOINLINE bidiagQRIterP #-}
+
+-- | One implicit-shift QR step on bidiagonal [lo..hi].
+-- Computes Wilkinson shift from bottom 2×2 of B^T B,
+-- then chases bulge via Givens rotations.
+bidiagQRStep :: MutableByteArray s -> Int  -- d + offset
+             -> MutableByteArray s -> Int  -- e + offset
+             -> MutableByteArray s -> Int -> Int  -- U + offset + ucols
+             -> MutableByteArray s -> Int -> Int  -- V + offset + vcols
+             -> Int -> Int  -- lo, hi
+             -> ST s ()
+bidiagQRStep mbaD offD mbaE offE mbaU offU ucols mbaV offV vcols lo hi = do
+  -- Compute Wilkinson shift from trailing 2×2 of T = B^T B
+  dhi1 <- readRawD mbaD offD (hi - 1)
+  dhi  <- readRawD mbaD offD hi
+  ehi1 <- readRawD mbaE offE (hi - 1)
+  ehi2 <- if hi >= 2 then readRawD mbaE offE (hi - 2) else return 0
+
+  -- T = B^T B trailing 2×2:
+  -- t11 = d[hi-1]^2 + e[hi-2]^2  (e[hi-2] = 0 if hi-1 == lo)
+  -- t12 = d[hi-1] * e[hi-1]
+  -- t22 = d[hi]^2 + e[hi-1]^2
+  let t11 = dhi1 * dhi1 + (if hi - 1 > lo then ehi2 * ehi2 else 0)
+      t12 = dhi1 * ehi1
+      t22 = dhi * dhi + ehi1 * ehi1
+
+  -- Wilkinson shift: eigenvalue of [[t11,t12],[t12,t22]] closer to t22
+  let delta = (t11 - t22) / 2
+      mu = t22 - t12 * t12 / (delta + signum delta * sqrt (delta * delta + t12 * t12))
+
+  -- Initial values for bulge chase
+  dlo <- readRawD mbaD offD lo
+  elo <- readRawD mbaE offE lo
+  let y = dlo * dlo - mu
+      z = dlo * elo
+
+  -- Chase bulge from lo to hi
+  go lo y z
+  where
+    go k y_ z_ = do
+      -- Right Givens rotation G(k,k+1,θ) to zero z in [y; z]
+      let (cosR, sinR) = givens y_ z_
+      -- Apply to columns k, k+1 of B (affects d[k], e[k], d[k+1], and possibly e[k-1])
+      dk  <- readRawD mbaD offD k
+      ek  <- readRawD mbaE offE k
+      dk1 <- readRawD mbaD offD (k + 1)
+
+      -- B * G^T: columns k and k+1 get mixed
+      let dk'  = cosR * dk + sinR * ek
+          ek'  = -sinR * dk + cosR * ek
+          -- This creates a bulge at B[k+1,k]
+          bulgeL = sinR * dk1
+          dk1'   = cosR * dk1
+
+      writeRawD mbaD offD k dk'
+      writeRawD mbaE offE k ek'
+      writeRawD mbaD offD (k + 1) dk1'
+
+      -- Also handle e[k-1] if k > lo (it gets mixed by previous left rotation)
+      -- The bulge from the right rotation is at position (k+1, k), i.e. below the diagonal
+
+      -- Accumulate right rotation into V (columns k, k+1)
+      rawMutApplyGivensColumns mbaV offV vcols cosR sinR k (k+1) vcols
+
+      -- Left Givens rotation G(k,k+1,θ) to zero the bulge at (k+1, k)
+      let (cosL, sinL) = givens dk' bulgeL
+
+      -- G * B: rows k and k+1 get mixed
+      let dk''  = cosL * dk' + sinL * bulgeL
+          ek''  = cosL * ek' + sinL * dk1'
+          dk1'' = -sinL * ek' + cosL * dk1'
+
+      writeRawD mbaD offD k dk''
+      writeRawD mbaE offE k ek''
+      writeRawD mbaD offD (k + 1) dk1''
+
+      -- This may create a new bulge at position (k, k+2) if k+1 < hi
+      when (k + 1 < hi) $ do
+        ek1 <- readRawD mbaE offE (k + 1)
+        let bulgeR = sinL * ek1
+            ek1'   = cosL * ek1
+        writeRawD mbaE offE (k + 1) ek1'
+
+        -- Accumulate left rotation into U (columns k, k+1)
+        rawMutApplyGivensColumns mbaU offU ucols cosL sinL k (k+1) ucols
+
+        -- Continue chase
+        go (k + 1) ek'' bulgeR
+
+      when (k + 1 >= hi) $
+        -- Accumulate final left rotation
+        rawMutApplyGivensColumns mbaU offU ucols cosL sinL k (k+1) ucols
+
+-- | Compute Givens rotation coefficients (c, s) such that
+-- [c s; -s c]^T [a; b] = [r; 0].
+givens :: Double -> Double -> (Double, Double)
+givens a b
+  | b == 0    = (1, 0)
+  | abs b > abs a =
+      let tau = -a / b
+          s   = 1 / sqrt (1 + tau * tau)
+          c   = s * tau
+      in (c, s)
+  | otherwise =
+      let tau = -b / a
+          c   = 1 / sqrt (1 + tau * tau)
+          s   = c * tau
+      in (c, s)
+{-# INLINE givens #-}
+
+-- | Accumulate a right Householder reflector into V.
+-- Right reflector k: v stored in row k of frozen A, cols k+2..n-1, with v[k+1]=1 (implicit).
+-- V = V * (I - beta * v * v^T)
+-- For each row of V: V[row, k+1..n-1] -= (beta * Σ V[row,l] * v[l]) * v
+rightQAccum :: MutableByteArray s -> Int -> Int  -- V + offset + vcols
+            -> ByteArray -> Int -> Int           -- frozen A + offset + acols
+            -> Double -> Int -> Int -> Int       -- beta, k, n, row
+            -> ST s ()
+rightQAccum mbaV offV vcols (ByteArray baA) offFA acols beta k nn row = do
+  -- Phase 1: wi = beta * (V[row, k+1] + Σ_{l=k+2}^{n-1} V[row, l] * A[k, l])
+  qrk1 <- readRawD mbaV offV (row * vcols + (k+1))
+  acc <- goSum (k+2) 0
+  let wi = beta * (qrk1 + acc)
+  -- Phase 2: V[row, k+1] -= wi (implicit v[k+1]=1)
+  writeRawD mbaV offV (row * vcols + (k+1)) (qrk1 - wi)
+  -- V[row, l] -= wi * A[k, l] for l in k+2..n-1
+  goUpdate (k+2) wi
+  where
+    goSum l acc_
+      | l >= nn = return acc_
+      | otherwise = do
+          let vl = readBAI baA offFA (k * acols + l)
+          qrl <- readRawD mbaV offV (row * vcols + l)
+          goSum (l + 1) (acc_ + qrl * vl)
+
+    goUpdate l wi
+      | l >= nn = return ()
+      | otherwise = do
+          let vl = readBAI baA offFA (k * acols + l)
+          qrl <- readRawD mbaV offV (row * vcols + l)
+          writeRawD mbaV offV (row * vcols + l) (qrl - wi * vl)
+          goUpdate (l + 1) wi
+
+    readBAI ba_ off_ i_ =
+      case indexDoubleArray# ba_ (case off_ of I# o -> o +# case i_ of I# ii -> ii) of
+        v -> D# v
+{-# INLINE rightQAccum #-}
+
+-- | Read a Double from a MutableByteArray at element index.
+readRawD :: MutableByteArray s -> Int -> Int -> ST s Double
+readRawD (MutableByteArray mba) (I# off) (I# i) = ST $ \s ->
+  case readDoubleArray# mba (off +# i) s of (# s', v #) -> (# s', D# v #)
+{-# INLINE readRawD #-}
+
+-- | Write a Double to a MutableByteArray at element index.
+writeRawD :: MutableByteArray s -> Int -> Int -> Double -> ST s ()
+writeRawD (MutableByteArray mba) (I# off) (I# i) (D# v) = ST $ \s ->
+  case writeDoubleArray# mba (off +# i) v s of s' -> (# s', () #)
+{-# INLINE writeRawD #-}
