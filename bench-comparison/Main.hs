@@ -21,12 +21,12 @@ import Numeric.LinearAlgebra.Massiv.Types
 import Numeric.LinearAlgebra.Massiv.Internal
 import Numeric.LinearAlgebra.Massiv.BLAS.Level1 (dotP)
 import Numeric.LinearAlgebra.Massiv.BLAS.Level2 (matvecP)
-import Numeric.LinearAlgebra.Massiv.BLAS.Level3 (matMulP)
+import Numeric.LinearAlgebra.Massiv.BLAS.Level3 (matMulP, matMulPPar)
 import Numeric.LinearAlgebra.Massiv.Solve.LU (luSolve, luSolveP)
 import Numeric.LinearAlgebra.Massiv.Solve.Cholesky (choleskySolve, choleskySolveP)
 import Numeric.LinearAlgebra.Massiv.Orthogonal.QR (qr, qrP)
 import Numeric.LinearAlgebra.Massiv.Eigen.Symmetric (symmetricEigen, symmetricEigenP)
-import Numeric.LinearAlgebra.Massiv.Eigen.SVD (svd)
+import Numeric.LinearAlgebra.Massiv.Eigen.SVD (svd, svdP)
 
 -- hmatrix
 import qualified Numeric.LinearAlgebra as H
@@ -139,7 +139,7 @@ main :: IO ()
 main = do
   -- Pre-compute all matrices to avoid construction overhead in benchmarks
   let hm4   = mkMatHM 4;   hm10  = mkMatHM 10;  hm50  = mkMatHM 50
-      hm100 = mkMatHM 100; hm200 = mkMatHM 200
+      hm100 = mkMatHM 100; hm200 = mkMatHM 200; hm500 = mkMatHM 500
       hv4   = mkVecHM 4;   hv10  = mkVecHM 10;   hv50  = mkVecHM 50
       hv100 = mkVecHM 100; hv1000 = mkVecHM 1000
       dd10 = mkDDHM 10; dd50 = mkDDHM 50; dd100 = mkDDHM 100
@@ -167,6 +167,12 @@ main = do
       , bgroup "200x200"
         [ bench "hmatrix"       $ nf (hmGemm hm200) hm200
         , bench "linear-massiv" $ nf (matMulP (mkMatLM @200 @200)) (mkMatLM @200 @200)
+        , bench "lm-parallel"   $ nf (matMulPPar (mkMatLM @200 @200)) (mkMatLM @200 @200)
+        ]
+      , bgroup "500x500"
+        [ bench "hmatrix"       $ nf (hmGemm hm500) hm500
+        , bench "linear-massiv" $ nf (matMulP (mkMatLM @500 @500)) (mkMatLM @500 @500)
+        , bench "lm-parallel"   $ nf (matMulPPar (mkMatLM @500 @500)) (mkMatLM @500 @500)
         ]
       ]
     , bgroup "dot"
@@ -265,11 +271,17 @@ main = do
     , bgroup "SVD"
       [ bgroup "10x10"
         [ bench "hmatrix"       $ nf H.svd hm10
-        , bench "linear-massiv" $ nf svd (mkMatLM @10 @10)
+        , bench "linear-massiv" $ nf svdP (mkMatLM @10 @10)
+        , bench "lm-generic"    $ nf svd (mkMatLM @10 @10)
         ]
       , bgroup "50x50"
         [ bench "hmatrix"       $ nf H.svd hm50
-        , bench "linear-massiv" $ nf svd (mkMatLM @50 @50)
+        , bench "linear-massiv" $ nf svdP (mkMatLM @50 @50)
+        , bench "lm-generic"    $ nf svd (mkMatLM @50 @50)
+        ]
+      , bgroup "100x100"
+        [ bench "hmatrix"       $ nf H.svd hm100
+        , bench "linear-massiv" $ nf svdP (mkMatLM @100 @100)
         ]
       ]
     ]

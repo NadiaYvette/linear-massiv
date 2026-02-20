@@ -15,6 +15,7 @@ module Numeric.LinearAlgebra.Massiv.Internal.Kernel
   , rawGemv
     -- * BLAS-3: matrix multiply (GEMM)
   , rawGemmKernel
+  , rawGemmBISlice
     -- * QR helpers (immutable)
   , rawSumSqRange
   , rawSumProdRange
@@ -116,15 +117,27 @@ rawGemv (ByteArray ba_a) (I# off_a) (I# ncols)
 rawGemmKernel :: ByteArray -> Int -> ByteArray -> Int
               -> MutableByteArray s -> Int
               -> Int -> Int -> Int -> ST s ()
-rawGemmKernel (ByteArray ba_a) (I# off_a) (ByteArray ba_b) (I# off_b)
-              (MutableByteArray mba_c) (I# off_c)
-              (I# m) (I# k) (I# n) = ST $ \s0 ->
+rawGemmKernel ba offA bb offB mc offC m k n =
+  rawGemmBISlice ba offA bb offB mc offC 0 m m k n
+{-# INLINE rawGemmKernel #-}
+
+-- | @rawGemmBISlice ba_a off_a ba_b off_b mba_c off_c biStart biEnd m k n@
+-- computes C[biStart..biEnd-1, :] += A[biStart..biEnd-1, :] * B
+-- where A is m×k, B is k×n, C is m×n (all row-major).
+-- Only the rows [biStart, biEnd) of C are written; all of B is read.
+-- This enables parallel GEMM by partitioning the row range across threads.
+rawGemmBISlice :: ByteArray -> Int -> ByteArray -> Int
+               -> MutableByteArray s -> Int
+               -> Int -> Int -> Int -> Int -> Int -> ST s ()
+rawGemmBISlice (ByteArray ba_a) (I# off_a) (ByteArray ba_b) (I# off_b)
+               (MutableByteArray mba_c) (I# off_c)
+               (I# biStart) (I# biEnd) (I# _m) (I# k) (I# n) = ST $ \s0 ->
   let bs = 64#
 
       goBI bi s
-        | isTrue# (bi >=# m) = s
+        | isTrue# (bi >=# biEnd) = s
         | otherwise =
-            let iEnd = minI (bi +# bs) m
+            let iEnd = minI (bi +# bs) biEnd
             in goBI (bi +# bs) (goBK bi iEnd 0# s)
 
       goBK bi iEnd bk s
@@ -176,8 +189,8 @@ rawGemmKernel (ByteArray ba_a) (I# off_a) (ByteArray ba_b) (I# off_b)
                        case writeDoubleArray# mba_c (cRowOff +# j) (cij +## aik *## bkj) s' of
                          s'' -> goJScalar (j +# 1#) jEnd_ aik bRowOff cRowOff s''
 
-  in (# goBI 0# s0, () #)
-{-# INLINE rawGemmKernel #-}
+  in (# goBI biStart s0, () #)
+{-# INLINE rawGemmBISlice #-}
 
 -- --------------------------------------------------------------------------
 -- QR helpers

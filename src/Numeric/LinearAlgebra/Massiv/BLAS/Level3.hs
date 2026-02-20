@@ -53,6 +53,7 @@ module Numeric.LinearAlgebra.Massiv.BLAS.Level3
     gemm
   , matMul
   , matMulP
+  , matMulPPar
   , matMulComp
     -- * Elementary matrix operations (GVL4 Section 1.1, pp. 4–18)
   , transpose
@@ -73,7 +74,10 @@ import GHC.ST (ST(..))
 import Data.Array.Byte (MutableByteArray(..))
 import Numeric.LinearAlgebra.Massiv.Types
 import Numeric.LinearAlgebra.Massiv.Internal
-import Numeric.LinearAlgebra.Massiv.Internal.Kernel (rawGemmKernel)
+import Control.Concurrent (forkIO, newEmptyMVar, putMVar, takeMVar, getNumCapabilities)
+import System.IO.Unsafe (unsafePerformIO)
+import GHC.IO (stToIO)
+import Numeric.LinearAlgebra.Massiv.Internal.Kernel (rawGemmKernel, rawGemmBISlice)
 
 -- | Block size for cache-tiled GEMM (generic fallback path).
 gemmBlockSize :: Int
@@ -198,6 +202,47 @@ matMulP (MkMatrix arrA) (MkMatrix arrB) =
     -- Run the raw SIMD kernel
     rawGemmKernel baA offA baB offB mbaC offC mm kk nn
 {-# NOINLINE matMulP #-}
+
+-- | Parallel specialised GEMM for @P Double@.
+-- Partitions the row range across OS threads, each calling 'rawGemmBISlice'
+-- on non-overlapping row ranges.  Uses @forkIO@ + @MVar@ barrier.
+-- Falls back to single-threaded 'matMulP' when @getNumCapabilities == 1@.
+matMulPPar :: forall m k n. (KnownNat m, KnownNat k, KnownNat n)
+           => Matrix m k M.P Double -> Matrix k n M.P Double -> Matrix m n M.P Double
+matMulPPar a b = unsafePerformIO $ do
+  let !mm = dimVal @m
+      !kk = dimVal @k
+      !nn = dimVal @n
+      !baA = unwrapByteArray (unMatrix a)
+      !offA = unwrapByteArrayOffset (unMatrix a)
+      !baB = unwrapByteArray (unMatrix b)
+      !offB = unwrapByteArrayOffset (unMatrix b)
+  caps <- getNumCapabilities
+  let numThreads = min caps mm  -- no point having more threads than rows
+  if numThreads <= 1
+    then pure (matMulP a b)
+    else do
+      -- Allocate mutable C, zero-initialise
+      mc <- stToIO $ M.newMArray (Sz (mm :. nn)) (0 :: Double)
+      let !mbaC = unwrapMutableByteArray mc
+          !offC = unwrapMutableByteArrayOffset mc
+          !chunkSize = (mm + numThreads - 1) `div` numThreads
+      -- Fork threads, each processing a row range
+      mvars <- mapM (\t -> do
+        let !biStart = t * chunkSize
+            !biEnd = min (biStart + chunkSize) mm
+        mv <- newEmptyMVar
+        _ <- forkIO $ do
+          stToIO $ rawGemmBISlice baA offA baB offB mbaC offC biStart biEnd mm kk nn
+          putMVar mv ()
+        pure mv
+        ) [0..numThreads-1]
+      -- Wait for all threads
+      mapM_ takeMVar mvars
+      -- Freeze and wrap
+      arr <- stToIO $ M.freezeS mc
+      pure (MkMatrix arr)
+{-# NOINLINE matMulPPar #-}
 
 {-# RULES
 "matMul/P/Double" forall (a :: Matrix m k M.P Double)

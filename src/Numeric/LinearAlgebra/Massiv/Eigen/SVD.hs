@@ -1,4 +1,6 @@
 {-# LANGUAGE AllowAmbiguousTypes #-}
+{-# LANGUAGE BangPatterns #-}
+{-# LANGUAGE MagicHash #-}
 
 -- |
 -- Module      : Numeric.LinearAlgebra.Massiv.Eigen.SVD
@@ -38,20 +40,26 @@
 module Numeric.LinearAlgebra.Massiv.Eigen.SVD
   ( -- * Full SVD
     svd
+  , svdP
     -- * Singular values only
   , singularValues
+  , singularValuesP
   ) where
 
 import qualified Data.Massiv.Array as M
-import Data.Massiv.Array (Ix2(..), Sz(..))
+import Data.Massiv.Array (Ix2(..), Sz(..), unwrapByteArray, unwrapByteArrayOffset)
+import Data.Primitive.ByteArray (ByteArray(..))
 import GHC.TypeNats (KnownNat)
+import Control.Monad (forM_)
 import Data.List (sortBy)
 import Data.Ord (Down(..))
+import GHC.Exts
 
 import Numeric.LinearAlgebra.Massiv.Types
 import Numeric.LinearAlgebra.Massiv.Internal
-import Numeric.LinearAlgebra.Massiv.BLAS.Level3 (matMul, transpose)
-import Numeric.LinearAlgebra.Massiv.Eigen.Symmetric (symmetricEigen)
+import Numeric.LinearAlgebra.Massiv.BLAS.Level3 (matMul, matMulP, transpose)
+import Numeric.LinearAlgebra.Massiv.BLAS.Level2 (matvecP)
+import Numeric.LinearAlgebra.Massiv.Eigen.Symmetric (symmetricEigen, symmetricEigenP)
 
 -- | Compute the full Singular Value Decomposition (GVL4 Theorem 8.6.1,
 -- p. 499).
@@ -110,6 +118,58 @@ svd a =
           if i == j then 1 else 0
   in (u, sigma, v)
 
+-- | P-specialised full SVD using raw ByteArray# SIMD kernels throughout.
+--
+-- Wires 'matMulP' (SIMD GEMM), 'symmetricEigenP' (raw primop QR iteration),
+-- and 'matvecP' (SIMD matrix–vector product) into the SVD pipeline.
+svdP :: forall m n. (KnownNat m, KnownNat n)
+     => Matrix m n M.P Double
+     -> (Matrix m m M.P Double, Vector n M.P Double, Matrix n n M.P Double)
+svdP a =
+  let !mm = dimVal @m
+      !nn = dimVal @n
+      at = transpose a
+      !ata = matMulP at a  -- n×n symmetric positive semidefinite, SIMD GEMM
+      -- Eigendecomposition of AᵀA using raw primop QR iteration
+      (!eigvals, !v) = symmetricEigenP ata (30 * nn) 1e-12
+      -- Singular values = sqrt of eigenvalues (clamp negatives to 0)
+      sigma = makeVector @n @M.P $ \i ->
+        let ev = eigvals !. i
+        in if ev > 0 then sqrt ev else 0
+      -- Compute U columns: u_j = A·v_j / σ_j using matvecP
+      -- Extract each column of V as a vector, multiply by A, normalise
+      u = createMatrix @m @m @M.P $ \mu -> do
+        -- Get immutable arrays for raw reads
+        let !baV = unwrapByteArray (unMatrix v)
+            !offV = unwrapByteArrayOffset (unMatrix v)
+        forM_ [0..nn-1] $ \j -> do
+          let sj = sigma !. j
+          if sj > 1e-14
+            then do
+              -- Extract column j of V as a Vector n
+              let !vj = makeVector @n @M.P $ \k -> readBA baV offV (k * nn + j)
+                  -- u_j = A · v_j / σ_j
+                  !avj = matvecP a vj
+                  !invSj = 1.0 / sj
+              forM_ [0..mm-1] $ \i ->
+                M.write_ mu (i :. j) (invSj * (avj !. i))
+            else
+              -- Zero singular value: use standard basis vector
+              forM_ [0..mm-1] $ \i ->
+                M.write_ mu (i :. j) (if i == j then 1 else 0)
+        -- Extra columns for m > n: extend to full orthogonal basis
+        forM_ [nn..mm-1] $ \j ->
+          forM_ [0..mm-1] $ \i ->
+            M.write_ mu (i :. j) (if i == j then 1 else 0)
+  in (u, sigma, v)
+{-# NOINLINE svdP #-}
+
+-- | Read a Double from an immutable ByteArray at element index.
+readBA :: ByteArray -> Int -> Int -> Double
+readBA (ByteArray ba) (I# off) (I# i) =
+  case indexDoubleArray# ba (off +# i) of v -> D# v
+{-# INLINE readBA #-}
+
 -- | Compute only the singular values of \(A\), sorted in descending order.
 --
 -- \[
@@ -131,5 +191,19 @@ singularValues a =
       evList = map (\i -> eigvals !. i) [0..nn-1]
       sorted = sortBy (\x y -> compare (Down x) (Down y)) evList
   in makeVector @n @r $ \i ->
+    let ev = sorted !! i
+    in if ev > 0 then sqrt ev else 0
+
+-- | P-specialised singular values using raw SIMD GEMM and raw primop eigenvalue solver.
+singularValuesP :: forall m n. (KnownNat m, KnownNat n)
+                => Matrix m n M.P Double -> Vector n M.P Double
+singularValuesP a =
+  let nn = dimVal @n
+      at = transpose a
+      !ata = matMulP at a
+      (!eigvals, _) = symmetricEigenP ata (30 * nn) 1e-12
+      evList = map (\i -> eigvals !. i) [0..nn-1]
+      sorted = sortBy (\x y -> compare (Down x) (Down y)) evList
+  in makeVector @n @M.P $ \i ->
     let ev = sorted !! i
     in if ev > 0 then sqrt ev else 0

@@ -25,6 +25,9 @@ import Data.Massiv.Array (Ix2(..), Ix1, unwrapMutableByteArray, unwrapMutableByt
 import GHC.TypeNats (KnownNat)
 import Control.Monad (when, forM_)
 import Control.Monad.ST (ST)
+import GHC.Exts
+import GHC.ST (ST(..))
+import Data.Primitive.ByteArray (MutableByteArray(..))
 
 import Numeric.LinearAlgebra.Massiv.Types
 import Numeric.LinearAlgebra.Massiv.Internal
@@ -251,7 +254,8 @@ applyGivensRightQP mq c s ci ck nn =
   in rawMutApplyGivensColumns mbaQ offQ nn c s ci ck nn
 
 -- | Specialised symmetric eigenvalue decomposition for @P Double@.
--- Uses raw ByteArray# primops for the Givens rotation in the QR step.
+-- Uses raw ByteArray# primops for the entire QR iteration, including
+-- diagonal/subdiagonal reads and writes plus Givens rotation on Q.
 symmetricEigenP :: forall n. KnownNat n
                 => Matrix n n M.P Double -> Int -> Double -> (Vector n M.P Double, Matrix n n M.P Double)
 symmetricEigenP a maxIter tol =
@@ -260,37 +264,62 @@ symmetricEigenP a maxIter tol =
       (dArr, qArr) = M.withMArrayST (unMatrix q0) $ \mq -> do
         md <- M.thawS (unVector diag_)
         msd <- M.thawS (unVector subdiag)
-        tridiagQRLoopP md msd mq nn maxIter tol
+        let !mbaD  = unwrapMutableByteArray md
+            !offD  = unwrapMutableByteArrayOffset md
+            !mbaSD = unwrapMutableByteArray msd
+            !offSD = unwrapMutableByteArrayOffset msd
+            !mbaQ  = unwrapMutableByteArray mq
+            !offQ  = unwrapMutableByteArrayOffset mq
+        rawTridiagQRLoop mbaD offD mbaSD offSD mbaQ offQ nn maxIter tol
         dFrozen <- M.freezeS md
         pure (MkVector dFrozen)
   in (dArr, MkMatrix qArr)
 {-# NOINLINE symmetricEigenP #-}
 
--- | P-specialised QR loop using raw Givens.
-tridiagQRLoopP :: M.MArray s M.P Ix1 Double -> M.MArray s M.P Ix1 Double -> M.MArray s M.P Ix2 Double
-               -> Int -> Int -> Double -> ST s ()
-tridiagQRLoopP md msd mq nn maxIter tol = go 0 0 (nn - 1)
+-- | Read a Double from a raw MutableByteArray at element index.
+readRawD :: MutableByteArray s -> Int -> Int -> ST s Double
+readRawD (MutableByteArray mba) (I# off) (I# i) = ST $ \s ->
+  case readDoubleArray# mba (off +# i) s of
+    (# s', v #) -> (# s', D# v #)
+{-# INLINE readRawD #-}
+
+-- | Write a Double to a raw MutableByteArray at element index.
+writeRawD :: MutableByteArray s -> Int -> Int -> Double -> ST s ()
+writeRawD (MutableByteArray mba) (I# off) (I# i) (D# v) = ST $ \s ->
+  case writeDoubleArray# mba (off +# i) v s of
+    s' -> (# s', () #)
+{-# INLINE writeRawD #-}
+
+-- | Raw primop QR loop: all diagonal/subdiagonal access via raw ByteArray# primops.
+rawTridiagQRLoop :: MutableByteArray s -> Int   -- ^ diagonal array + offset
+                 -> MutableByteArray s -> Int   -- ^ subdiagonal array + offset
+                 -> MutableByteArray s -> Int   -- ^ Q matrix + offset
+                 -> Int -> Int -> Double -> ST s ()
+rawTridiagQRLoop mbaD offD mbaSD offSD mbaQ offQ nn maxIter tol = go 0 0 (nn - 1)
   where
     go !iter !lo !hi
       | iter >= maxIter = pure ()
       | lo >= hi = pure ()
       | otherwise = do
-          sdhi <- M.readM msd (hi - 1)
-          dhi1 <- M.readM md (hi - 1)
-          dhi  <- M.readM md hi
+          -- Bottom deflation
+          sdhi <- readRawD mbaSD offSD (hi - 1)
+          dhi1 <- readRawD mbaD offD (hi - 1)
+          dhi  <- readRawD mbaD offD hi
           if abs sdhi <= tol * (abs dhi1 + abs dhi)
-            then do M.write_ msd (hi - 1) 0; go iter lo (hi - 1)
+            then do writeRawD mbaSD offSD (hi - 1) 0; go iter lo (hi - 1)
             else do
-              sdlo <- M.readM msd lo
-              dlo  <- M.readM md lo
-              dlo1 <- M.readM md (lo + 1)
+              -- Top deflation
+              sdlo <- readRawD mbaSD offSD lo
+              dlo  <- readRawD mbaD offD lo
+              dlo1 <- readRawD mbaD offD (lo + 1)
               if abs sdlo <= tol * (abs dlo + abs dlo1)
-                then do M.write_ msd lo 0; go iter (lo + 1) hi
+                then do writeRawD mbaSD offSD lo 0; go iter (lo + 1) hi
                 else do
-                  split <- findSplit md msd lo hi tol
+                  -- Interior deflation: find split point
+                  split <- rawFindSplit mbaD offD mbaSD offSD lo hi tol
                   case split of
                     Just q -> do
-                      M.write_ msd q 0
+                      writeRawD mbaSD offSD q 0
                       go iter lo q
                       go iter (q + 1) hi
                     Nothing -> do
@@ -298,35 +327,51 @@ tridiagQRLoopP md msd mq nn maxIter tol = go 0 0 (nn - 1)
                           delta = (dhi1 - dhi) / 2
                           sgn = if delta >= 0 then 1 else -1
                           shift = dhi - sp1*sp1 / (delta + sgn * sqrt (delta*delta + sp1*sp1))
-                      implicitQRStepInPlaceP md msd mq nn shift lo hi
+                      rawImplicitQRStep mbaD offD mbaSD offSD mbaQ offQ nn shift lo hi
                       go (iter + 1) lo hi
 
--- | P-specialised implicit QR step using raw Givens.
-implicitQRStepInPlaceP :: M.MArray s M.P Ix1 Double -> M.MArray s M.P Ix1 Double -> M.MArray s M.P Ix2 Double
-                       -> Int -> Double -> Int -> Int -> ST s ()
-implicitQRStepInPlaceP md msd mq nn shift lo hi = do
-  dlo <- M.readM md lo
-  sdlo <- M.readM msd lo
+-- | Raw primop interior split search.
+rawFindSplit :: MutableByteArray s -> Int -> MutableByteArray s -> Int
+             -> Int -> Int -> Double -> ST s (Maybe Int)
+rawFindSplit mbaD offD mbaSD offSD lo hi tol = scan (lo + 1)
+  where
+    scan q
+      | q >= hi - 1 = pure Nothing
+      | otherwise = do
+          sdq <- readRawD mbaSD offSD q
+          dq  <- readRawD mbaD offD q
+          dq1 <- readRawD mbaD offD (q + 1)
+          if abs sdq <= tol * (abs dq + abs dq1)
+            then pure (Just q)
+            else scan (q + 1)
+
+-- | Raw primop implicit QR step via bulge-chasing Givens rotations.
+rawImplicitQRStep :: MutableByteArray s -> Int -> MutableByteArray s -> Int
+                  -> MutableByteArray s -> Int
+                  -> Int -> Double -> Int -> Int -> ST s ()
+rawImplicitQRStep mbaD offD mbaSD offSD mbaQ offQ nn shift lo hi = do
+  dlo <- readRawD mbaD offD lo
+  sdlo <- readRawD mbaSD offSD lo
   chase lo (dlo - shift) sdlo
   where
     chase k x z = do
       let (c, s) = givensRotation x z
       when (k > lo) $
-        M.write_ msd (k-1) (c * x - s * z)
-      dk  <- M.readM md k
-      ek  <- M.readM msd k
-      dk1 <- M.readM md (k+1)
-      M.write_ md k     (c*c*dk - 2*c*s*ek + s*s*dk1)
-      M.write_ md (k+1) (s*s*dk + 2*c*s*ek + c*c*dk1)
-      M.write_ msd k    (c*s*(dk - dk1) + (c*c - s*s)*ek)
-      -- Use raw primop Givens instead of generic version
-      applyGivensRightQP mq c s k (k+1) nn
+        writeRawD mbaSD offSD (k-1) (c * x - s * z)
+      dk  <- readRawD mbaD offD k
+      ek  <- readRawD mbaSD offSD k
+      dk1 <- readRawD mbaD offD (k+1)
+      writeRawD mbaD offD k     (c*c*dk - 2*c*s*ek + s*s*dk1)
+      writeRawD mbaD offD (k+1) (s*s*dk + 2*c*s*ek + c*c*dk1)
+      writeRawD mbaSD offSD k   (c*s*(dk - dk1) + (c*c - s*s)*ek)
+      -- Raw primop Givens rotation on Q
+      rawMutApplyGivensColumns mbaQ offQ nn c s k (k+1) nn
       if k + 1 < hi
         then do
-          ek1 <- M.readM msd (k+1)
+          ek1 <- readRawD mbaSD offSD (k+1)
           let z' = -s * ek1
-          M.write_ msd (k+1) (c * ek1)
-          ek_new <- M.readM msd k
+          writeRawD mbaSD offSD (k+1) (c * ek1)
+          ek_new <- readRawD mbaSD offSD k
           chase (k+1) ek_new z'
         else pure ()
 
