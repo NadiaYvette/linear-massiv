@@ -30,11 +30,15 @@ module Numeric.LinearAlgebra.Massiv.Internal.Kernel
   , rawPivotSearch
   , rawForwardSubUnitPacked
   , rawBackSubPacked
+  , rawForwardSubUnitPackedSIMD
+  , rawBackSubPackedSIMD
     -- * Cholesky kernels
   , rawCholColumn
   , rawCholColumnSIMD
   , rawForwardSubCholPacked
   , rawBackSubCholTPacked
+  , rawForwardSubCholPackedSIMD
+  , rawBackSubCholTPackedSIMD
     -- * QR mutable kernels
   , rawMutSumSqColumn
   , rawMutSumProdColumns
@@ -1016,6 +1020,182 @@ rawCholColumnSIMD (MutableByteArray mba) (I# off) (I# n) (I# j) = ST $ \s0 ->
                                     s5 -> goScale (i +# 1#) s5
                     in (# goScale (j +# 1#) s3, () #)
 {-# INLINE rawCholColumnSIMD #-}
+
+-- --------------------------------------------------------------------------
+-- SIMD forward/back substitution kernels (dot-product formulation)
+-- --------------------------------------------------------------------------
+
+-- | SIMD forward substitution (unit lower triangular, dot-product formulation).
+-- Solves Ly = b where L has unit diagonal; b is already in mba_x.
+-- For each row i: x[i] -= dot(L[i, 0..i-1], x[0..i-1]).
+-- L row slices are contiguous in row-major storage → SIMD-friendly.
+rawForwardSubUnitPackedSIMD :: ByteArray -> Int -> Int
+                            -> MutableByteArray s -> Int -> ST s ()
+rawForwardSubUnitPackedSIMD (ByteArray ba_lu) (I# off_lu) (I# n)
+                            (MutableByteArray mba_x) (I# off_x) = ST $ \s0 ->
+  let goI i s
+        | isTrue# (i >=# n) = s
+        | otherwise =
+            let rowOff = off_lu +# i *# n
+                dotLen = i
+                d4End = dotLen -# (dotLen `remInt#` 4#)
+            in case goSimd rowOff 0# d4End (broadcastDoubleX4# 0.0##) s of
+                 (# s1, acc4 #) ->
+                   let !(# a, b, c, d #) = unpackDoubleX4# acc4
+                       simdSum = a +## b +## c +## d
+                   in case goScalar rowOff d4End dotLen simdSum s1 of
+                        (# s2, dotVal #) ->
+                          case readDoubleArray# mba_x (off_x +# i) s2 of
+                            (# s3, xi #) ->
+                              case writeDoubleArray# mba_x (off_x +# i) (xi -## dotVal) s3 of
+                                s4 -> goI (i +# 1#) s4
+
+      goSimd rowOff k k4End acc s
+        | isTrue# (k >=# k4End) = (# s, acc #)
+        | otherwise =
+            let lv = indexDoubleArrayAsDoubleX4# ba_lu (rowOff +# k)
+            in case readDoubleArrayAsDoubleX4# mba_x (off_x +# k) s of
+                 (# s', xv #) -> goSimd rowOff (k +# 4#) k4End (fmaddDoubleX4# lv xv acc) s'
+
+      goScalar rowOff k kEnd acc s
+        | isTrue# (k >=# kEnd) = (# s, acc #)
+        | otherwise =
+            let lk = indexDoubleArray# ba_lu (rowOff +# k)
+            in case readDoubleArray# mba_x (off_x +# k) s of
+                 (# s', xk #) -> goScalar rowOff (k +# 1#) kEnd (acc +## lk *## xk) s'
+
+  in (# goI 0# s0, () #)
+{-# INLINE rawForwardSubUnitPackedSIMD #-}
+
+-- | SIMD back substitution (upper triangular, dot-product formulation).
+-- Solves Ux = y where y is in mba_x; overwrites with x.
+-- For each row i (n-1 down to 0): x[i] = (x[i] - dot(U[i, i+1..n-1], x[i+1..n-1])) / U[i,i].
+rawBackSubPackedSIMD :: ByteArray -> Int -> Int
+                     -> MutableByteArray s -> Int -> ST s ()
+rawBackSubPackedSIMD (ByteArray ba_lu) (I# off_lu) (I# n)
+                     (MutableByteArray mba_x) (I# off_x) = ST $ \s0 ->
+  let goI i s
+        | isTrue# (i <# 0#) = s
+        | otherwise =
+            let rowOff = off_lu +# i *# n
+                dotStart = i +# 1#
+                dotLen = n -# i -# 1#
+                d4End = dotStart +# (dotLen -# (dotLen `remInt#` 4#))
+            in case goSimd rowOff dotStart d4End (broadcastDoubleX4# 0.0##) s of
+                 (# s1, acc4 #) ->
+                   let !(# a, b, c, d #) = unpackDoubleX4# acc4
+                       simdSum = a +## b +## c +## d
+                   in case goScalar rowOff d4End n simdSum s1 of
+                        (# s2, dotVal #) ->
+                          let uii = indexDoubleArray# ba_lu (rowOff +# i)
+                          in case readDoubleArray# mba_x (off_x +# i) s2 of
+                               (# s3, xi #) ->
+                                 case writeDoubleArray# mba_x (off_x +# i) ((xi -## dotVal) /## uii) s3 of
+                                   s4 -> goI (i -# 1#) s4
+
+      goSimd rowOff k k4End acc s
+        | isTrue# (k >=# k4End) = (# s, acc #)
+        | otherwise =
+            let uv = indexDoubleArrayAsDoubleX4# ba_lu (rowOff +# k)
+            in case readDoubleArrayAsDoubleX4# mba_x (off_x +# k) s of
+                 (# s', xv #) -> goSimd rowOff (k +# 4#) k4End (fmaddDoubleX4# uv xv acc) s'
+
+      goScalar rowOff k kEnd acc s
+        | isTrue# (k >=# kEnd) = (# s, acc #)
+        | otherwise =
+            let uk = indexDoubleArray# ba_lu (rowOff +# k)
+            in case readDoubleArray# mba_x (off_x +# k) s of
+                 (# s', xk #) -> goScalar rowOff (k +# 1#) kEnd (acc +## uk *## xk) s'
+
+  in (# goI (n -# 1#) s0, () #)
+{-# INLINE rawBackSubPackedSIMD #-}
+
+-- | SIMD Cholesky forward substitution (non-unit diagonal, dot-product formulation).
+-- Solves Gy = b; b is in mba_x, overwrites with y.
+-- For each row i: x[i] = (x[i] - dot(G[i, 0..i-1], x[0..i-1])) / G[i,i].
+rawForwardSubCholPackedSIMD :: ByteArray -> Int -> Int
+                            -> MutableByteArray s -> Int -> ST s ()
+rawForwardSubCholPackedSIMD (ByteArray ba_g) (I# off_g) (I# n)
+                            (MutableByteArray mba_x) (I# off_x) = ST $ \s0 ->
+  let goI i s
+        | isTrue# (i >=# n) = s
+        | otherwise =
+            let rowOff = off_g +# i *# n
+                dotLen = i
+                d4End = dotLen -# (dotLen `remInt#` 4#)
+            in case goSimd rowOff 0# d4End (broadcastDoubleX4# 0.0##) s of
+                 (# s1, acc4 #) ->
+                   let !(# a, b, c, d #) = unpackDoubleX4# acc4
+                       simdSum = a +## b +## c +## d
+                   in case goScalar rowOff d4End dotLen simdSum s1 of
+                        (# s2, dotVal #) ->
+                          let gii = indexDoubleArray# ba_g (rowOff +# i)
+                          in case readDoubleArray# mba_x (off_x +# i) s2 of
+                               (# s3, xi #) ->
+                                 case writeDoubleArray# mba_x (off_x +# i) ((xi -## dotVal) /## gii) s3 of
+                                   s4 -> goI (i +# 1#) s4
+
+      goSimd rowOff k k4End acc s
+        | isTrue# (k >=# k4End) = (# s, acc #)
+        | otherwise =
+            let gv = indexDoubleArrayAsDoubleX4# ba_g (rowOff +# k)
+            in case readDoubleArrayAsDoubleX4# mba_x (off_x +# k) s of
+                 (# s', xv #) -> goSimd rowOff (k +# 4#) k4End (fmaddDoubleX4# gv xv acc) s'
+
+      goScalar rowOff k kEnd acc s
+        | isTrue# (k >=# kEnd) = (# s, acc #)
+        | otherwise =
+            let gk = indexDoubleArray# ba_g (rowOff +# k)
+            in case readDoubleArray# mba_x (off_x +# k) s of
+                 (# s', xk #) -> goScalar rowOff (k +# 1#) kEnd (acc +## gk *## xk) s'
+
+  in (# goI 0# s0, () #)
+{-# INLINE rawForwardSubCholPackedSIMD #-}
+
+-- | SIMD Cholesky G^T back substitution (SAXPY formulation with broadcast).
+-- Solves G^T x = y; y is in mba_x, overwrites with x.
+-- For each j (n-1 down to 0): x[j] /= G[j,j], then for i=0..j-1:
+-- x[i] -= G[j,i] * x[j] (SAXPY with broadcast x[j]).
+-- G[j, 0..j-1] is contiguous in row-major → SIMD-friendly.
+rawBackSubCholTPackedSIMD :: ByteArray -> Int -> Int
+                          -> MutableByteArray s -> Int -> ST s ()
+rawBackSubCholTPackedSIMD (ByteArray ba_g) (I# off_g) (I# n)
+                          (MutableByteArray mba_x) (I# off_x) = ST $ \s0 ->
+  let goJ j s
+        | isTrue# (j <# 0#) = s
+        | otherwise =
+            let gjj = indexDoubleArray# ba_g (off_g +# j *# n +# j)
+            in case readDoubleArray# mba_x (off_x +# j) s of
+                 (# s', xj_ #) ->
+                   let xj = xj_ /## gjj
+                   in case writeDoubleArray# mba_x (off_x +# j) xj s' of
+                        s'' ->
+                          let jRowOff = off_g +# j *# n
+                              negXj4 = broadcastDoubleX4# (negateDouble# xj)
+                              updateLen = j
+                              u4End = updateLen -# (updateLen `remInt#` 4#)
+
+                              goSimd i s_
+                                | isTrue# (i >=# u4End) = s_
+                                | otherwise =
+                                    let gv = indexDoubleArrayAsDoubleX4# ba_g (jRowOff +# i)
+                                    in case readDoubleArrayAsDoubleX4# mba_x (off_x +# i) s_ of
+                                         (# s1, xv #) ->
+                                           case writeDoubleArrayAsDoubleX4# mba_x (off_x +# i) (fmaddDoubleX4# negXj4 gv xv) s1 of
+                                             s2 -> goSimd (i +# 4#) s2
+
+                              goScalar i s_
+                                | isTrue# (i >=# j) = s_
+                                | otherwise =
+                                    let gji = indexDoubleArray# ba_g (jRowOff +# i)
+                                    in case readDoubleArray# mba_x (off_x +# i) s_ of
+                                         (# s1, xi #) ->
+                                           case writeDoubleArray# mba_x (off_x +# i) (xi -## gji *## xj) s1 of
+                                             s2 -> goScalar (i +# 1#) s2
+
+                          in goJ (j -# 1#) (goScalar u4End (goSimd 0# s''))
+  in (# goJ (n -# 1#) s0, () #)
+{-# INLINE rawBackSubCholTPackedSIMD #-}
 
 -- --------------------------------------------------------------------------
 -- Utilities

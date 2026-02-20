@@ -2136,6 +2136,167 @@ $100{\times}100$), within run-to-run variance of earlier measurements.
 \end{enumerate}
 
 %% ====================================================================
+\section{Round~8: SIMD Substitution Kernels and D\&C Eigensolver}
+\label{sec:round8}
+
+Round~8 targets two of the three remaining bottlenecks identified in
+\S\ref{sec:round7-future}: the scalar forward/back-substitution inner
+loops in the LU and Cholesky solve paths, and the $O(n^3)$ QR iteration
+eigensolver.
+
+\subsection{Optimisations Applied}
+
+\paragraph{SIMD forward/back-substitution kernels.}
+The previous substitution kernels (\texttt{rawForwardSubUnitPacked},
+\texttt{rawBackSubPacked}, \texttt{rawForwardSubCholPacked},
+\texttt{rawBackSubCholTPacked}) used column-oriented scalar loops with
+stride-$n$ memory access, which is unfriendly to SIMD vectorisation and
+cache prefetching.  Four new SIMD kernels restructure the inner loops:
+
+\begin{itemize}
+\item \textbf{Forward substitution} (LU and Cholesky): Reformulated as a
+  dot-product $x_i = (b_i - L_{i,0:i-1} \cdot x_{0:i-1}) / L_{ii}$
+  where the row slice $L_{i,0:i-1}$ is contiguous in row-major storage.
+  The dot product is computed with \texttt{indexDoubleArrayAsDoubleX4\#}
+  (immutable $L$) and \texttt{readDoubleArrayAsDoubleX4\#} (mutable~$x$)
+  using \texttt{fmaddDoubleX4\#}, with scalar cleanup for remainders.
+
+\item \textbf{Back substitution} (LU): Same dot-product formulation on
+  the upper triangle row slice $U_{i,i+1:n-1}$.
+
+\item \textbf{$G^T$ back substitution} (Cholesky): SAXPY formulation
+  $x_{0:j-1} \mathrel{-}= G_{j,0:j-1} \cdot x_j$, where $x_j$ is
+  broadcast into \texttt{DoubleX4\#} via \texttt{broadcastDoubleX4\#}
+  and the contiguous row slice $G_{j,0:j-1}$ enables vectorised updates
+  with \texttt{fmaddDoubleX4\#}.
+\end{itemize}
+
+\paragraph{Divide-and-conquer tridiagonal eigensolver (attempted).}
+A full divide-and-conquer (D\&C) eigensolver was implemented following
+GVL4~\cite{gvl4} Section~8.4: recursive splitting at $k = n/2$,
+secular equation root-finding via Newton iteration with bisection
+fallback, eigenvector computation, and $Q$-matrix composition via GEMM.
+This targets the $O(n^3)$ cost of QR iteration with a theoretically
+$O(n^{2.3})$ average-case algorithm.
+
+\subsection{Benchmark Results}
+
+\paragraph{SIMD substitution impact.}
+Table~\ref{tab:round8-solve} shows the effect of SIMD substitution on
+LU and Cholesky solve performance.  The absolute \texttt{linear-massiv}
+times improved by $1.2\text{--}1.5\times$ across sizes.
+
+\begin{table}[h]
+\centering
+\caption{Solver performance: Round~7 vs.\ Round~8 ($+$RTS $-$N1)}
+\label{tab:round8-solve}
+\begin{tabular}{l l S[round-precision=1] S[round-precision=1] S[round-precision=1] S[round-precision=2] S[round-precision=2]}
+\toprule
+{Operation} & {Size} & {hmatrix (\si{\micro\second})} & {lm R7 (\si{\micro\second})} & {lm R8 (\si{\micro\second})} & {R7 ratio} & {R8 ratio} \\
+\midrule
+LU solve      & $50{\times}50$   & 46.6  & 28.1  & 23.8  & 0.51 & 0.51 \\
+LU solve      & $100{\times}100$ & 279.5 & 187.7 & 154.2 & 0.57 & 0.55 \\
+Cholesky solve & $50{\times}50$  & 35.2  & 26.9  & 18.3  & 0.63 & 0.52 \\
+Cholesky solve & $100{\times}100$ & 187.6 & 130.3 & 93.1  & 0.57 & 0.50 \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+The SIMD substitution kernels deliver a consistent $1.2\text{--}1.5\times$
+absolute speedup in \texttt{linear-massiv} solver times.  The Cholesky
+solve at $100{\times}100$ improves from a $0.57\times$ ratio to
+$\mathbf{0.50\times}$ (a $2\times$ advantage over hmatrix), while LU
+solve tightens from $0.57\times$ to $0.55\times$.  The Cholesky path
+benefits more because the $G^T$ back-substitution SAXPY kernel
+vectorises more naturally than the general upper-triangular back
+substitution.
+
+\paragraph{D\&C eigensolver regression.}
+The divide-and-conquer eigensolver, when activated for $n \ge 25$,
+produced a significant regression: eigenvalue at $100{\times}100$ went
+from $1.13\times$ to $2.61\times$ (absolute time from
+$2.2$\,ms to $5.7$\,ms).  Root cause analysis identified three
+implementation-level bottlenecks:
+
+\begin{enumerate}
+\item \textbf{GEMM overhead at each recursion level.}  The $Q$-matrix
+  composition requires a full $O(n^3)$ GEMM at each recursion level.
+  Although the sub-problems are smaller, the constant factor of the
+  GEMM calls accumulates across $O(\log n)$ levels.
+
+\item \textbf{Secular equation convergence.}  The Newton-with-bisection
+  solver for the secular equation
+  $f(\lambda) = 1 + \rho \sum z_i^2/(d_i - \lambda) = 0$ requires
+  up to 80 iterations per root, with $n$ roots per merge step.
+
+\item \textbf{Memory allocation overhead.}  Each recursion level
+  allocates and freezes multiple \texttt{ByteArray} buffers for
+  intermediate $Q$ sub-matrices and the GEMM workspace.
+\end{enumerate}
+
+The D\&C path was therefore \textbf{reverted}; the code remains in the
+source for future optimisation but is not active.  The QR iteration
+eigensolver continues to serve all eigenvalue computations.
+
+\paragraph{Summary of Round~8 ratios.}
+Table~\ref{tab:round8-summary} compares all nine operations at
+$100{\times}100$.
+
+\begin{table}[h]
+\centering
+\caption{$100{\times}100$ performance summary after Round~8 ($+$RTS $-$N1)}
+\label{tab:round8-summary}
+\begin{tabular}{l S[round-precision=2] S[round-precision=2]}
+\toprule
+{Operation} & {R7 ratio (lm/hm)} & {R8 ratio (lm/hm)} \\
+\midrule
+GEMM           & 0.52 & 0.65 \\
+dot (1000)     & 0.34 & 0.34 \\
+matvec         & 0.46 & 0.49 \\
+LU solve       & 0.57 & 0.55 \\
+Cholesky solve & 0.57 & 0.50 \\
+QR             & 0.03 & 0.03 \\
+eigenSH        & 1.13 & 1.23 \\
+SVD            & 2.91 & 3.63 \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+Note that the GEMM, eigenSH, and SVD ratio shifts are primarily due to
+run-to-run measurement variance rather than code changes: the
+\texttt{linear-massiv} code for these operations is identical between
+Rounds~7 and~8.  The \texttt{linear} $4{\times}4$ GEMM reference
+benchmark (pure Haskell, identical code) shifted from 65\,ns to 82\,ns
+between runs, indicating ${\sim}25\%$ system-level variance.  The
+meaningful improvements are in the solver ratios, where the absolute
+\texttt{linear-massiv} times improved by $1.2\text{--}1.5\times$.
+
+\subsection{Remaining Bottlenecks and Future Work}
+\label{sec:round8-future}
+
+\begin{enumerate}
+\item \textbf{Blocked WY Householder for SVD bidiagonalisation.}
+  The $3\text{--}4\times$ SVD gap remains the largest single bottleneck.
+  A blocked WY representation (GVL4~\cite{gvl4} Section~5.2.3) would
+  aggregate Householder reflectors into dense matrix--matrix products,
+  converting per-reflector overhead into BLAS-3 GEMM operations.
+
+\item \textbf{Optimised D\&C tridiagonal eigensolver.}
+  The current D\&C implementation regressed due to per-level GEMM
+  overhead and memory allocation costs.  Key improvements would include:
+  (a)~in-place $Q$-accumulation avoiding separate GEMM calls;
+  (b)~the Bunch--Nielsen--Sorensen rational interpolation for
+  secular equation roots (replacing Newton+bisection);
+  (c)~pre-allocated workspace buffers to eliminate per-level allocation.
+
+\item \textbf{Larger-size benchmarks.}
+  At $100{\times}100$, eigenvalue sits at $1.2\times$ of hmatrix---within
+  reach of QR iteration tuning alone.  Benchmarking at $200{\times}200$
+  and $500{\times}500$ would clarify where the $O(n^3)$ QR cost becomes
+  the binding constraint and whether D\&C becomes essential.
+\end{enumerate}
+
+%% ====================================================================
 \section{Conclusion}
 \label{sec:conclusion}
 
@@ -2208,14 +2369,24 @@ per-element Householder accumulation overhead, highlighting the need
 for blocked WY representations to match LAPACK's BLAS-3 reflector
 application.
 
+\paragraph{Round~8 (SIMD substitution).}
+SIMD vectorisation of the forward/back-substitution kernels in LU and
+Cholesky solve delivered $1.2\text{--}1.5\times$ absolute speedups in
+solver performance, improving the Cholesky solve ratio from $0.57\times$
+to $\mathbf{0.50\times}$ ($2\times$ faster than LAPACK).  A
+divide-and-conquer tridiagonal eigensolver was implemented following
+GVL4~\cite{gvl4} Section~8.4 but regressed by $2.6\times$ due to
+per-level GEMM overhead and memory allocation costs; it was reverted
+pending further optimisation.
+
 \paragraph{Summary.}
 Of the nine benchmarked operation categories, \texttt{linear-massiv}
 now \textbf{outperforms or matches \texttt{hmatrix} (OpenBLAS/LAPACK) in
-eight}: GEMM (single-threaded and parallel), dot product, matrix--vector
-multiply, LU solve, Cholesky solve, QR factorisation, and eigenvalue
-decomposition (near-parity at $1.13\times$).  The sole remaining
-disadvantage is SVD ($3\text{--}4\times$), which requires blocked
-Householder representations or a divide-and-conquer approach to close.
+seven}: GEMM (single-threaded and parallel), dot product, matrix--vector
+multiply, LU solve, Cholesky solve, and QR factorisation.  Eigenvalue
+decomposition sits near parity ($1.2\times$ at $100{\times}100$), while
+SVD ($3\text{--}4\times$) remains the sole significant bottleneck,
+requiring blocked Householder representations to close.
 
 \texttt{linear-massiv} demonstrates that \textbf{pure Haskell with
 GHC's native SIMD primops, raw \texttt{ByteArray\#} primops, and

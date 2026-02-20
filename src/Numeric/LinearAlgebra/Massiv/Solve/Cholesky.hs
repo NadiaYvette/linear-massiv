@@ -75,7 +75,7 @@ import Numeric.LinearAlgebra.Massiv.Internal
 import Numeric.LinearAlgebra.Massiv.Solve.Triangular (forwardSub, backSub)
 import Numeric.LinearAlgebra.Massiv.BLAS.Level3 (transpose)
 import Numeric.LinearAlgebra.Massiv.Internal.Kernel
-  (rawCholColumnSIMD, rawForwardSubCholPacked, rawBackSubCholTPacked)
+  (rawCholColumnSIMD, rawForwardSubCholPackedSIMD, rawBackSubCholTPackedSIMD)
 
 -- | Outer-product Cholesky factorization (GVL4 Algorithm 4.2.1, p. 164).
 --
@@ -259,11 +259,11 @@ choleskySolveP (MkMatrix a) (MkVector b) =
         offX = unwrapMutableByteArrayOffset mx
     copyVectorRaw b mbaX offX nn
 
-    -- Phase 3: Forward substitution (Gy = b)
-    rawForwardSubCholPacked baG offFG nn mbaX offX
+    -- Phase 3: Forward substitution (Gy = b, SIMD dot-product)
+    rawForwardSubCholPackedSIMD baG offFG nn mbaX offX
 
-    -- Phase 4: Back substitution (G^T x = y), without forming G^T
-    rawBackSubCholTPacked baG offFG nn mbaX offX
+    -- Phase 4: Back substitution (G^T x = y, SIMD SAXPY)
+    rawBackSubCholTPackedSIMD baG offFG nn mbaX offX
 {-# NOINLINE choleskySolveP #-}
 
 -- | Copy lower triangle of an immutable 2D P array into a mutable byte array.

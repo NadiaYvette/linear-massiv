@@ -80,7 +80,7 @@ import Numeric.LinearAlgebra.Massiv.Internal
 import Numeric.LinearAlgebra.Massiv.Solve.Triangular (forwardSubUnit, backSub)
 import Numeric.LinearAlgebra.Massiv.Internal.Kernel
   (rawLUEliminateColumn, rawSwapRows, rawPivotSearch,
-   rawForwardSubUnitPacked, rawBackSubPacked)
+   rawForwardSubUnitPackedSIMD, rawBackSubPackedSIMD)
 
 -- | LU factorization with partial pivoting (GVL4 Algorithm 3.4.1, p. 126).
 --
@@ -290,11 +290,11 @@ luSolveP (MkMatrix a) (MkVector b) =
     -- Apply pivot permutation to x
     applyPivotsForward mbaX offX pivots
 
-    -- Phase 3: Forward substitution (unit lower triangular)
-    rawForwardSubUnitPacked baLU offLU nn mbaX offX
+    -- Phase 3: Forward substitution (unit lower triangular, SIMD dot-product)
+    rawForwardSubUnitPackedSIMD baLU offLU nn mbaX offX
 
-    -- Phase 4: Back substitution (upper triangular)
-    rawBackSubPacked baLU offLU nn mbaX offX
+    -- Phase 4: Back substitution (upper triangular, SIMD dot-product)
+    rawBackSubPackedSIMD baLU offLU nn mbaX offX
 {-# NOINLINE luSolveP #-}
 
 -- | Copy an immutable P vector into a mutable byte array.
