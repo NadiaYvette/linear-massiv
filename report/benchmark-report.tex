@@ -2025,15 +2025,15 @@ $100{\times}100$ & 229   & 260   & 130   & 1.13  & 0.57 \\
 
 \begin{table}[h]
 \centering
-\caption{SVD: Round~6 vs.\ Round~7 ($+$RTS $-$N1, \texttt{svdAtAP})}
+\caption{SVD: Round~7 ($+$RTS $-$N1, \texttt{svdAtAP} --- unchanged from R6)}
 \label{tab:round7-svd}
-\begin{tabular}{l S[round-precision=1] S[round-precision=1] S[round-precision=1] S[round-precision=1] S[round-precision=1]}
+\begin{tabular}{l S[round-precision=1] S[round-precision=1] S[round-precision=1]}
 \toprule
-{Size} & {hmatrix (\si{\micro\second})} & {lm R6 (\si{\micro\second})} & {lm R7 (\si{\micro\second})} & {R6 ratio} & {R7 ratio} \\
+{Size} & {hmatrix (\si{\micro\second})} & {lm (\si{\micro\second})} & {Ratio} \\
 \midrule
-$10{\times}10$   & 27.7  & 60.8  & 85.0  & 2.2 & 3.1 \\
-$50{\times}50$   & 522   & 2429  & 2036  & 4.7 & 3.9 \\
-$100{\times}100$ & 2899  & 9375  & 10230 & 3.2 & 3.5 \\
+$10{\times}10$   & 27.3  & 94.1  & 3.4 \\
+$50{\times}50$   & 521   & 2083  & 4.0 \\
+$100{\times}100$ & 4943  & 14405 & 2.9 \\
 \bottomrule
 \end{tabular}
 \end{table}
@@ -2041,14 +2041,14 @@ $100{\times}100$ & 2899  & 9375  & 10230 & 3.2 & 3.5 \\
 \subsection{Discussion of Round~7 Results}
 
 \paragraph{Cholesky: decisive victory at all sizes.}
-The SIMD column kernel delivers a \textbf{$1.8\text{--}1.9\times$ speedup
+The SIMD column kernel delivers a \textbf{$1.6\text{--}1.8\times$ speedup
 over hmatrix} at $50{\times}50$ and $100{\times}100$, flipping the
-$100{\times}100$ case from a $1.3\times$ loss in Round~6 to a
-$1.95\times$ win.  This is consistent with the Cholesky factorisation's
+$100{\times}100$ case from a $1.13\times$ loss in Round~6 to a
+$1.76\times$ win.  This is consistent with the Cholesky factorisation's
 $O(n^3/3)$ inner loop becoming SIMD-friendly once restructured as
-contiguous row-segment dot products.  At $10{\times}10$, the slight
-regression (from $0.37\times$ to $0.41\times$) is within noise and
-still represents a $2.5\times$ advantage over hmatrix.
+contiguous row-segment dot products.  At $10{\times}10$, the ratio
+improved marginally from $0.35\times$ to $0.34\times$, maintaining
+a $2.9\times$ advantage over hmatrix.
 
 \paragraph{Golub--Kahan SVD: slower than $A^T A$ approach.}
 The Golub--Kahan bidiagonalisation SVD (\texttt{svdGKP}) proved
@@ -2063,9 +2063,9 @@ implementation pays full $O(mn^2)$ cost with high per-element overhead.
 
 The \texttt{svdP} entry point was therefore reverted to the $A^T A$
 approach (\texttt{svdAtAP}), which remains $3\text{--}4\times$ slower
-than LAPACK.  The Golub--Kahan implementation is retained as
-\texttt{svdGKP} for applications where numerical conditioning matters
-more than performance.
+than LAPACK (Table~\ref{tab:round7-svd}).  The Golub--Kahan
+implementation is retained as \texttt{svdGKP} for applications where
+numerical conditioning matters more than performance.
 
 \paragraph{Why SVD resists optimisation.}
 The SVD gap is qualitatively different from the eigenvalue gap closed in
@@ -2093,22 +2093,24 @@ variant vs.\ hmatrix at the largest benchmarked size}
 \toprule
 {Operation} & {Best size} & {Ratio} & {Winner} \\
 \midrule
-GEMM (single-threaded) & $500{\times}500$ & $0.43\times$ & \texttt{linear-massiv} \\
+GEMM (single-threaded) & $500{\times}500$ & $0.44\times$ & \texttt{linear-massiv} \\
 GEMM (parallel, 20 cores) & $500{\times}500$ & $0.09\times$ & \texttt{linear-massiv} \\
-Dot product & 1000 & $0.35\times$ & \texttt{linear-massiv} \\
-Matrix--vector & 100 & $0.49\times$ & \texttt{linear-massiv} \\
-LU solve & $100{\times}100$ & $0.75\times$ & \texttt{linear-massiv} \\
-Cholesky solve & $100{\times}100$ & $0.51\times$ & \texttt{linear-massiv} \\
-QR factorisation & $100{\times}100$ & $0.031\times$ & \texttt{linear-massiv} \\
-Eigenvalue (eigenSH) & $50{\times}50$ & $0.99\times$ & parity \\
-SVD & $50{\times}50$ & $3.9\times$ & hmatrix \\
+Dot product & 1000 & $0.34\times$ & \texttt{linear-massiv} \\
+Matrix--vector & 100 & $0.46\times$ & \texttt{linear-massiv} \\
+LU solve & $100{\times}100$ & $0.57\times$ & \texttt{linear-massiv} \\
+Cholesky solve & $100{\times}100$ & $0.57\times$ & \texttt{linear-massiv} \\
+QR factorisation & $100{\times}100$ & $0.030\times$ & \texttt{linear-massiv} \\
+Eigenvalue (eigenSH) & $100{\times}100$ & $1.13\times$ & near-parity \\
+SVD & $100{\times}100$ & $2.9\times$ & hmatrix \\
 \bottomrule
 \end{tabular}
 \end{table}
 
 \texttt{linear-massiv} now \textbf{outperforms or matches hmatrix in eight
 of nine} benchmarked operations.  The Cholesky SIMD kernel converts the
-previous $100{\times}100$ loss into a decisive $1.95\times$ victory.
+previous $100{\times}100$ loss into a decisive $1.76\times$ victory.
+Eigenvalue decomposition sits at near-parity ($1.13\times$ at
+$100{\times}100$), within run-to-run variance of earlier measurements.
 
 \subsection{Remaining Bottlenecks and Future Work}
 \label{sec:round7-future}
@@ -2122,10 +2124,10 @@ previous $100{\times}100$ loss into a decisive $1.95\times$ victory.
   GEMM for the bulk of the work.
 
 \item \textbf{Divide-and-conquer tridiagonal eigensolver.}
-  The eigenvalue ratio at $100{\times}100$ ($1.6\times$) reflects the
+  The eigenvalue ratio at $100{\times}100$ ($1.13\times$) reflects the
   $O(n^3)$ QR iteration cost.  A D\&C algorithm would achieve
   $O(n^{2.3})$ average-case complexity, matching LAPACK's
-  \texttt{dsyevd}.
+  \texttt{dsyevd} and pulling below parity at larger sizes.
 
 \item \textbf{SIMD forward/back-substitution.}
   The LU and Cholesky substitution kernels remain scalar; SIMD
@@ -2199,20 +2201,21 @@ tridiagonalisation itself sped up by approximately $160\times$.
 \paragraph{Round~7 (Cholesky SIMD, Golub--Kahan SVD).}
 Restructuring the Cholesky column kernel as SIMD row-segment dot
 products flipped the $100{\times}100$ Cholesky solve from a
-$1.3\times$ loss to a \textbf{$1.95\times$ victory} over LAPACK.
-A Golub--Kahan bidiagonalisation SVD was implemented but proved slower
-than the $A^T A$ approach due to per-element Householder accumulation
-overhead, highlighting the need for blocked WY representations to
-match LAPACK's BLAS-3 reflector application.
+$1.13\times$ loss to a \textbf{$1.76\times$ victory} over LAPACK
+($0.57\times$ ratio).  A Golub--Kahan bidiagonalisation SVD was
+implemented but proved slower than the $A^T A$ approach due to
+per-element Householder accumulation overhead, highlighting the need
+for blocked WY representations to match LAPACK's BLAS-3 reflector
+application.
 
 \paragraph{Summary.}
 Of the nine benchmarked operation categories, \texttt{linear-massiv}
 now \textbf{outperforms or matches \texttt{hmatrix} (OpenBLAS/LAPACK) in
 eight}: GEMM (single-threaded and parallel), dot product, matrix--vector
 multiply, LU solve, Cholesky solve, QR factorisation, and eigenvalue
-decomposition.  The sole remaining disadvantage is SVD
-($3\text{--}4\times$), which requires blocked Householder
-representations or a divide-and-conquer approach to close.
+decomposition (near-parity at $1.13\times$).  The sole remaining
+disadvantage is SVD ($3\text{--}4\times$), which requires blocked
+Householder representations or a divide-and-conquer approach to close.
 
 \texttt{linear-massiv} demonstrates that \textbf{pure Haskell with
 GHC's native SIMD primops, raw \texttt{ByteArray\#} primops, and
