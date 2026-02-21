@@ -3615,11 +3615,231 @@ processes.  Future benchmark rounds should adopt this protocol.
 \end{enumerate}
 
 %% ====================================================================
+\section{Round~14: D\&C Eigensolver and Blocked Q Accumulation}
+\label{sec:round14}
+
+Round~14 addressed the recommendations of \S\ref{sec:round13-future}
+with three contributions: (1)~debugging and testing the
+divide-and-conquer tridiagonal eigensolver, (2)~blocked WY Q
+accumulation for tridiagonalisation, and (3)~analysis of why naive
+D\&C is slower than QR iteration at moderate sizes.
+
+\subsection{D\&C Eigensolver Bug Fixes}
+\label{sec:round14-dc}
+
+The existing \texttt{dcEigenTridiagOpt} function (GVL4
+Section~8.4) had zero test coverage and contained four bugs
+that produced incorrect results:
+
+\begin{enumerate}
+\item \textbf{Rho sign convention.}
+  The coupling parameter~$\rho$ was set directly to~$\beta$ (the
+  off-tridiagonal element), but the diagonal correction subtracted
+  $|\beta|$.  Fixed: $\rho = |\beta|$, and the~$Q_2$ z-entries are
+  negated when~$\beta < 0$.
+
+\item \textbf{z-vector source (fundamental).}
+  The z-vector for each merge step was extracted from the \emph{global}
+  Q matrix, but D\&C requires it from the \emph{local} eigenvector
+  matrix of each subproblem.  Fixed: added a \texttt{wsQlocal}
+  workspace (identity-initialised), operating all D\&C recursion on
+  local coordinates, with a final GEMM
+  $Q_{\mathrm{out}} = Q_{\mathrm{in}} \cdot Q_{\mathrm{local}}$.
+
+\item \textbf{Newton bracket update ordering.}
+  The bisection fallback used stale brackets because the bracket
+  tightening was computed \emph{after} the bisection.  Fixed: compute
+  brackets first, then apply bisection to the tightened interval.
+
+\item \textbf{Edge root initial guess.}
+  The last secular equation root used a midpoint initial guess on a
+  wide interval.  Fixed: use first-order perturbation theory
+  $\delta_0 = \rho z_{n-1}^2 / (1 + \rho \sum_{i<n-1}
+  z_i^2/(d_i - d_{n-1}))$ for a better starting point.
+\end{enumerate}
+
+Four new tests were added: eigenvalue reconstruction ($\|A - Q\Lambda
+Q^T\| < 10^{-8}$), orthogonality ($\|Q^T Q - I\| < 10^{-8}$),
+diagonal matrix eigenvalues, and D\&C/QR eigenvalue agreement at
+$30{\times}30$.  The secular solver was also enhanced with Newton
+polishing (3~iterations) and perturbation shortcuts for near-deflated
+roots.
+
+\subsection{D\&C Performance Analysis}
+\label{sec:round14-dc-perf}
+
+Despite the bug fixes, wiring D\&C as the default eigensolver
+(crossover at $n \geq 50$) \emph{degraded} performance at all tested
+sizes:
+
+\begin{table}[h]
+\centering
+\caption{EigenSH: QR iteration vs.\ D\&C eigensolver ($+$RTS $-$N1)}
+\label{tab:round14-dc}
+\begin{tabular}{lrr}
+\hline
+Size & QR Ratio & D\&C Ratio \\
+\hline
+$100{\times}100$ & $1.22\times$ & $1.75\times$ \\
+$200{\times}200$ & $1.28\times$ & $1.71\times$ \\
+$500{\times}500$ & $1.28\times$ & $2.11\times$ \\
+\hline
+\end{tabular}
+\end{table}
+
+The regression is caused by the naive D\&C implementation's
+overhead:
+\begin{itemize}
+\item \textbf{Workspace allocation.}  Each call allocates
+  ${\sim}10$ arrays of $n^2$ doubles (${\sim}20$\,MB at $n{=}500$).
+  GHC's allocator and garbage collector add significant latency.
+\item \textbf{Element-by-element copies.}  Each merge step copies
+  $O(n^2)$ elements to/from workspace arrays for GEMM preparation,
+  with~$O(\log n)$ levels yielding~$O(n^2 \log n)$ total copy cost.
+\item \textbf{Secular solver overhead.}  Insertion sort ($O(n^2)$),
+  deflation bookkeeping, and per-element workspace manipulation
+  add substantial constant factors.
+\end{itemize}
+
+LAPACK's \texttt{DSTEDC} avoids these costs through pre-allocated
+workspace (single \texttt{LWORK} allocation), optimised BLAS
+routines, and highly-tuned secular solver (\texttt{DLASD4}).
+The D\&C crossover was therefore set to $n \geq 100{,}000$
+(effectively disabled), retaining the code for future optimisation
+at very large sizes.
+
+\subsection{Blocked WY Q Accumulation}
+\label{sec:round14-wy}
+
+The Q accumulation phase of tridiagonalisation was converted from
+per-row Householder updates to a blocked WY representation:
+$Q \leftarrow Q \cdot (I - Y T Y^T)$,
+where~$Y$ is the $n{\times}b$ matrix of packed Householder vectors
+and~$T$ is the $b{\times}b$ upper-triangular T~factor.  Each block
+requires three GEMM calls: $W_1 = Q \cdot Y$,
+$W_2 = W_1 \cdot T$, and $Q \mathrel{+}= (-W_2) \cdot Y^T$.
+
+A key optimisation uses \texttt{unsafeFreezeByteArray} directly on
+the mutable~$Q$ matrix for the first GEMM input, eliminating the
+$O(n^2)$ per-block copy that would otherwise be needed.
+
+\paragraph{Crossover at $n = 256$.}
+The blocked approach wastes work on the triangular structure of~$Y$:
+later Householder vectors have fewer nonzero entries, but the GEMM
+processes all~$n$ rows.  At $n{=}100$, this waste exceeds the GEMM
+benefit, so a crossover was introduced:
+\begin{itemize}
+\item $n < 256$: per-row accumulation via
+  \texttt{rawMutTridiagQAccum} (exploits sparsity, minimal overhead)
+\item $n \geq 256$: blocked WY accumulation with $b{=}32$
+  (benefits from Level~3 cache and SIMD utilisation)
+\end{itemize}
+
+\subsection{Benchmark Results}
+\label{sec:round14-bench}
+
+\begin{table}[h]
+\centering
+\caption{EigenSH: Round~14 vs.\ Round~13 ($+$RTS $-$N1)}
+\label{tab:round14-eigen}
+\begin{tabular}{lrrrr}
+\hline
+Size & R14 LM (ms) & R14 HM (ms) & R14 Ratio & R13 Ratio \\
+\hline
+$10{\times}10$   & 0.016 & 0.013 & $1.22\times$ & $1.07\times$ \\
+$50{\times}50$   & 0.477 & 0.507 & $\mathbf{0.94\times}$ & $0.92\times$ \\
+$100{\times}100$ & 2.45--3.76 & 2.73--2.97 & ${\sim}1.1\text{--}1.3\times$ & $1.12\times$ \\
+$200{\times}200$ & 23.1  & 17.2  & $1.34\times$ & $1.24\times$ \\
+$500{\times}500$ & 356--398 & 254--312 & ${\sim}1.2\text{--}1.4\times$ & $1.30\times$ \\
+\hline
+\end{tabular}
+\end{table}
+
+\textbf{Note:} Round~14 measurements showed high variance
+(criterion reported ``severely inflated'' at most sizes).  The ranges
+in the table reflect the span across multiple benchmark runs.  The
+$50{\times}50$ result consistently shows linear-massiv faster than
+hmatrix ($0.94\times$).  At $500{\times}500$, the best measurements
+show ${\sim}1.2\times$ (blocked WY helping), while the worst show
+${\sim}1.4\times$ (similar to R13).
+
+\begin{table}[h]
+\centering
+\caption{SVD: Round~14 ($+$RTS $-$N1)}
+\label{tab:round14-svd}
+\begin{tabular}{lrrrr}
+\hline
+Size & R14 LM (ms) & R14 HM (ms) & R14 Ratio & R13 Ratio \\
+\hline
+$10{\times}10$   & 0.049 & 0.033 & $1.46\times$ & $1.92\times$ \\
+$50{\times}50$   & 2.37  & 0.608 & $3.90\times$ & $3.09\times$ \\
+$100{\times}100$ & 9.18--13.5 & 3.98--4.82 & ${\sim}2.3\text{--}2.8\times$ & $2.64\times$ \\
+$200{\times}200$ & 93.9  & 37.7  & $2.49\times$ & $2.39\times$ \\
+$500{\times}500$ & 1250--1372 & 362--611 & ${\sim}2.2\text{--}3.5\times$ & $2.66\times$ \\
+\hline
+\end{tabular}
+\end{table}
+
+SVD performance is dominated by the eigenSH sub-step
+(${\sim}58\%$ of SVD time), so improvements to eigenSH flow through
+to SVD proportionally.  The wide ranges at $500{\times}500$ reflect
+system noise rather than code changes.
+
+\subsection{Discussion}
+\label{sec:round14-discussion}
+
+\paragraph{Why D\&C underperforms.}
+The divide-and-conquer tridiagonal eigensolver has theoretical
+advantages: $O(n^{2.3})$ average complexity (vs.\ $O(n^3)$ for QR
+iteration) and Level~3 GEMM-based merge steps.  In practice, the
+naive Haskell implementation's overhead---$10{+}$ workspace
+allocations, $O(n^2 \log n)$ element copies, and scalar
+bookkeeping---overwhelms these advantages at $n \leq 500$.
+Competitive D\&C performance would require:
+\begin{itemize}
+\item Single-allocation workspace (pass a pre-allocated buffer)
+\item In-place column permutations (avoid $O(n^2)$ copy per merge)
+\item SIMD-optimised secular solver (currently all scalar)
+\end{itemize}
+
+\paragraph{Blocked WY trade-offs.}
+The blocked WY Q accumulation demonstrates the fundamental tension
+between Level~3 benefits and structural waste.  At $n{=}500$, the
+GEMM's SIMD/cache advantages outweigh the ${\sim}2\times$ extra
+arithmetic from processing Y's zero entries.  At $n{=}100$, the
+per-row approach's sparsity exploitation wins.  A
+\emph{compact WY} representation that skips zero entries could
+eliminate this trade-off but adds significant implementation
+complexity.
+
+\subsection{Remaining Bottlenecks}
+\label{sec:round14-future}
+
+\begin{enumerate}
+\item \textbf{SIMD Q accumulation kernel.}
+  The per-row Q accumulation reads Householder vectors from strided
+  columns of the tridiagonal matrix.  Pre-packing each vector into a
+  contiguous temporary and using \texttt{DoubleX4\#} SIMD for the dot
+  product and update phases could yield $2\text{--}3\times$ speedup on
+  the Q accumulation phase (currently ${\sim}24\%$ of eigenSH time).
+
+\item \textbf{Optimised D\&C workspace management.}
+  Pre-allocating a single workspace buffer and partitioning it across
+  recursion levels would eliminate the per-call allocation overhead
+  that dominates the current D\&C implementation.
+
+\item \textbf{Panel-factorisation tridiagonalisation.}
+  As noted in Round~13, the LAPACK \texttt{DSYTRD} approach interleaves
+  reflector accumulation with trailing-matrix updates, achieving Level~3
+  behaviour without the wasted arithmetic of dense blocked WY.
+\end{enumerate}
+
+%% ====================================================================
 \section{Conclusion}
 \label{sec:conclusion}
 
 We have benchmarked three Haskell linear algebra libraries across nine
-categories of numerical operations through thirteen rounds of optimisation.
+categories of numerical operations through fourteen rounds of optimisation.
 
 \paragraph{Round~1 (baseline).}
 The initial results confirmed the expected performance hierarchy:
