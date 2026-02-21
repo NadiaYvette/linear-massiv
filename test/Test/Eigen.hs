@@ -17,6 +17,7 @@ import Numeric.LinearAlgebra.Massiv.Eigen.Power
 import Numeric.LinearAlgebra.Massiv.Eigen.Hessenberg
 import Numeric.LinearAlgebra.Massiv.Eigen.Symmetric
 import Numeric.LinearAlgebra.Massiv.Eigen.SVD
+import Data.Proxy (Proxy(..))
 import Numeric.LinearAlgebra.Massiv.Eigen.Schur (schur, eigenvalues)
 import Numeric.LinearAlgebra.Massiv.Norms (normFrob, vnorm2)
 import Test.Types
@@ -59,6 +60,12 @@ eigenTests = testGroup "Eigenvalue"
     ]
   , testGroup "Eigenvalue ordering"
     [ testProperty "symmetric eigenvalues sorted 4x4" prop_symmetricEigenvaluesSorted
+    ]
+  , testGroup "D&C eigensolver"
+    [ testCase "D&C eigenvalues of diagonal 10x10" test_dcEigenDiagonal
+    , testCase "D&C reconstruction 50x50" test_dcEigenReconstruction50
+    , testCase "D&C orthogonality 50x50" test_dcEigenOrthogonal50
+    , testCase "D&C matches QR at 30x30" test_dcMatchesQR
     ]
   ]
 
@@ -254,3 +261,58 @@ prop_symmetricEigenvaluesSorted = forAll (genSPDMatrix @4) $ \a ->
       evList = sort $ map (\i -> eigvals !. i) [0..3]
       -- Verify non-decreasing order after sorting
   in and $ zipWith (<=) evList (tail evList)
+
+-- D&C eigensolver tests
+
+test_dcEigenDiagonal :: Assertion
+test_dcEigenDiagonal = do
+  -- Eigenvalues of diag(10, 9, 8, ..., 1) should be {1..10}
+  let a = makeMatrix @10 @10 @M.P $ \i j ->
+            if i == j then fromIntegral (10 - i) else 0 :: Double
+      (eigvals, _) = symmetricEigenPDC a 1e-12
+      evs = sort [eigvals !. i | i <- [0..9]]
+  mapM_ (\(i, expected) ->
+    assertBool ("eigenvalue " ++ show expected) $
+      abs (evs !! i - expected) < 0.01)
+    (zip [0..] [1..10 :: Double])
+
+test_dcEigenReconstruction50 :: Assertion
+test_dcEigenReconstruction50 = do
+  -- A = QΛQ^T reconstruction for a 50x50 SPD matrix
+  let a = mkSPD50
+      (eigvals, q) = symmetricEigenPDC a 1e-12
+      qt = transpose q
+      lambda = makeMatrix @50 @50 @M.P $ \i j ->
+        if i == j then eigvals !. i else 0
+      qlqt = matMul q (matMul lambda qt)
+      maxErr = maximum [abs (a ! (i,j) - qlqt ! (i,j)) | i <- [0..49], j <- [0..49]]
+  assertBool ("reconstruction error " ++ show maxErr ++ " < 1e-8") $ maxErr < 1e-8
+
+test_dcEigenOrthogonal50 :: Assertion
+test_dcEigenOrthogonal50 = do
+  let a = mkSPD50
+      (_, q) = symmetricEigenPDC a 1e-12
+      qt = transpose q
+      qtq = matMul qt q
+      eye = identityMatrix @50 @M.P :: Matrix 50 50 M.P Double
+      maxErr = maximum [abs (qtq ! (i,j) - eye ! (i,j)) | i <- [0..49], j <- [0..49]]
+  assertBool ("orthogonality error " ++ show maxErr ++ " < 1e-8") $ maxErr < 1e-8
+
+test_dcMatchesQR :: Assertion
+test_dcMatchesQR = do
+  -- D&C and QR should produce same eigenvalues for a 30x30 SPD matrix
+  let a = makeMatrix @30 @30 @M.P $ \i j ->
+            let d = fromIntegral (abs (i - j) + 1) :: Double
+            in if i == j then 30 + fromIntegral i else 1.0 / d
+      (eigsDC, _) = symmetricEigenPDC a 1e-12
+      (eigsQR, _) = symmetricEigenP a 3000 1e-12
+      dcSorted = sort [eigsDC !. i | i <- [0..29]]
+      qrSorted = sort [eigsQR !. i | i <- [0..29]]
+      maxDiff = maximum $ zipWith (\a' b' -> abs (a' - b')) dcSorted qrSorted
+  assertBool ("D&C vs QR diff " ++ show maxDiff ++ " < 1e-8") $ maxDiff < 1e-8
+
+-- Helper: 50x50 SPD matrix for D&C tests
+mkSPD50 :: Matrix 50 50 M.P Double
+mkSPD50 = makeMatrix @50 @50 @M.P $ \i j ->
+  let d = fromIntegral (abs (i - j) + 1) :: Double
+  in if i == j then 50 + fromIntegral i else 1.0 / d
