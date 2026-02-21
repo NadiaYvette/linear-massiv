@@ -3417,7 +3417,14 @@ original implementation could fail to converge when zero or near-zero
 superdiagonal entries prevented deflation.  The rewritten version uses
 explicit \texttt{findLo}/\texttt{deflateHi} tracking to correctly
 identify and deflate converged singular values, following GVL4
-Algorithm~8.6.2 more closely.  This fix only affects \texttt{svdGKP}
+Algorithm~8.6.2 more closely.  A separate bug in the Wilkinson shift
+formula was also fixed: the expression
+$\mu = t_{22} - t_{12}^2 / (\delta + \mathop{\mathrm{sgn}}(\delta)
+\sqrt{\delta^2 + t_{12}^2})$ used \texttt{signum delta}, which
+returns~0 for $\delta = 0$, causing division by zero.  Replaced with
+$\mathop{\mathrm{sgn}}(\delta) = \text{if } \delta \geq 0 \text{ then }
+1 \text{ else } {-1}$.
+These fixes only affect \texttt{svdGKP}
 (which is not wired as the default SVD path).
 
 \subsection{Benchmark Results}
