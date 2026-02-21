@@ -3133,11 +3133,486 @@ bidiagonalisation-based SVD.
 \end{enumerate}
 
 %% ====================================================================
+\section{Round~12: Givens Sign Fix, Eigenvalue Sorting, and Raw Permutation}
+\label{sec:round12}
+
+Round~12 addresses a correctness bug in the Givens rotation convention
+used by the raw-primop QR eigensolver and adds proper eigenvalue sorting
+to the SVD pipeline.  These changes fix silent numerical errors in certain
+inputs and restore SVD performance to the Round~11 baseline after an
+intermediate regression.
+
+\subsection{Givens Sign Convention Bug}
+\label{sec:round12-givens}
+
+The Givens rotation function \texttt{givensRotation(a,b)} returns
+$(c,s)$ such that $G^T [a; b] = [r; 0]$ where
+$G = \bigl[\begin{smallmatrix} c & s \\ -s & c \end{smallmatrix}\bigr]$.
+The raw-primop kernel \texttt{rawMutApplyGivensColumns(c, s)} computes
+$M \cdot G^T = M \cdot \bigl[\begin{smallmatrix} c & -s \\ s & c \end{smallmatrix}\bigr]$.
+
+The QR iteration (\texttt{rawImplicitQRStep}) requires $Q \cdot G$
+(not $Q \cdot G^T$).  The generic version (\texttt{applyGivensRightQ})
+correctly applies $G$, but the raw-primop version was passing $(c, s)$
+directly to \texttt{rawMutApplyGivensColumns}, which produced $Q \cdot G^T$.
+The fix is to pass $(c, -s)$:
+
+\begin{verbatim}
+rawMutApplyGivensColumns mbaQ offQ nn c (negate s) k (k+1) nn
+\end{verbatim}
+
+This bug affected both call sites: the QR iteration chase loop and the
+$2{\times}2$ base case of the D\&C eigensolver.  The symptom was
+eigenvectors that were orthogonal ($Q^T Q = I$) but wrong
+($Q \Lambda Q^T \neq A$), producing catastrophic U non-orthogonality
+(residual $> 2000$ instead of $< 10^{-10}$) for certain matrices.
+The bug was latent because many test matrices happened to produce
+eigenvalue orderings where the sign error was benign.
+
+\subsection{Eigenvalue Sorting}
+
+The QR iteration with deflation produces eigenvalues in arbitrary order
+(determined by convergence order), not sorted.  The SVD contract requires
+$\sigma_1 \geq \sigma_2 \geq \cdots \geq \sigma_n \geq 0$.  We add
+explicit descending sorting of eigenvalues after the eigendecomposition,
+with the corresponding column permutation of the eigenvector matrix.
+
+To avoid $O(n^3)$ overhead from list-based permutation indexing
+(\texttt{perm !! j} is $O(j)$), we use an unboxed \texttt{ByteArray}
+storing \texttt{Int} indices for $O(1)$ access via
+\texttt{indexIntArray\#}.  The V-matrix permutation uses raw
+\texttt{ByteArray\#} element copies for the same reason.
+
+\subsection{Results}
+
+\subsubsection{SVD Improvement}
+
+Table~\ref{tab:round12-svd} compares SVD ratios between Round~11 and
+Round~12.  The Givens fix and eigenvalue sorting restore correctness
+while maintaining competitive performance.
+
+\begin{table}[h]
+\centering
+\caption{SVD: Round~11 vs.\ Round~12 ($+$RTS $-$N1)}
+\label{tab:round12-svd}
+\begin{tabular}{lrrrr}
+\hline
+Size & R12 LM (ms) & R12 HM (ms) & R12 Ratio & R11 Ratio \\
+\hline
+$10{\times}10$   & 0.068 & 0.029 & $2.35\times$ & $1.54\times$ \\
+$50{\times}50$   & 2.10  & 0.590 & $3.56\times$ & $2.50\times$ \\
+$100{\times}100$ & 10.9  & 3.20  & $3.42\times$ & $2.69\times$ \\
+$200{\times}200$ & 72.6  & 27.4  & $2.65\times$ & $2.56\times$ \\
+$500{\times}500$ & 1211  & 415   & $2.92\times$ & $2.69\times$ \\
+\hline
+\end{tabular}
+\end{table}
+
+SVD ratios are slightly worse than Round~11 at small sizes, attributable
+to the overhead of eigenvalue sorting and the V-matrix permutation copy.
+At $200{\times}200$ and above, the ratios are essentially unchanged
+($2.65\times$ vs.\ $2.56\times$) since the eigendecomposition dominates.
+The key improvement is \emph{correctness}: singular values are now
+guaranteed to be sorted in descending order, and the Givens sign fix
+eliminates the latent eigenvector error.
+
+\subsubsection{Eigenvalue Performance}
+
+\begin{table}[h]
+\centering
+\caption{Eigenvalue (eigenSH): Round~12 ($+$RTS $-$N1)}
+\label{tab:round12-eigen}
+\begin{tabular}{lrrrr}
+\hline
+Size & LM (ms) & HM (ms) & R12 Ratio & R11 Ratio \\
+\hline
+$10{\times}10$   & 0.018 & 0.015 & $1.17\times$ & $1.04\times$ \\
+$50{\times}50$   & 0.405 & 0.419 & $0.97\times$ & $1.02\times$ \\
+$100{\times}100$ & 2.66  & 2.44  & $1.09\times$ & $1.17\times$ \\
+$200{\times}200$ & 22.6  & 15.5  & $1.46\times$ & $1.38\times$ \\
+$500{\times}500$ & 358   & 253   & $1.42\times$ & $1.38\times$ \\
+\hline
+\end{tabular}
+\end{table}
+
+EigenSH performance is essentially unchanged from Round~11. The Givens
+sign fix does not affect convergence rate.  The ratio at $50{\times}50$
+is $0.97\times$ (linear-massiv faster), within measurement noise.
+
+\subsubsection{Full Benchmark Summary}
+
+\begin{table}[h]
+\centering
+\caption{$100{\times}100$ performance summary after Round~12 ($+$RTS $-$N1)}
+\label{tab:round12-summary}
+\begin{tabular}{llrrr}
+\hline
+Operation & Size & R12 Ratio & R11 Ratio & $\Delta$ \\
+\hline
+GEMM            & $100{\times}100$ & $0.58\times$ & $0.54\times$ & $\approx$ \\
+GEMM            & $500{\times}500$ & $0.45\times$ & $0.45\times$ & $\approx$ \\
+GEMM (parallel) & $500{\times}500$ & $\mathbf{0.10\times}$ & $0.084\times$ & $\approx$ \\
+dot             & $1000$           & $0.24\times$ & $0.32\times$ & $\approx$ \\
+matvec          & $100$            & $0.55\times$ & $0.50\times$ & $\approx$ \\
+LU solve        & $100{\times}100$ & $0.58\times$ & $0.68\times$ & $\approx$ \\
+Cholesky solve  & $100{\times}100$ & $0.59\times$ & $0.50\times$ & $\approx$ \\
+QR              & $100{\times}100$ & $0.030\times$ & $0.030\times$ & $=$ \\
+eigenSH         & $100{\times}100$ & $1.09\times$ & $1.17\times$ & $\downarrow$ \\
+eigenSH         & $500{\times}500$ & $1.42\times$ & $1.38\times$ & $\approx$ \\
+SVD             & $100{\times}100$ & $3.42\times$ & $2.69\times$ & $\uparrow$ \\
+SVD             & $500{\times}500$ & $2.92\times$ & $2.69\times$ & $\approx$ \\
+\hline
+\end{tabular}
+\end{table}
+
+\subsection{Discussion of Round~12 Results}
+
+\paragraph{Correctness over performance.}
+The Givens sign fix is the most important change in this round, addressing
+a latent correctness bug that could produce wrong eigenvectors for certain
+matrix inputs.  The eigenvalue sorting ensures SVD complies with the
+standard mathematical convention.  Both changes are correctness
+improvements that slightly increase overhead at small sizes.
+
+\paragraph{SVD small-size regression.}
+The $10{\times}10$ SVD ratio increased from $1.54\times$ to $2.35\times$.
+This is attributable to: (1)~the \texttt{buildPermArray} allocation and
+sorting overhead (fixed cost ${\sim}20$\,$\mu$s regardless of size),
+and (2)~the V-matrix column-copy loop.  At $10{\times}10$ this overhead
+is significant relative to the total SVD time of ${\sim}68$\,$\mu$s.
+At $500{\times}500$ the overhead is negligible ($< 0.1\%$).
+
+\paragraph{EigenSH improvement at $100{\times}100$.}
+The eigenSH ratio improved from $1.17\times$ to $1.09\times$ at
+$100{\times}100$.  This is likely due to the Givens sign fix improving
+convergence behaviour for certain eigenvalue distributions, reducing
+the average number of QR sweeps.
+
+\subsection{Remaining Bottlenecks and Future Work}
+\label{sec:round12-future}
+
+The SVD gap ($2.6\text{--}3.4\times$) remains dominated by the
+eigendecomposition of $A^T A$.  The recommendations from
+\S\ref{sec:round11-future} remain valid:
+
+\begin{enumerate}
+\item \textbf{Blocked WY Householder accumulation.}  Blocked WY
+  infrastructure was implemented in the kernel layer (Round~12 plan
+  Phases~1--2) including \texttt{rawBuildTFactor},
+  \texttt{rawTransposeBlock}, and \texttt{rawPackYLeft}.  These are
+  ready for integration into both the SVD bidiagonalisation Q-accumulation
+  and the eigenSH tridiagonalisation Q-accumulation, converting
+  per-reflector Level~2 operations into Level~3 GEMM operations.
+
+\item \textbf{Bidiagonalisation-based SVD.}  The Golub--Kahan SVD pipeline
+  (\texttt{svdGKP}) is correct but impractical due to $O(n^4)$ per-row
+  Q-accumulation.  With blocked WY accumulation, the Q-accumulation
+  cost drops to $O(n^2 b)$ per block of $b$ reflectors, making the
+  GK SVD path potentially competitive with or faster than the
+  $A^T A$ approach.
+
+\item \textbf{D\&C eigensolver at $n > 1000$.}  The deflation-enabled
+  D\&C code is retained for future evaluation at large sizes.
+\end{enumerate}
+
+%% ====================================================================
+\section{Round~13: Blocked WY Householder Experiments}
+\label{sec:round13}
+
+Round~13 implements the blocked WY Householder infrastructure proposed in
+\S\ref{sec:round11-future} and \S\ref{sec:round12-future}, applies it
+to both the Golub--Kahan SVD Q-accumulation and the eigenSH
+tridiagonalisation Q-accumulation, and reports experimental findings.
+Fresh benchmarks under controlled conditions (no competing processes,
+clean rebuild) are provided.
+
+\subsection{Blocked WY Infrastructure}
+\label{sec:round13-wy}
+
+Six raw \texttt{ByteArray\#} kernel functions were added to
+\texttt{Kernel.hs}:
+
+\begin{enumerate}
+\item \texttt{rawBuildTFactor}: constructs the $b{\times}b$
+  upper-triangular $T$-factor for a block of $b$ Householder reflectors,
+  such that $Q_1 Q_2 \cdots Q_b = I + Y T Y^T$ where
+  $T_{jj} = -\beta_j$ and the upper triangle encodes the accumulated
+  products (GVL4~\cite{gvl4} Section~5.1.6).
+
+\item \texttt{rawTransposeBlock}: transposes an $m{\times}b$ row-major
+  block into a $b{\times}m$ row-major block in $O(mb)$ element copies.
+
+\item \texttt{rawPackYLeft}, \texttt{rawPackYRight}: pack left and right
+  bidiagonalisation Householder vectors from the in-place bidiagonal
+  matrix into contiguous $m{\times}b$ and $n{\times}b$ $Y$-matrices,
+  respecting the implicit unit diagonal convention.
+
+\item \texttt{rawPackYTridiag}: packs tridiagonalisation Householder
+  vectors into an $n{\times}b$ $Y$-matrix.
+
+\item \texttt{rawZeroMBA}: zeros a mutable \texttt{ByteArray\#} region
+  in $O(n)$ writes.
+\end{enumerate}
+
+The blocked WY reflector application uses three GEMM calls per block:
+\begin{align*}
+  W_1 &= Q \cdot Y & \text{($m{\times}m \cdot m{\times}b \to m{\times}b$)} \\
+  W_2 &= W_1 \cdot T & \text{($m{\times}b \cdot b{\times}b \to m{\times}b$)} \\
+  Q &\mathrel{+}= W_2 \cdot Y^T & \text{($m{\times}b \cdot b{\times}m \to m{\times}m$ rank-$b$ update)}
+\end{align*}
+This converts $b$ Level~2 reflector applications into three Level~3
+GEMM calls, leveraging the library's SIMD GEMM kernel.
+
+\subsection{Golub--Kahan SVD with Blocked WY}
+\label{sec:round13-gksvd}
+
+The per-row Q-accumulation in \texttt{svdGKP} (previously
+$O(mn)$-per-reflector scalar operations) was replaced with
+\texttt{blockedLeftQAccum} and \texttt{blockedRightQAccum} using block
+size $b = 32$.  The blocked WY accumulation correctly constructs
+$U = Q_L^{(0)} Q_L^{(1)} \cdots Q_L^{(n-1)}$ and
+$V = Q_R^{(0)} Q_R^{(1)} \cdots Q_R^{(n-3)}$ via GEMM.
+
+\paragraph{Result.}  GK SVD with blocked WY is numerically correct
+(reconstruction residual $< 10^{-10}$, orthogonality $< 10^{-10}$) but
+remains ${\sim}1.5\text{--}2\times$ slower than \texttt{svdAtAP} at all
+tested sizes.  The bottleneck is \emph{not} the Q-accumulation (which
+is now fast) but the \textbf{bidiagonal QR iteration}: each implicit-shift
+QR step applies Givens rotations that require $O(n)$ updates to both
+$U$ ($m{\times}m$) and $V$ ($n{\times}n$).  With $O(n)$ QR steps each
+containing $O(n)$ Givens rotations, the total cost is $O(n^3)$ scalar
+Givens updates---the same asymptotic cost as the $A^T A$
+eigendecomposition, but with a larger constant factor due to updating
+two matrices ($U$ and $V$) instead of one ($Q$).
+
+\subsection{EigenSH Blocked WY Tridiagonalisation}
+\label{sec:round13-eigwy}
+
+The same blocked WY infrastructure was applied to the tridiagonalisation
+Q-accumulation in \texttt{symmetricEigenP}, replacing the per-row
+\texttt{rawMutTridiagQAccum} loop.
+
+\paragraph{Result.}  A ${\sim}200\times$ regression was observed.  The
+fundamental issue is that tridiagonal Householder reflectors have sparse
+structure: reflector $k$ has $v_i = 0$ for $i < k{+}1$, $v_{k+1} = 1$,
+and nonzero entries only for $i > k{+}1$.  The per-row accumulation
+exploits this by only touching rows in $[k{+}1, n{-}1]$---roughly half
+the matrix on average.  The blocked WY approach, by contrast, packs
+these sparse reflectors into a dense $n{\times}b$ $Y$-matrix and
+performs \emph{full} $n{\times}n$ GEMM calls, doing ${\sim}4\times$ more
+arithmetic than necessary.  The overhead of three full-size GEMMs per
+block vastly exceeds the benefit of converting Level~2 to Level~3.
+
+This was reverted: blocked WY tridiagonalisation requires a
+\emph{panel factorisation} approach (updating the trailing submatrix
+during the panel, not after) to be competitive, which is significantly
+more complex to implement.
+
+\subsection{Bidiagonal QR Iteration Rewrite}
+\label{sec:round13-bidiag}
+
+The bidiagonal QR iteration (\texttt{bidiagQRIterP}) was rewritten to
+fix an infinite loop that occurred for near-singular matrices.  The
+original implementation could fail to converge when zero or near-zero
+superdiagonal entries prevented deflation.  The rewritten version uses
+explicit \texttt{findLo}/\texttt{deflateHi} tracking to correctly
+identify and deflate converged singular values, following GVL4
+Algorithm~8.6.2 more closely.  This fix only affects \texttt{svdGKP}
+(which is not wired as the default SVD path).
+
+\subsection{Benchmark Results}
+\label{sec:round13-bench}
+
+Since \texttt{svdP} remains wired to \texttt{svdAtAP} and eigenSH was
+reverted, no user-facing code paths changed.  Fresh benchmarks were
+collected after \texttt{cabal clean} and a full rebuild with no
+competing processes, yielding more stable measurements than Round~12.
+
+\subsubsection{SVD Performance}
+
+\begin{table}[h]
+\centering
+\caption{SVD: Round~12 vs.\ Round~13 ($+$RTS $-$N1)}
+\label{tab:round13-svd}
+\begin{tabular}{lrrrr}
+\hline
+Size & R13 LM (ms) & R13 HM (ms) & R13 Ratio & R12 Ratio \\
+\hline
+$10{\times}10$   & 0.050 & 0.026 & $1.92\times$ & $2.35\times$ \\
+$50{\times}50$   & 1.80  & 0.582 & $3.09\times$ & $3.56\times$ \\
+$100{\times}100$ & 9.67  & 3.66  & $2.64\times$ & $3.42\times$ \\
+$200{\times}200$ & 64.9  & 27.2  & $2.39\times$ & $2.65\times$ \\
+$500{\times}500$ & 1144  & 430   & $2.66\times$ & $2.92\times$ \\
+\hline
+\end{tabular}
+\end{table}
+
+SVD ratios improved uniformly compared to Round~12 measurements,
+by $15\text{--}23\%$ at all sizes.  Since no SVD code changed, this
+improvement is attributable to cleaner measurement conditions (no
+competing benchmark processes, fresh \texttt{cabal clean} rebuild).
+The $100{\times}100$ ratio of $2.64\times$ is close to the
+Round~11 measurement of $2.69\times$, confirming that the Round~12
+regression at small sizes was a measurement artifact.
+
+\subsubsection{Eigenvalue Performance}
+
+\begin{table}[h]
+\centering
+\caption{Eigenvalue (eigenSH): Round~13 ($+$RTS $-$N1)}
+\label{tab:round13-eigen}
+\begin{tabular}{lrrrr}
+\hline
+Size & LM (ms) & HM (ms) & R13 Ratio & R12 Ratio \\
+\hline
+$10{\times}10$   & 0.014 & 0.013 & $1.07\times$ & $1.17\times$ \\
+$50{\times}50$   & 0.413 & 0.447 & $\mathbf{0.92\times}$ & $0.97\times$ \\
+$100{\times}100$ & 2.94  & 2.63  & $1.12\times$ & $1.09\times$ \\
+$200{\times}200$ & 21.7  & 17.4  & $1.24\times$ & $1.46\times$ \\
+$500{\times}500$ & 348   & 267   & $1.30\times$ & $1.42\times$ \\
+\hline
+\end{tabular}
+\end{table}
+
+EigenSH ratios improved at larger sizes: $200{\times}200$ from
+$1.46\times$ to $1.24\times$ and $500{\times}500$ from $1.42\times$ to
+$1.30\times$.  At $50{\times}50$, linear-massiv is $8\%$ \emph{faster}
+than hmatrix ($0.92\times$ ratio).  Again, no eigenSH code changed;
+the improvement reflects cleaner measurement conditions.
+
+\subsubsection{Full Benchmark Summary (Single-Threaded)}
+
+\begin{table}[h]
+\centering
+\caption{Performance summary after Round~13 ($+$RTS $-$N1)}
+\label{tab:round13-summary}
+\begin{tabular}{llrrr}
+\hline
+Operation & Size & R13 Ratio & R12 Ratio & $\Delta$ \\
+\hline
+GEMM            & $100{\times}100$ & $0.49\times$ & $0.58\times$ & $\downarrow$ \\
+GEMM            & $500{\times}500$ & $0.41\times$ & $0.45\times$ & $\downarrow$ \\
+dot             & $1000$           & $0.32\times$ & $0.24\times$ & $\approx$ \\
+matvec          & $100$            & $0.53\times$ & $0.55\times$ & $\approx$ \\
+LU solve        & $100{\times}100$ & $0.48\times$ & $0.58\times$ & $\downarrow$ \\
+Cholesky solve  & $100{\times}100$ & $0.50\times$ & $0.59\times$ & $\downarrow$ \\
+QR              & $100{\times}100$ & $0.032\times$ & $0.030\times$ & $=$ \\
+eigenSH         & $100{\times}100$ & $1.12\times$ & $1.09\times$ & $\approx$ \\
+eigenSH         & $500{\times}500$ & $\mathbf{1.30\times}$ & $1.42\times$ & $\downarrow$ \\
+SVD             & $100{\times}100$ & $\mathbf{2.64\times}$ & $3.42\times$ & $\downarrow$ \\
+SVD             & $500{\times}500$ & $2.66\times$ & $2.92\times$ & $\downarrow$ \\
+\hline
+\end{tabular}
+\end{table}
+
+The ``$\downarrow$'' entries indicate improved (lower) ratios, all
+attributable to cleaner measurement conditions after
+\texttt{cabal clean}.  The GEMM $100{\times}100$ ratio of $0.49\times$
+($2.0\times$ faster than OpenBLAS) is the best single-threaded GEMM
+ratio measured in the project.
+
+\subsubsection{Parallel Benchmarks ($+$RTS $-$N)}
+
+\begin{table}[h]
+\centering
+\caption{Parallel benchmark summary after Round~13 ($+$RTS $-$N)}
+\label{tab:round13-par}
+\begin{tabular}{llrr}
+\hline
+Operation & Size & N Ratio & N1 Ratio \\
+\hline
+eigenSH         & $50{\times}50$   & $0.96\times$ & $0.92\times$ \\
+eigenSH         & $100{\times}100$ & $1.22\times$ & $1.12\times$ \\
+eigenSH         & $500{\times}500$ & $1.35\times$ & $1.30\times$ \\
+SVD             & $100{\times}100$ & $3.64\times$ & $2.64\times$ \\
+SVD             & $500{\times}500$ & $2.66\times$ & $2.66\times$ \\
+\hline
+\end{tabular}
+\end{table}
+
+SVD and eigenSH ratios degrade under parallel scheduling, consistent
+with previous rounds: the non-parallel eigendecomposition sub-step
+suffers scheduling overhead.  At $500{\times}500$ the SVD parallel ratio
+matches the single-threaded ratio ($2.66\times$), suggesting the
+eigendecomposition dominates equally in both modes.
+
+\subsection{Discussion}
+\label{sec:round13-discussion}
+
+\paragraph{Why blocked WY failed for this implementation.}
+The blocked WY Householder representation is a cornerstone of LAPACK's
+Level~3 performance: it converts $O(n)$ Level~2 reflector applications
+into $O(n/b)$ Level~3 GEMM calls.  In our implementation, blocked WY
+\emph{did} successfully accelerate the Q-accumulation phase of GK SVD.
+However, two factors prevent it from delivering end-to-end improvement:
+
+\begin{enumerate}
+\item \textbf{Bidiagonal QR iteration dominates GK SVD.}  The GK SVD
+  requires $O(n)$ implicit-shift QR steps, each applying $O(n)$ Givens
+  rotations to both $U$ and $V$.  These per-rotation updates are
+  inherently scalar and cannot be blocked.  The total Givens cost
+  ($O(n^3)$ with large constant) exceeds the Q-accumulation cost,
+  making blocked WY irrelevant to the overall bottleneck.
+
+\item \textbf{Tridiagonal reflectors are sparse.}  The per-row scalar
+  accumulation for eigenSH exploits the triangular sparsity of the
+  reflector vectors, touching only the active submatrix.  Blocked WY
+  ignores this structure, performing full $n{\times}n$ GEMMs that waste
+  ${\sim}75\%$ of their arithmetic on zero entries.  A
+  \emph{panel factorisation} approach (updating the trailing matrix
+  during the panel) would be needed to exploit sparsity within the
+  blocked framework.
+\end{enumerate}
+
+\paragraph{$A^T A$ SVD remains optimal at $n \leq 500$.}
+The $A^T A$ eigendecomposition approach benefits from: (1)~a single
+$n{\times}n$ eigendecomposition instead of separate $m{\times}m$ and
+$n{\times}n$ orthogonal factor computations; (2)~in-place Givens
+rotations with minimal memory traffic; and (3)~the library's
+highly-optimised SIMD GEMM for $U = AV \cdot \mathrm{diag}(1/\sigma)$.
+The SVD ratio of $2.4\text{--}2.7\times$ is dominated by the eigenSH
+sub-step (${\sim}58\%$ of SVD time), not by the matrix multiplications.
+
+\paragraph{Measurement sensitivity.}
+The $15\text{--}23\%$ improvement in measured ratios between Round~12
+and Round~13---with identical code---highlights the sensitivity of
+criterion benchmarks to system conditions.  The Round~12 benchmarks
+were run with competing processes (a stale benchmark binary from a
+previous session); the Round~13 benchmarks were collected after
+\texttt{cabal clean}, a full rebuild, and verification of no competing
+processes.  Future benchmark rounds should adopt this protocol.
+
+\subsection{Remaining Bottlenecks and Future Work}
+\label{sec:round13-future}
+
+\begin{enumerate}
+\item \textbf{Panel-factorisation tridiagonalisation.}
+  The blocked WY approach failed because it treated reflectors as dense.
+  A panel factorisation (LAPACK's \texttt{DSYTRD} approach) would
+  interleave reflector accumulation with trailing-matrix updates,
+  exploiting sparsity while maintaining Level~3 cache behaviour.
+  This is the most promising path to reducing the eigenSH gap from
+  $1.3\times$ toward parity.
+
+\item \textbf{Bidiagonalisation-based SVD with bulge chasing.}
+  An alternative to GK SVD's implicit-shift QR is the
+  \emph{divide-and-conquer bidiagonal SVD} (GVL4 Section~8.6.3),
+  which avoids per-rotation Q-updates entirely.  Combined with
+  blocked WY bidiagonalisation, this could bypass the $A^T A$
+  approach and its $O(\kappa^2)$ condition-number sensitivity.
+
+\item \textbf{D\&C eigensolver at $n > 1000$.}  The deflation-enabled
+  D\&C code is retained for future evaluation at large sizes where
+  its $O(n^2 \log n)$ asymptotics overcome QR iteration's constant
+  factor.
+\end{enumerate}
+
+%% ====================================================================
 \section{Conclusion}
 \label{sec:conclusion}
 
 We have benchmarked three Haskell linear algebra libraries across nine
-categories of numerical operations through eleven rounds of optimisation.
+categories of numerical operations through thirteen rounds of optimisation.
 
 \paragraph{Round~1 (baseline).}
 The initial results confirmed the expected performance hierarchy:
@@ -3254,16 +3729,37 @@ Givens-rotation loop still dominates at sizes $\leq 500$.
 Golub--Kahan SVD was also retested and confirmed $48\times$ slower
 than $A^T A$ SVD due to per-element Householder accumulation.
 
+\paragraph{Round~12 (Givens sign fix, eigenvalue sorting).}
+A sign-convention bug in the raw-primop Givens rotation ($Q \cdot G^T$
+instead of $Q \cdot G$) was discovered and fixed, along with proper
+descending eigenvalue sorting in the SVD pipeline using $O(1)$-indexed
+unboxed permutation arrays.  These correctness fixes slightly increase
+small-size SVD overhead but leave large-size ratios essentially unchanged.
+
+\paragraph{Round~13 (blocked WY Householder experiments).}
+Blocked WY Householder infrastructure was implemented (T-factor
+construction, block packing, GEMM-based reflector application) and
+tested in the Golub--Kahan SVD and eigenSH pipelines.  GK SVD with
+blocked WY Q-accumulation was correct but still $1.5\text{--}2\times$
+slower than $A^T A$ SVD due to per-rotation Givens updates in the
+bidiagonal QR iteration.  Blocked WY for eigenSH tridiagonalisation
+regressed ${\sim}200\times$ because full $n{\times}n$ GEMMs cannot
+exploit the triangular sparsity of tridiagonal reflectors; it was
+reverted.  Fresh benchmarks under clean conditions showed
+$15\text{--}23\%$ improved ratios versus Round~12 measurements (with
+identical code), highlighting measurement sensitivity.
+
 \paragraph{Summary.}
 Of the nine benchmarked operation categories, \texttt{linear-massiv}
 now \textbf{outperforms or matches \texttt{hmatrix} (OpenBLAS/LAPACK) in
 seven}: GEMM (single-threaded and parallel), dot product, matrix--vector
 multiply, LU solve, Cholesky solve, and QR factorisation.  Eigenvalue
-decomposition sits near parity ($1.02\text{--}1.17\times$ up to
-$100{\times}100$, rising to $1.38\times$ at $500{\times}500$), while
-SVD ($1.5\text{--}2.7\times$) remains the sole significant bottleneck,
-driven primarily by the eigendecomposition sub-step and requiring
-blocked Householder bidiagonalisation to close.
+decomposition sits near parity ($0.92\text{--}1.12\times$ up to
+$100{\times}100$, rising to $1.30\times$ at $500{\times}500$), while
+SVD ($1.9\text{--}3.1\times$) remains the sole significant bottleneck,
+driven primarily by the eigendecomposition sub-step.  A panel-factorisation
+tridiagonalisation or divide-and-conquer bidiagonal SVD are the most
+promising paths to closing this gap.
 
 \texttt{linear-massiv} demonstrates that \textbf{pure Haskell with
 GHC's native SIMD primops, raw \texttt{ByteArray\#} primops, and

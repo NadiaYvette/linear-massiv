@@ -97,10 +97,16 @@ svd a =
       at = transpose a
       ata = matMul at a  -- n×n symmetric positive semidefinite
       -- Eigendecomposition of AᵀA
-      (eigvals, v) = symmetricEigen ata (30 * nn) 1e-12
-      -- Singular values = sqrt of eigenvalues (clamp negatives to 0)
-      sigma = makeVector @n @r $ \i ->
-        let ev = eigvals !. i
+      (eigvalsRaw_, vRaw_) = symmetricEigen ata (30 * nn) 1e-12
+      -- Sort eigenvalues descending; build O(1) permutation array
+      permBA_ = buildPermArray
+                  (map snd $ sortBy (\(a_,_) (b_,_) -> compare (Down a_) (Down b_))
+                             [(eigvalsRaw_ !. i, i) | i <- [0..nn-1]])
+                  nn
+      v = makeMatrix @n @n @r $ \i j -> vRaw_ ! (i, indexPermArray permBA_ j)
+      -- Singular values = sqrt of sorted eigenvalues (clamp negatives to 0)
+      sigma = makeVector @n @r $ \j ->
+        let ev = eigvalsRaw_ !. indexPermArray permBA_ j
         in if ev > 0 then sqrt ev else 0
       -- Compute U: u_i = A·v_i / σ_i
       -- First, build U by computing A·V column by column
@@ -109,8 +115,8 @@ svd a =
           let sj = sigma !. j
           in if sj > 1e-14
              then -- u_j = (1/σ_j) · Σ_k A(i,k) · V(k,j)
-               let av = foldl' (\acc k -> acc + (a ! (i, k)) * (v ! (k, j))) 0 [0..nn-1]
-               in av / sj
+               let av_ = foldl' (\acc k -> acc + (a ! (i, k)) * (v ! (k, j))) 0 [0..nn-1]
+               in av_ / sj
              else -- Zero singular value; use arbitrary orthogonal vector
                if i == j then 1 else 0
         else
@@ -139,10 +145,42 @@ svdAtAP a =
       !nn = dimVal @n
       !ata = matMulAtAP a  -- n×n symmetric positive semidefinite, fast transpose + SIMD GEMM
       -- Eigendecomposition of AᵀA using raw primop QR iteration
-      (!eigvals, !v) = symmetricEigenP ata (10 * nn) 1e-12
-      -- Singular values = sqrt of eigenvalues (clamp negatives to 0)
-      sigma = makeVector @n @M.P $ \i ->
-        let ev = eigvals !. i
+      (!eigvalsRaw, !vRaw) = symmetricEigenP ata (10 * nn) 1e-12
+      -- Sort eigenvalues descending; build O(1) permutation array
+      !permList = map snd $ sortBy (\(a_,_) (b_,_) -> compare (Down a_) (Down b_))
+                        [(eigvalsRaw !. i, i) | i <- [0..nn-1]]
+      !permBA = buildPermArray permList nn
+      -- Rearrange V columns via O(1) indexed permutation using raw ByteArray copy
+      !v = createMatrix @n @n @M.P $ \mv -> do
+        let !baV   = unwrapByteArray (unMatrix vRaw)
+            !offV  = unwrapByteArrayOffset (unMatrix vRaw)
+            !mbaVP = unwrapMutableByteArray mv
+            !offVP = unwrapMutableByteArrayOffset mv
+            !(ByteArray baV#) = baV
+            !(I# offV#) = offV
+            !(MutableByteArray mbaVP#) = mbaVP
+            !(I# offVP#) = offVP
+            !(I# nnV#) = nn
+        -- Copy columns: V_new[i,j] = V_raw[i, perm[j]]
+        ST $ \s0 ->
+          let goRow i s
+                | isTrue# (i >=# nnV#) = s
+                | otherwise =
+                    let goCol j s1
+                          | isTrue# (j >=# nnV#) = s1
+                          | otherwise =
+                              let !(I# pj) = indexPermArray permBA (I# j)
+                                  !val = indexDoubleArray# baV# (offV# +# i *# nnV# +# pj)
+                              in case writeDoubleArray# mbaVP# (offVP# +# i *# nnV# +# j) val s1 of
+                                   s2 -> goCol (j +# 1#) s2
+                    in goRow (i +# 1#) (goCol 0# s)
+          in (# goRow 0# s0, () #)
+      -- Singular values = sqrt of sorted eigenvalues (clamp negatives to 0)
+      sigma = makeVector @n @M.P $ \j ->
+        let !(ByteArray baEV#) = unwrapByteArray (unVector eigvalsRaw)
+            !(I# offEV#) = unwrapByteArrayOffset (unVector eigvalsRaw)
+            !(I# pj#) = indexPermArray permBA j
+            ev = case indexDoubleArray# baEV# (offEV# +# pj#) of v_ -> D# v_
         in if ev > 0 then sqrt ev else 0
       -- Compute U = A·V via single GEMM, then scale columns by 1/σ_j
       !av = matMulP a v  -- m×n result via SIMD GEMM
@@ -223,6 +261,27 @@ readBA :: ByteArray -> Int -> Int -> Double
 readBA (ByteArray ba) (I# off) (I# i) =
   case indexDoubleArray# ba (off +# i) of v -> D# v
 {-# INLINE readBA #-}
+
+-- | Build an unboxed Int permutation array from a list for O(1) indexed access.
+buildPermArray :: [Int] -> Int -> ByteArray
+buildPermArray xs n = runST $ do
+  mba <- newByteArray (n * 8)  -- 8 bytes per Int on 64-bit
+  let go _ []     = pure ()
+      go i (x:rest) = do
+        let !(MutableByteArray mba#) = mba
+            !(I# i#) = i
+            !(I# x#) = x
+        ST $ \s -> case writeIntArray# mba# i# x# s of s' -> (# s', () #)
+        go (i + 1) rest
+  go 0 xs
+  unsafeFreezeByteArray mba
+{-# INLINE buildPermArray #-}
+
+-- | O(1) index into a permutation ByteArray.
+indexPermArray :: ByteArray -> Int -> Int
+indexPermArray (ByteArray ba#) (I# i#) =
+  case indexIntArray# ba# i# of x# -> I# x#
+{-# INLINE indexPermArray #-}
 
 -- | Compute only the singular values of \(A\), sorted in descending order.
 singularValues :: forall m n r e. (KnownNat m, KnownNat n, M.Manifest r e, Floating e, Ord e)
@@ -438,19 +497,39 @@ bidiagonalizeP mbaA offA mm nn mbaBetaL mbaBetaR = do
 -- | Implicit-shift bidiagonal QR iteration (GVL4 Algorithm 8.6.2).
 -- Operates on diagonal d and superdiagonal e of an upper bidiagonal matrix.
 -- Accumulates left rotations into U (m×n columns) and right rotations into V (n×n).
+--
+-- Each iteration: (1) find the active unreduced block [p..q] by scanning from
+-- the bottom for deflation, then scanning up for split; (2) apply one QR step
+-- to [p..q]; (3) repeat until fully deflated or maxIter reached.
 bidiagQRIterP :: MutableByteArray s -> Int  -- d + offset
               -> MutableByteArray s -> Int  -- e + offset
               -> MutableByteArray s -> Int -> Int  -- U + offset + ucols
               -> MutableByteArray s -> Int -> Int  -- V + offset + vcols
               -> Int -> Int  -- n, maxIter
               -> ST s ()
-bidiagQRIterP mbaD offD mbaE offE mbaU offU ucols mbaV offV vcols nn maxIter = go 0 0 (nn - 1)
+bidiagQRIterP mbaD offD mbaE offE mbaU offU ucols mbaV offV vcols nn maxIter = go 0
   where
-    go !iter !lo !hi
+    go !iter
       | iter >= maxIter = return ()
-      | hi <= lo = return ()
       | otherwise = do
-          -- Check if e[hi-1] is negligible → deflation
+          -- Step 1: Find q — the bottom of the unreduced block.
+          -- Scan from nn-1 downward, deflating negligible e[q-1].
+          q <- deflateHi (nn - 1)
+          if q <= 0
+            then return ()  -- fully deflated
+            else do
+              -- Step 2: Find p — the top of the unreduced block.
+              -- Scan from q-1 downward, looking for a split.
+              p <- findLo (q - 1)
+              -- Step 3: Apply one QR step to [p..q]
+              bidiagQRStep mbaD offD mbaE offE mbaU offU ucols mbaV offV vcols p q
+              go (iter + 1)
+
+    -- Scan from hi down: deflate any trailing negligible superdiagonals.
+    -- Returns the index of the bottom row of the active block (0 if fully deflated).
+    deflateHi !hi
+      | hi <= 0 = return 0
+      | otherwise = do
           ehi <- readRawD mbaE offE (hi - 1)
           dhi <- readRawD mbaD offD hi
           dhi1 <- readRawD mbaD offD (hi - 1)
@@ -458,55 +537,23 @@ bidiagQRIterP mbaD offD mbaE offE mbaU offU ucols mbaV offV vcols nn maxIter = g
           if abs ehi <= tol
             then do
               writeRawD mbaE offE (hi - 1) 0
-              go iter lo (hi - 1)
-            else do
-              -- Check if e[lo] is negligible → advance lo
-              elo <- readRawD mbaE offE lo
-              dlo <- readRawD mbaD offD lo
-              dlo1 <- readRawD mbaD offD (lo + 1)
-              let tolLo = 1e-14 * (abs dlo + abs dlo1)
-              if abs elo <= tolLo && lo < hi - 1
-                then do
-                  writeRawD mbaE offE lo 0
-                  go iter (lo + 1) hi
-                else do
-                  -- Find split points
-                  mSplit <- findSplit mbaE offE mbaD offD lo hi
-                  case mSplit of
-                    Just q -> do
-                      writeRawD mbaE offE q 0
-                      -- Check if zero is on diagonal — special zero-shift chase
-                      mZeroDiag <- findZeroDiag mbaD offD lo hi
-                      case mZeroDiag of
-                        Just _ -> go iter lo hi  -- re-enter with split
-                        Nothing -> go iter lo hi  -- re-enter with split
-                    Nothing -> do
-                      -- Implicit-shift QR step
-                      bidiagQRStep mbaD offD mbaE offE mbaU offU ucols mbaV offV vcols lo hi
-                      go (iter + 1) lo hi
+              deflateHi (hi - 1)
+            else return hi
 
-    findSplit mbaE_ offE_ mbaD_ offD_ lo_ hi_ = go' (hi_ - 1)
-      where
-        go' q
-          | q <= lo_ = return Nothing
-          | otherwise = do
-              eq <- readRawD mbaE_ offE_ q
-              dq <- readRawD mbaD_ offD_ q
-              dq1 <- readRawD mbaD_ offD_ (q + 1)
-              let tol = 1e-14 * (abs dq + abs dq1)
-              if abs eq <= tol
-                then return (Just q)
-                else go' (q - 1)
-
-    findZeroDiag mbaD_ offD_ lo_ hi_ = go' lo_
-      where
-        go' i
-          | i > hi_ = return Nothing
-          | otherwise = do
-              di <- readRawD mbaD_ offD_ i
-              if abs di < 1e-300
-                then return (Just i)
-                else go' (i + 1)
+    -- Scan from idx downward to find the top of the unreduced block.
+    -- Returns the smallest p such that B[p..q] is unreduced.
+    findLo !idx
+      | idx <= 0 = return 0
+      | otherwise = do
+          eidx <- readRawD mbaE offE (idx - 1)
+          didx <- readRawD mbaD offD idx
+          didx1 <- readRawD mbaD offD (idx - 1)
+          let tol = 1e-14 * (abs didx1 + abs didx)
+          if abs eidx <= tol
+            then do
+              writeRawD mbaE offE (idx - 1) 0
+              return idx
+            else findLo (idx - 1)
 {-# NOINLINE bidiagQRIterP #-}
 
 -- | One implicit-shift QR step on bidiagonal [lo..hi].
@@ -535,7 +582,8 @@ bidiagQRStep mbaD offD mbaE offE mbaU offU ucols mbaV offV vcols lo hi = do
 
   -- Wilkinson shift: eigenvalue of [[t11,t12],[t12,t22]] closer to t22
   let delta = (t11 - t22) / 2
-      mu = t22 - t12 * t12 / (delta + signum delta * sqrt (delta * delta + t12 * t12))
+      signD = if delta >= 0 then 1 else -1
+      mu = t22 - t12 * t12 / (delta + signD * sqrt (delta * delta + t12 * t12))
 
   -- Initial values for bulge chase
   dlo <- readRawD mbaD offD lo

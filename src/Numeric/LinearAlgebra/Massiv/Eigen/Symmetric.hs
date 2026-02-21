@@ -561,7 +561,7 @@ rawImplicitQRStep mbaD offD mbaSD offSD mbaQ offQ nn shift lo hi = do
       writeRawD mbaD offD (k+1) (s*s*dk + 2*c*s*ek + c*c*dk1)
       writeRawD mbaSD offSD k   (c*s*(dk - dk1) + (c*c - s*s)*ek)
       -- Raw primop Givens rotation on Q
-      rawMutApplyGivensColumns mbaQ offQ nn c s k (k+1) nn
+      rawMutApplyGivensColumns mbaQ offQ nn c (negate s) k (k+1) nn
       if k + 1 < hi
         then do
           ek1 <- readRawD mbaSD offSD (k+1)
@@ -630,7 +630,7 @@ dcEigenTridiagOpt mbaD offD mbaE offE mbaQ offQ fullN lo0 hi0 tol
                 writeRawD mbaD offD lo lam1
                 writeRawD mbaD offD hi lam2
                 writeRawD mbaE offE lo 0
-                rawMutApplyGivensColumns mbaQ offQ fullN c s lo hi fullN
+                rawMutApplyGivensColumns mbaQ offQ fullN c (negate s) lo hi fullN
             | hi - lo + 1 <= dcThreshold = do
                 -- QR fallback for small subproblems
                 let !k = hi - lo + 1
