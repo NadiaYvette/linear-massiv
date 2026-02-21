@@ -150,15 +150,35 @@ tridiagonalizeP a =
   let nn = dimVal @n
 
       -- Phase 1: In-place Householder tridiagonalisation
+      -- For n < panelCrossover: per-column Level-2 (rank-2 update per step)
+      -- For n >= panelCrossover: DLATRD-style panel factorisation (Level-3 SYR2K)
+      panelCrossover = 256
       (betaList, tArr) = M.withMArrayST (unMatrix a) $ \mt -> do
         let !mbaT = unwrapMutableByteArray mt
             !offT = unwrapMutableByteArrayOffset mt
-        -- Allocate reusable temporary vectors (n Doubles = n*8 bytes)
         mbaV <- newByteArray (nn * 8)
         mbaP <- newByteArray (nn * 8)
         mbaW <- newByteArray (nn * 8)
-        betas <- mapM (\k -> tridiagStepP mbaT offT nn mbaV mbaP mbaW k) [0..nn-3]
-        pure betas
+        if nn < panelCrossover
+          then do
+            betas <- mapM (\k -> tridiagStepP mbaT offT nn mbaV mbaP mbaW k) [0..nn-3]
+            pure betas
+          else do
+            let !nb = 32
+                !numRef = nn - 2  -- number of Householder reflectors
+            -- V_panel (nn × nb) and W_panel (nn × nb) for deferred rank-2 updates
+            mbaVp <- newByteArray (nn * nb * 8)
+            mbaWp <- newByteArray (nn * nb * 8)
+            -- Temporary for GEMM-based trailing update
+            mbaTemp <- newByteArray (nn * nb * 8)
+            let go !k0 !accBetas
+                  | k0 > numRef - 1 = pure (reverse accBetas)
+                  | otherwise = do
+                      let !bs = min nb (numRef - k0)
+                      panelBetas <- panelTridiagP mbaT offT nn mbaV mbaP mbaW
+                                                  mbaVp mbaWp mbaTemp k0 bs
+                      go (k0 + bs) (reverse panelBetas ++ accBetas)
+            go 0 []
 
       -- Get underlying ByteArray from frozen T for Q accumulation
       !tBA  = unwrapByteArray tArr
@@ -315,6 +335,210 @@ tridiagStepP mbaT offT nn mbaV mbaP mbaW k = do
       writeRawD mbaT offT (k*nn + (k+1)) mu
 
       pure beta
+
+-- | DLATRD-style panel tridiagonalisation.
+-- Processes columns k0..k0+bs-1, building V_panel and W_panel matrices
+-- that represent the deferred rank-2 updates. After processing all columns
+-- in the panel, applies a single Level-3 SYR2K trailing update.
+--
+-- Within the panel, column k of T is corrected for deferred updates:
+--   T[:,k] -= V_panel * W_panel[k,:] + W_panel * V_panel[k,:]
+-- before computing the Householder reflector.
+--
+-- Returns the list of beta values for the panel columns.
+panelTridiagP :: MutableByteArray s -> Int -> Int  -- T matrix, offset, n
+              -> MutableByteArray s -> MutableByteArray s -> MutableByteArray s  -- v, p, w temps
+              -> MutableByteArray s -> MutableByteArray s -> MutableByteArray s  -- Vp, Wp, temp
+              -> Int -> Int  -- k0, bs (panel start, panel size)
+              -> ST s [Double]
+panelTridiagP mbaT offT nn mbaV mbaP mbaW mbaVp mbaWp _mbaTemp k0 bs = do
+  -- DLATRD-style: NO rank-2 updates to T within the panel.
+  -- All corrections computed from V_panel, W_panel.
+  -- After the panel, apply SYR2K to the full remaining submatrix.
+  betas <- go 0 []
+
+  -- After the panel: apply accumulated rank-2 update to the full remaining
+  -- submatrix T[k0+1:nn, k0+1:nn]. This includes both within-panel diagonal
+  -- entries and the trailing submatrix.
+  --
+  -- We must save/restore Householder vectors in columns k0..k0+bs-1
+  -- because the SYR2K will overwrite them.
+  let !remStart = k0 + 1
+      !remSize = nn - remStart
+  when (remSize > 0 && bs > 0) $ do
+    -- Save Householder vectors from T columns k0..k0+bs-1
+    -- These are T[i, k] for i > k+1, k in [k0..k0+bs-1]
+    -- Also save subdiagonal entries T[k+1, k] = mu
+    let !hvSize = bs * nn  -- upper bound for storage
+    mbaHvSave <- newByteArray (hvSize * 8)
+    forM_ [0..bs-1] $ \l -> do
+      let !k = k0 + l
+          !startRow = k + 1
+      forM_ [startRow..nn-1] $ \i -> do
+        val <- readRawD mbaT offT (i * nn + k)
+        writeRawD mbaHvSave 0 (l * nn + i) val
+      -- Also save T[k, k+1] (the upper subdiagonal)
+      when (k + 1 < nn) $ do
+        val <- readRawD mbaT offT (k * nn + (k + 1))
+        writeRawD mbaHvSave 0 (l * nn + k) val  -- reuse slot k < startRow
+
+    -- Build contiguous V_rem (remSize × bs) and W_rem (remSize × bs)
+    mbaVr <- newByteArray (remSize * bs * 8)
+    mbaWr <- newByteArray (remSize * bs * 8)
+    forM_ [0..remSize-1] $ \i ->
+      forM_ [0..bs-1] $ \j -> do
+        readRawD mbaVp 0 ((remStart + i) * bs + j) >>= writeRawD mbaVr 0 (i * bs + j)
+        readRawD mbaWp 0 ((remStart + i) * bs + j) >>= writeRawD mbaWr 0 (i * bs + j)
+
+    -- Build -W_rem^T and -V_rem^T (bs × remSize)
+    mbaNWrT <- newByteArray (bs * remSize * 8)
+    mbaNVrT <- newByteArray (bs * remSize * 8)
+    forM_ [0..remSize-1] $ \i ->
+      forM_ [0..bs-1] $ \j -> do
+        readRawD mbaWr 0 (i * bs + j) >>= \w -> writeRawD mbaNWrT 0 (j * remSize + i) (negate w)
+        readRawD mbaVr 0 (i * bs + j) >>= \v -> writeRawD mbaNVrT 0 (j * remSize + i) (negate v)
+
+    -- Copy T_rem to contiguous temp
+    mbaRem <- newByteArray (remSize * remSize * 8)
+    forM_ [0..remSize-1] $ \i ->
+      forM_ [0..remSize-1] $ \j ->
+        readRawD mbaT offT ((remStart + i) * nn + (remStart + j))
+          >>= writeRawD mbaRem 0 (i * remSize + j)
+
+    -- GEMM: rem += V_rem * (-W_rem^T) + W_rem * (-V_rem^T)
+    baVr <- unsafeFreezeByteArray mbaVr
+    baNWrT <- unsafeFreezeByteArray mbaNWrT
+    rawGemmKernel baVr 0 baNWrT 0 mbaRem 0 remSize bs remSize
+    baWr <- unsafeFreezeByteArray mbaWr
+    baNVrT <- unsafeFreezeByteArray mbaNVrT
+    rawGemmKernel baWr 0 baNVrT 0 mbaRem 0 remSize bs remSize
+
+    -- Copy back to T
+    forM_ [0..remSize-1] $ \i ->
+      forM_ [0..remSize-1] $ \j ->
+        readRawD mbaRem 0 (i * remSize + j)
+          >>= writeRawD mbaT offT ((remStart + i) * nn + (remStart + j))
+
+    -- Restore saved Householder vectors and subdiagonal entries
+    forM_ [0..bs-1] $ \l -> do
+      let !k = k0 + l
+          !startRow = k + 1
+      forM_ [startRow..nn-1] $ \i -> do
+        val <- readRawD mbaHvSave 0 (l * nn + i)
+        writeRawD mbaT offT (i * nn + k) val
+      when (k + 1 < nn) $ do
+        val <- readRawD mbaHvSave 0 (l * nn + k)
+        writeRawD mbaT offT (k * nn + (k + 1)) val
+
+  pure betas
+  where
+    go !j !acc
+      | j >= bs = pure (reverse acc)
+      | otherwise = do
+          let !k = k0 + j
+              !subSize = nn - k - 1
+
+          -- Step 1: Read corrected column. T is ORIGINAL (no rank-2 updates applied).
+          -- corrected_col[i] = T[i+k+1, k] - Σ_l (V[i+k+1,l]*W[k,l] + W[i+k+1,l]*V[k,l])
+          forM_ [0..subSize-1] $ \i -> do
+            tik <- readRawD mbaT offT ((k+1+i)*nn + k)
+            if j == 0
+              then writeRawD mbaP 0 i tik
+              else do
+                let corrLoop !l !accC
+                      | l >= j = pure accC
+                      | otherwise = do
+                          vp_il <- readRawD mbaVp 0 ((k+1+i) * bs + l)
+                          wp_kl <- readRawD mbaWp 0 (k * bs + l)
+                          wp_il <- readRawD mbaWp 0 ((k+1+i) * bs + l)
+                          vp_kl <- readRawD mbaVp 0 (k * bs + l)
+                          corrLoop (l+1) (accC + vp_il * wp_kl + wp_il * vp_kl)
+                corr <- corrLoop 0 0
+                writeRawD mbaP 0 i (tik - corr)
+
+          -- Step 2: Householder from corrected column
+          x0 <- readRawD mbaP 0 0
+          sigma <- do
+            let sigLoop !i !acc_
+                  | i >= subSize = pure acc_
+                  | otherwise = do
+                      ci <- readRawD mbaP 0 i
+                      sigLoop (i+1) (acc_ + ci * ci)
+            sigLoop 1 0
+          if sigma == 0 && x0 >= 0
+            then do
+              forM_ [0..nn-1] $ \i -> do
+                writeRawD mbaVp 0 (i * bs + j) 0
+                writeRawD mbaWp 0 (i * bs + j) 0
+              go (j+1) (0 : acc)
+            else do
+              let mu = sqrt (x0 * x0 + sigma)
+                  v0 = if x0 <= 0 then x0 - mu else -sigma / (x0 + mu)
+                  beta = 2 * v0 * v0 / (sigma + v0 * v0)
+
+              writeRawD mbaV 0 0 1.0
+              forM_ [1..subSize-1] $ \i -> do
+                ci <- readRawD mbaP 0 i
+                writeRawD mbaV 0 i (ci / v0)
+
+              -- Step 3: p = beta * T * v (using ORIGINAL T, then correct via V,W)
+              rawMutSymMatvecSub mbaT offT nn mbaV 0 mbaP 0 (k+1) nn
+              forM_ [0..subSize-1] $ \i -> do
+                pi_ <- readRawD mbaP 0 i
+                writeRawD mbaP 0 i (beta * pi_)
+
+              -- Step 4: Full V,W correction.
+              -- p -= beta * (V_sub*(W_sub^T*v) + W_sub*(V_sub^T*v))
+              -- where V_sub = V_panel[k+1:nn-1, 0:j-1], W_sub = W_panel[k+1:nn-1, 0:j-1]
+              when (j > 0) $ do
+                forM_ [0..j-1] $ \l -> do
+                  let dotW !idx !accW
+                        | idx >= subSize = pure accW
+                        | otherwise = do
+                            wp <- readRawD mbaWp 0 ((k+1+idx) * bs + l)
+                            vi <- readRawD mbaV 0 idx
+                            dotW (idx+1) (accW + wp * vi)
+                  z1 <- dotW 0 0
+
+                  let dotV !idx !accV
+                        | idx >= subSize = pure accV
+                        | otherwise = do
+                            vp <- readRawD mbaVp 0 ((k+1+idx) * bs + l)
+                            vi <- readRawD mbaV 0 idx
+                            dotV (idx+1) (accV + vp * vi)
+                  z2 <- dotV 0 0
+
+                  forM_ [0..subSize-1] $ \i -> do
+                    vp_il <- readRawD mbaVp 0 ((k+1+i) * bs + l)
+                    wp_il <- readRawD mbaWp 0 ((k+1+i) * bs + l)
+                    pi_ <- readRawD mbaP 0 i
+                    writeRawD mbaP 0 i (pi_ - beta * (vp_il * z1 + wp_il * z2))
+
+              -- Step 5: w = p - alpha*v
+              ptv <- mutDotVec mbaP 0 mbaV 0 subSize
+              let alpha_ = beta * ptv / 2
+              forM_ [0..subSize-1] $ \i -> do
+                pi_ <- readRawD mbaP 0 i
+                vi  <- readRawD mbaV 0 i
+                writeRawD mbaW 0 i (pi_ - alpha_ * vi)
+
+              -- Step 6: Store v,w in panels
+              forM_ [0..k] $ \i -> do
+                writeRawD mbaVp 0 (i * bs + j) 0
+                writeRawD mbaWp 0 (i * bs + j) 0
+              forM_ [0..subSize-1] $ \i -> do
+                readRawD mbaV 0 i >>= writeRawD mbaVp 0 ((k+1+i) * bs + j)
+                readRawD mbaW 0 i >>= writeRawD mbaWp 0 ((k+1+i) * bs + j)
+
+              -- Step 7: Store Householder vector in T (for Q accumulation)
+              forM_ [1..subSize-1] $ \i ->
+                readRawD mbaV 0 i >>= writeRawD mbaT offT ((k+1+i)*nn + k)
+
+              -- Step 8: Set subdiagonal
+              writeRawD mbaT offT ((k+1)*nn + k) mu
+              writeRawD mbaT offT (k*nn + (k+1)) mu
+
+              go (j+1) (beta : acc)
 
 -- | Dot product of two mutable vectors.
 mutDotVec :: MutableByteArray s -> Int -> MutableByteArray s -> Int -> Int -> ST s Double

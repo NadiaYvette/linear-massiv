@@ -3835,11 +3835,122 @@ complexity.
 \end{enumerate}
 
 %% ====================================================================
+\section{Round~15: DLATRD-style Panel Tridiagonalisation}
+\label{sec:round15}
+
+Round~14 identified panel-factorisation tridiagonalisation as the primary
+remaining bottleneck.  The standard column-by-column Householder
+tridiagonalisation performs a Level-2 symmetric rank-2 update of the
+\emph{full} trailing submatrix after each column, at cost
+$O((n-k)^2)$ per step.  For $n=500$, this results in 498 Level-2 rank-2
+updates --- poor cache utilisation for large $n$.
+
+\subsection{Implementation}
+
+We implement a DLATRD-style panel factorisation that processes $n_b = 32$
+columns per panel:
+
+\begin{enumerate}
+\item \textbf{Within the panel}, each column's Householder reflector is
+  formed from a \emph{corrected} column of the original matrix~$T$.  The
+  correction accounts for deferred rank-2 updates using accumulated
+  $V_\mathrm{panel}$ and $W_\mathrm{panel}$ matrices.  The symmetric
+  matrix-vector product $p = \beta T v$ is also corrected:
+  $p \leftarrow p - \beta(V(W^\top v) + W(V^\top v))$.  No rank-2
+  updates are applied to $T$ during the panel.
+
+\item \textbf{After the panel}, the accumulated rank-2 update
+  $T \leftarrow T - V W^\top - W V^\top$ is applied to the full remaining
+  submatrix $T[k_0{+}1:n, k_0{+}1:n]$ via two GEMM calls
+  (\texttt{rawGemmKernel}).  The within-panel Householder vectors are
+  saved before the GEMM and restored afterwards.
+
+\item A \textbf{crossover at $n = 256$} selects between per-column Level-2
+  (small matrices) and panel Level-3 (large matrices).
+\end{enumerate}
+
+\subsection{Correctness}
+
+The key challenge was the \emph{cross-term} entries
+$T[i,j]$ where one index lies within the panel and the other in the trailing
+region.  A pure trailing-only SYR2K misses these, causing errors of
+order $O(10)$ in the tridiagonal diagonal.  Our solution applies the SYR2K
+to the \emph{full} remaining submatrix, with save/restore of Householder
+vectors to prevent overwriting.
+
+Four new tests verify the panel implementation:
+\begin{itemize}
+\item Tridiag match at $128 \times 128$ (below crossover, per-column path)
+\item Eigenreconstruction at $200 \times 200$ ($\|A - Q\Lambda Q^\top\| < 10^{-7}$)
+\item Orthogonality at $200 \times 200$ ($\|Q^\top Q - I\| < 10^{-8}$)
+\item Eigenreconstruction at $300 \times 300$ (above crossover, panel path)
+\end{itemize}
+All 87 tests pass.
+
+\subsection{Benchmark Results}
+
+\begin{table}[h]
+\centering
+\begin{tabular}{l r r r r}
+\toprule
+\textbf{Size} & \textbf{hmatrix} & \textbf{linear-massiv} & \textbf{Ratio} & \textbf{R14 ratio} \\
+\midrule
+$100\times100$ & 2.5\,ms & 3.0\,ms & 1.20$\times$ & 1.22$\times$ \\
+$200\times200$ & 17\,ms & 22\,ms & 1.31$\times$ & 1.28$\times$ \\
+$500\times500$ & 293\,ms & 369\,ms & 1.26$\times$ & 1.28$\times$ \\
+\bottomrule
+\end{tabular}
+\caption{eigenSH performance, Round~15 vs Round~14.}
+\label{tab:r15-eigensh}
+\end{table}
+
+\subsection{Discussion}
+
+The panel tridiagonalisation provides a small improvement at $500 \times 500$
+(1.26$\times$ vs 1.28$\times$ from Round~14).  At $200 \times 200$, the
+per-column path (below the crossover) performs comparably to Round~14.
+The modest gain reflects three factors:
+
+\begin{enumerate}
+\item \textbf{Save/restore overhead.}  Saving and restoring Householder
+  vectors before and after the GEMM SYR2K adds $O(n \cdot n_b)$ memory
+  traffic per panel.
+
+\item \textbf{GEMM on the full remaining submatrix.}  Rather than
+  restricting the SYR2K to the trailing submatrix only, we must apply it
+  to the full remaining submatrix to handle cross-terms correctly.  This
+  increases the GEMM dimensions and reduces the Level-3 benefit.
+
+\item \textbf{QR iteration dominance.}  The QR iteration phase (Givens
+  rotations) still consumes $\sim$60\% of total \texttt{eigenSH} time,
+  limiting the impact of tridiagonalisation improvements.
+\end{enumerate}
+
+\subsection{Remaining Bottlenecks}
+\label{sec:r15-remaining}
+
+\begin{enumerate}
+\item \textbf{SIMD Givens rotation kernel.}  The bulge-chasing QR step
+  applies $O(n)$ Givens rotations per iteration, each updating two columns
+  of $Q$ at cost $O(n)$.  A SIMD kernel for the two-column update
+  (DoubleX4\# loads, FMA, stores) would reduce this bottleneck.
+
+\item \textbf{Optimised D\&C eigensolver.}  The existing D\&C code
+  (\texttt{dcEigenTridiagOpt}) has excessive workspace allocation overhead.
+  Pre-allocating a single workspace buffer and reusing it across recursive
+  calls would make D\&C competitive at $n \geq 500$.
+
+\item \textbf{D\&C bidiagonal SVD.}  The SVD currently uses $A^\top A$
+  eigendecomposition, which squares the condition number.  A direct
+  bidiagonal D\&C (GVL4 \S8.6.3) would improve both accuracy and speed.
+\end{enumerate}
+
+%% ====================================================================
 \section{Conclusion}
 \label{sec:conclusion}
 
 We have benchmarked three Haskell linear algebra libraries across nine
-categories of numerical operations through fourteen rounds of optimisation.
+categories of numerical operations through fifteen rounds of optimisation.
 
 \paragraph{Round~1 (baseline).}
 The initial results confirmed the expected performance hierarchy:

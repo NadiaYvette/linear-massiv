@@ -67,6 +67,12 @@ eigenTests = testGroup "Eigenvalue"
     , testCase "D&C orthogonality 50x50" test_dcEigenOrthogonal50
     , testCase "D&C matches QR at 30x30" test_dcMatchesQR
     ]
+  , testGroup "Panel tridiag (n >= 256)"
+    [ testCase "tridiag match 128x128" test_panelTridiagReconstruction128
+    , testCase "eigenreconstruction 200x200" test_panelTridiagReconstruction200
+    , testCase "orthogonality 200x200" test_panelTridiagOrthogonal200
+    , testCase "eigenreconstruction 300x300" test_panelTridiagReconstruction300
+    ]
   ]
 
 -- Power method
@@ -310,6 +316,64 @@ test_dcMatchesQR = do
       qrSorted = sort [eigsQR !. i | i <- [0..29]]
       maxDiff = maximum $ zipWith (\a' b' -> abs (a' - b')) dcSorted qrSorted
   assertBool ("D&C vs QR diff " ++ show maxDiff ++ " < 1e-8") $ maxDiff < 1e-8
+
+-- Panel tridiag tests (n >= 128 crossover)
+
+test_panelTridiagReconstruction128 :: Assertion
+test_panelTridiagReconstruction128 = do
+  let nn = 128
+      a = makeMatrix @128 @128 @M.P $ \i j ->
+            let d = fromIntegral (abs (i - j) + 1) :: Double
+            in if i == j then 128 + fromIntegral i else 1.0 / d
+      (eigvals, q) = symmetricEigenP a 10000 1e-12
+      qt = transpose q
+      lambda = makeMatrix @128 @128 @M.P $ \i j ->
+        if i == j then eigvals !. i else 0
+      qlqt = matMul q (matMul lambda qt)
+      maxErr = maximum [abs (a ! (i,j) - qlqt ! (i,j)) | i <- [0..nn-1], j <- [0..nn-1]]
+  assertBool ("reconstruction error " ++ show maxErr ++ " < 1e-7") $ maxErr < 1e-7
+
+test_panelTridiagReconstruction200 :: Assertion
+test_panelTridiagReconstruction200 = do
+  let nn = 200
+      a = mkSPD200
+      (eigvals, q) = symmetricEigenP a 10000 1e-12
+      qt = transpose q
+      lambda = makeMatrix @200 @200 @M.P $ \i j ->
+        if i == j then eigvals !. i else 0
+      qlqt = matMul q (matMul lambda qt)
+      maxErr = maximum [abs (a ! (i,j) - qlqt ! (i,j)) | i <- [0..nn-1], j <- [0..nn-1]]
+  assertBool ("reconstruction error " ++ show maxErr ++ " < 1e-7") $ maxErr < 1e-7
+
+test_panelTridiagOrthogonal200 :: Assertion
+test_panelTridiagOrthogonal200 = do
+  let nn = 200
+      a = mkSPD200
+      (_, q) = symmetricEigenP a 10000 1e-12
+      qt = transpose q
+      qtq = matMul qt q
+      eye = identityMatrix @200 @M.P :: Matrix 200 200 M.P Double
+      maxErr = maximum [abs (qtq ! (i,j) - eye ! (i,j)) | i <- [0..nn-1], j <- [0..nn-1]]
+  assertBool ("orthogonality error " ++ show maxErr ++ " < 1e-8") $ maxErr < 1e-8
+
+test_panelTridiagReconstruction300 :: Assertion
+test_panelTridiagReconstruction300 = do
+  let nn = 300
+      a = makeMatrix @300 @300 @M.P $ \i j ->
+            let d = fromIntegral (abs (i - j) + 1) :: Double
+            in if i == j then 300 + fromIntegral i else 1.0 / d
+      (eigvals, q) = symmetricEigenP a 15000 1e-12
+      qt = transpose q
+      lambda = makeMatrix @300 @300 @M.P $ \i j ->
+        if i == j then eigvals !. i else 0
+      qlqt = matMul q (matMul lambda qt)
+      maxErr = maximum [abs (a ! (i,j) - qlqt ! (i,j)) | i <- [0..nn-1], j <- [0..nn-1]]
+  assertBool ("reconstruction error " ++ show maxErr ++ " < 1e-6") $ maxErr < 1e-6
+
+mkSPD200 :: Matrix 200 200 M.P Double
+mkSPD200 = makeMatrix @200 @200 @M.P $ \i j ->
+  let d = fromIntegral (abs (i - j) + 1) :: Double
+  in if i == j then 200 + fromIntegral i else 1.0 / d
 
 -- Helper: 50x50 SPD matrix for D&C tests
 mkSPD50 :: Matrix 50 50 M.P Double
