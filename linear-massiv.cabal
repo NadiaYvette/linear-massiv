@@ -7,6 +7,11 @@ description:
   "Matrix Computations" (4th ed.) using massiv arrays as the backing store,
   with compile-time dimensional conformance via GHC type-level naturals.
   Extends the linear library's typeclasses for integration with existing code.
+  .
+  Co-authored by Claude Opus (Anthropic). This code should be considered a
+  derived work of the various algorithmic examples and reference
+  implementations drawn upon during development, including but not limited
+  to LAPACK, OpenBLAS, and GVL4.
 license:       BSD-3-Clause
 build-type:    Simple
 

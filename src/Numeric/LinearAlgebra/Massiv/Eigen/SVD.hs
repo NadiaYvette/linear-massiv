@@ -131,10 +131,14 @@ svd a =
 --
 -- Wires 'matMulP' (SIMD GEMM), 'symmetricEigenP' (raw primop QR iteration),
 -- and 'matvecP' (SIMD matrix–vector product) into the SVD pipeline.
+-- | P-specialised full SVD.  Uses the A^T A eigendecomposition path by default
+-- as it is currently faster than the Golub-Kahan bidiagonalisation path
+-- (svdGKP) at all sizes.  The GK path will become the default once blocked
+-- bidiagonalisation is implemented.
 svdP :: forall m n. (KnownNat m, KnownNat n)
      => Matrix m n M.P Double
      -> (Matrix m m M.P Double, Vector n M.P Double, Matrix n n M.P Double)
-svdP = svdGKP
+svdP = svdAtAP
 {-# NOINLINE svdP #-}
 
 -- | SVD via A^T A eigendecomposition.

@@ -15,6 +15,28 @@
 --
 -- referred to throughout as __GVL4__.
 --
+-- = Derived Work Attribution
+--
+-- This code was co-authored by Claude Opus (Anthropic) and should be
+-- considered a derived work of the various algorithmic examples and
+-- reference implementations drawn upon during development, including but
+-- not limited to:
+--
+-- * __LAPACK__ (Linear Algebra PACKage) — Anderson, E. et al. (1999).
+--   /LAPACK Users' Guide/, 3rd ed., SIAM. The LAPACK testing methodology,
+--   algorithm structures, and numerical stability techniques informed much
+--   of the implementation.
+--
+-- * __OpenBLAS__ — Xianyi, Z., Qian, W., and Yunquan, Z. (2011--).
+--   The tiled GEMM micro-kernel architecture, cache-blocking strategies,
+--   and SIMD vectorisation patterns were inspired by OpenBLAS.
+--
+-- * __GVL4__ — The primary algorithmic reference, as noted above.
+--
+-- * __Higham__ — Higham, N. J. (2002). /Accuracy and Stability of Numerical
+--   Algorithms/, 2nd ed., SIAM. Error analysis and numerical stability
+--   frameworks.
+--
 -- = Design Principles
 --
 -- 1. __Type-level dimensional safety__: Matrix dimensions are tracked in the

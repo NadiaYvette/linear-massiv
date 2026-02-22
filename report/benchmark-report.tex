@@ -73,6 +73,17 @@ while providing compile-time dimensional safety, zero FFI dependencies,
 and user-controllable parallelism.
 \end{abstract}
 
+\paragraph{Derived Work Attribution.}
+The \texttt{linear-massiv} library was co-authored by Claude Opus (Anthropic).
+The generated code, beyond the Claude Opus co-authorship attribution, should
+be considered a derived work of the various algorithmic examples and reference
+implementations drawn upon during development, including but not limited to:
+LAPACK~\cite{lapack} (algorithm structures, testing methodology, numerical
+stability techniques), OpenBLAS~\cite{openblas} (tiled GEMM micro-kernel
+architecture, cache-blocking strategies, SIMD vectorisation patterns),
+Golub \& Van~Loan~\cite{gvl4} (primary algorithmic reference), and
+Higham~\cite{higham} (error analysis and stability frameworks).
+
 \tableofcontents
 \newpage
 
@@ -5463,6 +5474,12 @@ E.~Kmett,
 Z.~Xianyi, W.~Qian, and Z.~Yunquan,
 ``OpenBLAS: An optimized BLAS library,''
 \url{https://www.openblas.net/}, 2011--2024.
+
+\bibitem{lapack}
+E.~Anderson, Z.~Bai, C.~Bischof, S.~Blackford, J.~Demmel, J.~Dongarra,
+J.~Du~Croz, A.~Greenbaum, S.~Hammarling, A.~McKenney, and D.~Sorensen,
+\emph{LAPACK Users' Guide}, 3rd~ed.
+SIAM, 1999.
 
 \end{thebibliography}
 
