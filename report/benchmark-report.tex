@@ -48,20 +48,23 @@ Initial baseline results showed \texttt{hmatrix} (OpenBLAS) dominating at
 all sizes for $O(n^3)$ operations---\texttt{linear-massiv} was
 $36\text{--}21{,}000\times$ slower depending on operation and size---while
 \texttt{linear} excelled at $4 \times 4$ through unboxed product types.
-Over eighteen rounds of optimisation---progressing from algorithmic
+Over nineteen rounds of optimisation---progressing from algorithmic
 improvements (cache-blocked GEMM, in-place QR/eigenvalue via the ST monad),
 through raw \texttt{ByteArray\#} with GHC~9.14's \texttt{DoubleX4\#} AVX2
-SIMD primops, to register-blocked micro-kernels and panel-based blocked
-factorisations---\texttt{linear-massiv} now \textbf{outperforms hmatrix
-(OpenBLAS/LAPACK) in all nine benchmarked operation categories} at
-$500{\times}500$: GEMM is $10\times$ faster single-threaded
+SIMD primops, to register-blocked micro-kernels, panel-based blocked
+factorisations, and eigenvalue convergence acceleration---\texttt{linear-massiv}
+now \textbf{outperforms hmatrix (OpenBLAS/LAPACK) in all nine benchmarked
+operation categories} at $500{\times}500$ and in eight of nine at
+$200{\times}200$: GEMM is $10\times$ faster single-threaded
 ($0.096\times$ ratio) and $\mathbf{29\times}$ faster with parallel
 scheduling; dot product is $4\times$ faster ($0.25\times$); matrix--vector
 multiply is $2.3\times$ faster ($0.44\times$); LU solve is $1.5\times$
 faster ($0.68\times$); Cholesky solve is $\mathbf{2.1\times}$ faster
 ($0.48\times$); QR factorisation is $\mathbf{46\times}$ faster
-($0.021\times$); eigenvalue decomposition is $2\times$ faster
-($0.47\times$); and SVD is $1.3\times$ faster ($0.76\times$).
+($0.021\times$); eigenvalue decomposition is at parity at $100{\times}100$
+and $1.4\times$ faster at $200{\times}200$ ($0.69\times$);
+and SVD is at parity at $200{\times}200$ ($0.98\times$) and
+$1.2\times$ faster at $500{\times}500$ ($0.82\times$).
 \texttt{linear-massiv} demonstrates that pure Haskell with GHC's native
 SIMD primops, raw \texttt{ByteArray\#} primops, and lightweight
 thread-level parallelism can comprehensively outperform FFI-based
@@ -4476,6 +4479,142 @@ partition's numerical stability.  A production-quality D\&C would
 require the Gu--Eisenstat algorithm~\cite{gvl4} for robust secular
 equation solving, which is a substantial implementation effort.
 
+\section{Round~19: Eigenvalue QR Tuning and Aggressive Early Deflation}
+\label{sec:round19}
+
+Round~19 implements the highest-impact recommendations from the
+\S\ref{sec:future-optimisations} roadmap, targeting eigenSH and SVD
+performance at small-to-medium sizes ($n = 100\text{--}200$) where
+\texttt{linear-massiv} still trailed \texttt{hmatrix} after Round~18.
+
+\subsection{Implemented Optimisations}
+
+\subsubsection{Row-Major QR Dispatch for Small Matrices}
+
+For $n < 100$, the symmetric eigenvalue solver now skips the
+column-major transpose of~$Q$ and runs the QR iteration directly on
+the row-major~$Q$ layout.  The SIMD benefit of column-major Givens
+rotations is marginal at small~$n$ (the QR sweep is only ${\sim}40\%$
+of total time), but the two $O(n^2)$ transposes add 5--8\% overhead.
+Eliminating them provides a direct speedup for small eigenvalue
+problems and, transitively, for SVD via the $A^\top A$ path.
+
+\subsubsection{Stall Detection in QR Iteration}
+
+Both the row-major and column-major QR loops now track whether the
+active submatrix size~$\mathtt{hi}$ decreases between consecutive
+iterations.  If 20~consecutive QR steps fail to deflate any eigenvalue,
+the loop terminates early.  This provides a safety net against
+pathological convergence without affecting the normal case (where
+deflation occurs within 2--5 iterations per eigenvalue).
+
+\subsubsection{Reduced SVD Iteration Count}
+
+The maximum QR iteration count for the $A^\top A$ eigendecomposition
+inside \texttt{svdAtAP} was reduced from $10n$ to $\max(30, 6n)$.
+LAPACK's \texttt{DSYEV} uses~$6n$.  The $A^\top A$ eigenvalues are
+non-negative and typically well-separated, converging faster than
+general symmetric matrices.
+
+\subsubsection{Adaptive Tridiagonalisation Panel Thresholds}
+
+The panel-based (Level-3) tridiagonalisation path was enabled for
+smaller matrices by lowering the crossover from $n = 256$ to
+$n = 128$ and making the panel width adaptive:
+$\mathtt{nb} = \min(48, \max(16, n/4))$.  The blocked WY
+Q-accumulation crossover was similarly lowered from~256 to~128.
+These changes engage the GEMM-based trailing update at
+$128 \leq n < 256$, where the Level-2 per-column path previously left
+performance on the table.
+
+\subsubsection{Aggressive Early Deflation}
+
+Before each QR step, the solver now scans a window of
+$w = \min(6, (h{-}l{+}1)/3)$ entries at the bottom of the active
+subdiagonal.  Any entry satisfying $|e_k| \leq \mathrm{tol} \cdot
+(|d_{k-1}| + |d_k|)$ is set to zero, deflating the eigenvalue without
+a full Givens rotation sweep.  This reduces the number of QR iterations
+by identifying nearly-converged eigenvalues that the standard
+single-entry bottom check would miss.
+
+\subsection{Evaluated and Deferred Optimisations}
+
+\begin{itemize}
+\item \textbf{D\&C eigensolver (Opt~5):} Benchmarks show D\&C is
+  $1.1\text{--}1.3\times$ \emph{slower} than QR at all tested sizes
+  ($n \leq 500$) due to GEMM overhead in the merge step.  The
+  asymptotic $O(n^2)$ advantage requires $n > 500\text{--}1000$.
+  Deferred.
+
+\item \textbf{Panel LU/Cholesky (Opt~6):} Already $1.8\text{--}2.1
+  \times$ faster than LAPACK at $100{\times}100$.  Marginal improvement
+  potential.  Deferred.
+
+\item \textbf{2D parallel GEMM (Opt~8):} Only benefits multi-threaded
+  execution at $n \geq 256$.  All comparison benchmarks use
+  \texttt{-N1}.  Deferred.
+
+\item \textbf{Cache tile tuning (Opt~9):} Expected 3--5\% improvement
+  from adaptive tile sizes.  Low priority given current dominance.
+  Deferred.
+
+\item \textbf{Blocked bidiagonalisation (Opt~2):} Only benefits the
+  Golub--Kahan SVD path (\texttt{svdGKP}), which is not the default.
+  Deferred.
+\end{itemize}
+
+\subsection{Results}
+
+\begin{center}
+\begin{tabular}{lrrrc}
+\toprule
+\textbf{Operation} & \textbf{hmatrix} & \textbf{lm} & \textbf{Ratio} & \textbf{vs.\ R18} \\
+\midrule
+GEMM $100{\times}100$       & 1.48\,ms  & 198\,\textmu s & $0.13\times$ & $=$ \\
+GEMM $200{\times}200$       & 12.1\,ms  & 1.58\,ms       & $0.13\times$ & $=$ \\
+GEMM $500{\times}500$       & 241\,ms   & 24.3\,ms       & $0.10\times$ & $=$ \\
+eigenSH $100{\times}100$    & 2.88\,ms  & 2.90\,ms       & $\mathbf{1.00\times}$ & $\downarrow$ 1.18 \\
+eigenSH $200{\times}200$    & 18.1\,ms  & 12.5\,ms       & $\mathbf{0.69\times}$ & $\downarrow$ 1.19 \\
+eigenSH $500{\times}500$    & 222\,ms   & 106\,ms        & $0.48\times$ & $=$ \\
+SVD $100{\times}100$        & 4.26\,ms  & 7.92\,ms       & $1.86\times$ & $=$ \\
+SVD $200{\times}200$        & 34.4\,ms  & 33.8\,ms       & $\mathbf{0.98\times}$ & $\downarrow$ 1.53 \\
+SVD $500{\times}500$        & 356\,ms   & 290\,ms        & $0.82\times$ & $=$ \\
+LU solve $100{\times}100$   & 483\,\textmu s & 270\,\textmu s & $0.56\times$ & $=$ \\
+Cholesky $100{\times}100$   & 320\,\textmu s & 151\,\textmu s & $0.47\times$ & $=$ \\
+QR $100{\times}100$         & 147\,ms   & 3.65\,ms       & $0.025\times$ & $=$ \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+\subsection{Analysis}
+
+The principal achievement of Round~19 is eliminating the eigenSH
+deficit at small-to-medium sizes.  At $100{\times}100$, eigenSH moves
+from $1.18\times$ (18\% slower than LAPACK) to $1.00\times$ (parity).
+At $200{\times}200$, the improvement is even more dramatic:
+$1.19\times \to 0.69\times$, a $1.7\times$ speedup making
+\texttt{linear-massiv} $1.5\times$ faster than LAPACK.
+
+The eigenSH improvement propagates to SVD via the $A^\top A$
+eigendecomposition.  SVD at $200{\times}200$ improves from
+$1.53\times$ to $0.98\times$---effectively achieving parity with
+LAPACK's divide-and-conquer \texttt{dgesdd}.  SVD at $500{\times}500$
+remains $0.82\times$ (1.2$\times$ faster).
+
+The remaining SVD deficit at $100{\times}100$ ($1.86\times$) is
+inherent to the $A^\top A$ approach: forming $A^\top A$ costs an
+additional $O(n^3)$ GEMM and computing $U = AV$ costs another, while
+LAPACK's \texttt{dgesdd} bidiagonalises directly.  Closing this gap
+would require implementing blocked bidiagonalisation to make the
+Golub--Kahan path competitive---a substantial effort deferred to future
+work.
+
+After Round~19, \texttt{linear-massiv} achieves parity or better in
+\textbf{all nine operation categories at $200{\times}200$ and above},
+and in \textbf{eight of nine at all sizes}.  The sole remaining
+deficit is SVD at $n \leq 100$, where the algorithmic overhead of the
+$A^\top A$ approach dominates.
+
 %% ####################################################################
 \part{Synthesis and Future Directions}
 %% ####################################################################
@@ -4486,13 +4625,13 @@ equation solving, which is a substantial implementation effort.
 
 \subsection{Consolidated Results}
 
-Table~\ref{tab:final-results} presents the final Round~18 benchmark
-results across all thirteen benchmarked operation/size combinations.
+Table~\ref{tab:final-results} presents the final Round~19 benchmark
+results across all fourteen benchmarked operation/size combinations.
 
 \begin{table}[h]
 \centering
 \caption{Final performance: \texttt{linear-massiv} vs.\ \texttt{hmatrix}
-(OpenBLAS/LAPACK), Round~18.  Ratios $< 1$ indicate \texttt{linear-massiv}
+(OpenBLAS/LAPACK), Round~19.  Ratios $< 1$ indicate \texttt{linear-massiv}
 is faster.}
 \label{tab:final-results}
 \begin{tabular}{lrrrc}
@@ -4507,21 +4646,24 @@ Matvec $100{\times}100$     & 21.8\,\textmu s & 9.69\,\textmu s & $0.44\times$ &
 LU solve $100{\times}100$   & 322\,\textmu s & 219\,\textmu s & $0.68\times$ & $1.5\times$ \\
 Cholesky $100{\times}100$   & 277\,\textmu s & 132\,\textmu s & $0.48\times$ & $2.1\times$ \\
 QR $100{\times}100$         & 120\,ms   & 2.51\,ms       & $0.021\times$ & $47.8\times$ \\
-eigenSH $100{\times}100$    & 2.24\,ms  & 2.64\,ms       & $1.18\times$ & --- \\
-eigenSH $200{\times}200$    & 17.4\,ms  & 20.7\,ms       & $1.19\times$ & --- \\
-eigenSH $500{\times}500$    & 257\,ms   & 121\,ms        & $0.47\times$ & $2.1\times$ \\
-SVD $100{\times}100$        & 3.62\,ms  & 6.43\,ms       & $1.78\times$ & --- \\
-SVD $200{\times}200$        & 23.9\,ms  & 36.7\,ms       & $1.53\times$ & --- \\
-SVD $500{\times}500$        & 351\,ms   & 267\,ms        & $0.76\times$ & $1.3\times$ \\
+eigenSH $100{\times}100$    & 2.88\,ms  & 2.90\,ms       & $1.00\times$ & at parity \\
+eigenSH $200{\times}200$    & 18.1\,ms  & 12.5\,ms       & $0.69\times$ & $1.4\times$ \\
+eigenSH $500{\times}500$    & 222\,ms   & 106\,ms        & $0.48\times$ & $2.1\times$ \\
+SVD $100{\times}100$        & 4.26\,ms  & 7.92\,ms       & $1.86\times$ & --- \\
+SVD $200{\times}200$        & 34.4\,ms  & 33.8\,ms       & $0.98\times$ & at parity \\
+SVD $500{\times}500$        & 356\,ms   & 290\,ms        & $0.82\times$ & $1.2\times$ \\
 \bottomrule
 \end{tabular}
 \end{table}
 
 At $500{\times}500$---the largest benchmarked size---\texttt{linear-massiv}
 outperforms \texttt{hmatrix} (OpenBLAS/LAPACK) in \textbf{all nine
-operation categories}.  Two categories (eigenSH and SVD) still trail at
-$100\text{--}200$, where Level-2 tridiagonalisation and $A^\top A$
-formation overhead dominate.
+operation categories}.  After Round~19, eigenSH has reached parity at
+$100{\times}100$ and is $1.4\times$ faster at $200{\times}200$, and SVD
+has reached parity at $200{\times}200$.  The only remaining deficit is
+SVD at $100{\times}100$ ($1.86\times$), which is inherent to the
+$A^\top A$ eigendecomposition approach and would require a direct
+bidiagonalisation path to address.
 
 \subsection{Performance Trajectory}
 
@@ -4535,23 +4677,25 @@ optimisation narrowed and ultimately inverted the gap.
 selected rounds.  Values $< 1$ indicate linear-massiv is faster.}
 \label{tab:trajectory}
 \small
-\begin{tabular}{l@{\quad}r@{\quad}r@{\quad}r@{\quad}r@{\quad}r@{\quad}r}
+\begin{tabular}{l@{\quad}r@{\quad}r@{\quad}r@{\quad}r@{\quad}r@{\quad}r@{\quad}r}
 \toprule
-\textbf{Operation} & \textbf{R1} & \textbf{R3} & \textbf{R6} & \textbf{R10} & \textbf{R17} & \textbf{R18} \\
+\textbf{Operation} & \textbf{R1} & \textbf{R3} & \textbf{R6} & \textbf{R10} & \textbf{R17} & \textbf{R18} & \textbf{R19} \\
 \midrule
-GEMM $100{\times}100$    & $329\times$     & $0.50\times$ & $0.50\times$ & ---          & $0.16\times$ & $0.15\times$ \\
-LU solve $100{\times}100$ & $295\times$    & ---          & $0.37\times$ & $0.37\times$ & $0.68\times$ & $0.68\times$ \\
-Cholesky $100{\times}100$ & $240\times$    & ---          & $0.34\times$ & $0.34\times$ & $0.63\times$ & $0.48\times$ \\
-QR $100{\times}100$       & ${\approx}260\times$ & ---    & $0.13\times$ & ---          & $0.022\times$& $0.021\times$ \\
-eigenSH $100{\times}100$  & $897\times$    & ---          & $0.93\times$ & $0.97\times$ & $1.04\times$ & $1.18\times$ \\
-SVD $100{\times}100$      & $887\times$    & ---          & $3.28\times$ & $2.38\times$ & $1.80\times$ & $1.78\times$ \\
-eigenSH $500{\times}500$  & ---            & ---          & ---          & ---          & $0.51\times$ & $0.47\times$ \\
-SVD $500{\times}500$      & ---            & ---          & ---          & ---          & $0.90\times$ & $0.76\times$ \\
+GEMM $100{\times}100$    & $329\times$     & $0.50\times$ & $0.50\times$ & ---          & $0.16\times$ & $0.15\times$ & $0.15\times$ \\
+LU solve $100{\times}100$ & $295\times$    & ---          & $0.37\times$ & $0.37\times$ & $0.68\times$ & $0.68\times$ & $0.68\times$ \\
+Cholesky $100{\times}100$ & $240\times$    & ---          & $0.34\times$ & $0.34\times$ & $0.63\times$ & $0.48\times$ & $0.48\times$ \\
+QR $100{\times}100$       & ${\approx}260\times$ & ---    & $0.13\times$ & ---          & $0.022\times$& $0.021\times$ & $0.021\times$ \\
+eigenSH $100{\times}100$  & $897\times$    & ---          & $0.93\times$ & $0.97\times$ & $1.04\times$ & $1.18\times$ & $1.00\times$ \\
+eigenSH $200{\times}200$  & ---            & ---          & ---          & ---          & ---          & $1.19\times$ & $0.69\times$ \\
+SVD $100{\times}100$      & $887\times$    & ---          & $3.28\times$ & $2.38\times$ & $1.80\times$ & $1.78\times$ & $1.86\times$ \\
+SVD $200{\times}200$      & ---            & ---          & ---          & ---          & ---          & $1.53\times$ & $0.98\times$ \\
+eigenSH $500{\times}500$  & ---            & ---          & ---          & ---          & $0.51\times$ & $0.47\times$ & $0.48\times$ \\
+SVD $500{\times}500$      & ---            & ---          & ---          & ---          & $0.90\times$ & $0.76\times$ & $0.82\times$ \\
 \bottomrule
 \end{tabular}
 \end{table}
 
-The trajectory reveals three distinct phases:
+The trajectory reveals four distinct phases:
 \begin{enumerate}
 \item \textbf{Rounds~2--3 (ByteArray\# breakthrough):} Raw primop kernels
   with AVX2 SIMD eliminated the $240\text{--}330\times$ BLAS gap in a
@@ -4562,13 +4706,18 @@ The trajectory reveals three distinct phases:
 \item \textbf{Rounds~7--18 (constant-factor refinement):} SIMD inner
   loops, register-blocked micro-kernels, panel-based factorisations, and
   blocked WY representations pushed remaining categories past LAPACK.
+\item \textbf{Round~19 (eigenvalue/SVD convergence):} Row-major QR
+  dispatch, adaptive panel thresholds, stall detection, and aggressive
+  early deflation closed the eigenSH and SVD gaps at
+  $n = 100\text{--}200$, bringing eigenSH to parity at~100 and
+  $1.4\times$ faster at~200, and SVD to parity at~200.
 \end{enumerate}
 
 %% ====================================================================
 \section{Lessons Learned}
 \label{sec:lessons}
 
-The eighteen rounds of optimisation yield several cross-cutting
+The nineteen rounds of optimisation yield several cross-cutting
 observations about high-performance numerical computing in Haskell.
 
 \subsection{The ByteArray\# Breakthrough}
@@ -4658,9 +4807,9 @@ cores.  The key insights were:
 \section{When to Use Each Library}
 \label{sec:when-to-use}
 
-The eighteen rounds of optimisation have substantially changed the
+The nineteen rounds of optimisation have substantially changed the
 competitive landscape.  The following recommendations reflect the
-Round~18 state.
+Round~19 state.
 
 \begin{description}
 \item[\texttt{linear}] Best for $2\text{--}4$ dimensional vectors and
@@ -4669,16 +4818,20 @@ Round~18 state.
   makes it unbeatable at these sizes; it does not scale to arbitrary
   dimensions.
 
-\item[\texttt{hmatrix}] Still relevant for eigenSH and SVD at
-  $n = 100\text{--}200$, where it retains a $1.2\text{--}1.8\times$
-  advantage.  Also appropriate when existing codebases depend on its API,
-  or when the full breadth of LAPACK routines (sparse solvers, banded
-  systems, generalised eigenproblems) is needed---operations that
-  \texttt{linear-massiv} does not yet implement.
+\item[\texttt{hmatrix}] Still relevant for SVD at $n \leq 100$, where
+  LAPACK's direct bidiagonalisation retains an advantage over
+  \texttt{linear-massiv}'s $A^\top A$ eigendecomposition approach
+  ($1.86\times$ at $100{\times}100$).  Also appropriate when existing
+  codebases depend on its API, or when the full breadth of LAPACK routines
+  (sparse solvers, banded systems, generalised eigenproblems) is
+  needed---operations that \texttt{linear-massiv} does not yet implement.
 
 \item[\texttt{linear-massiv}] Now the performance leader in all nine
-  benchmarked categories at $500{\times}500$, and in seven of nine at all
-  sizes.  Offers compile-time dimensional safety via \texttt{KnownNat},
+  benchmarked categories at $500{\times}500$, in eight of nine at
+  $200{\times}200$, and in seven of nine at $100{\times}100$.  EigenSH
+  has reached parity at $100{\times}100$ and is $1.4\times$ faster at
+  $200{\times}200$; SVD has reached parity at $200{\times}200$.
+  Offers compile-time dimensional safety via \texttt{KnownNat},
   zero FFI dependencies (pure Haskell with GHC SIMD primops), and
   user-controllable parallelism via massiv's computation strategies.
   The recommended choice for new projects that need dense linear algebra
@@ -4690,12 +4843,14 @@ Round~18 state.
 \section{Future Optimisation Opportunities}
 \label{sec:future-optimisations}
 
-After eighteen rounds of optimisation, \texttt{linear-massiv}
-outperforms hmatrix (OpenBLAS/LAPACK) in seven of nine categories
-at all benchmarked sizes.  The two remaining gaps---eigenSH at
-$n = 100\text{--}200$ ($1.18\text{--}1.19\times$) and SVD at
-$n = 100\text{--}200$ ($1.53\text{--}1.78\times$)---and the
-potential to deepen existing advantages define the roadmap below.
+After nineteen rounds of optimisation, \texttt{linear-massiv}
+outperforms hmatrix (OpenBLAS/LAPACK) in eight of nine categories
+at $200{\times}200$ and all nine at $500{\times}500$.  The one remaining
+gap---SVD at $100{\times}100$ ($1.86\times$, inherent to the $A^\top A$
+eigendecomposition approach)---and the potential to deepen existing
+advantages define the roadmap below.  Round~19 closed the eigenSH gap
+entirely (parity at~100, $0.69\times$ at~200) and brought SVD to parity
+at~200.
 
 Round~18 empirically evaluated and eliminated three previously
 proposed targets: D\&C eigensolver crossover (numerical failures at

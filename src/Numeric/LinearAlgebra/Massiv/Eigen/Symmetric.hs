@@ -160,7 +160,7 @@ tridiagonalizeP a =
       -- Phase 1: In-place Householder tridiagonalisation
       -- For n < panelCrossover: per-column Level-2 (rank-2 update per step)
       -- For n >= panelCrossover: DLATRD-style panel factorisation (Level-3 SYR2K)
-      panelCrossover = 256
+      panelCrossover = 128
       (betaList, tArr) = M.withMArrayST (unMatrix a) $ \mt -> do
         let !mbaT = unwrapMutableByteArray mt
             !offT = unwrapMutableByteArrayOffset mt
@@ -172,7 +172,7 @@ tridiagonalizeP a =
             betas <- mapM (\k -> tridiagStepP mbaT offT nn mbaV mbaP mbaW k) [0..nn-3]
             pure betas
           else do
-            let !nb = 48
+            let !nb = min 48 (max 16 (nn `div` 4))
                 !numRef = nn - 2  -- number of Householder reflectors
             -- V_panel (nn × nb) and W_panel (nn × nb) for deferred rank-2 updates
             mbaVp <- newByteArray (nn * nb * 8)
@@ -210,7 +210,7 @@ tridiagonalizeP a =
         -- Set Q = I (SIMD zero + diagonal ones)
         rawZeroDoubles mbaQ offQ (nn * nn)
         forM_ [0..nn-1] $ \i -> writeRawD mbaQ offQ (i*nn+i) 1
-        if nn < 256
+        if nn < 128
           then
             -- Per-row approach: Q <- Q · H_k for k = 0..n-3
             forM_ (zip [0..] betaList) $ \(k, beta_k) ->
@@ -703,11 +703,15 @@ symmetricEigenP a maxIter tol
             !offSD = unwrapMutableByteArrayOffset msd
             !mbaQ  = unwrapMutableByteArray mq
             !offQ  = unwrapMutableByteArrayOffset mq
-        -- Column-major Q for SIMD Givens rotations
-        mbaQcm <- newByteArray (nn * nn * 8)
-        rawTransposeToColMajor mbaQ offQ mbaQcm 0 nn
-        rawTridiagQRLoopCM mbaD offD mbaSD offSD mbaQcm 0 nn maxIter tol
-        rawTransposeFromColMajor mbaQcm 0 mbaQ offQ nn
+        -- For small n: use row-major QR loop (avoids two O(n^2) transposes)
+        -- For large n: column-major Q for SIMD Givens rotations
+        if nn < 100
+          then rawTridiagQRLoop mbaD offD mbaSD offSD mbaQ offQ nn maxIter tol
+          else do
+            mbaQcm <- newByteArray (nn * nn * 8)
+            rawTransposeToColMajor mbaQ offQ mbaQcm 0 nn
+            rawTridiagQRLoopCM mbaD offD mbaSD offSD mbaQcm 0 nn maxIter tol
+            rawTransposeFromColMajor mbaQcm 0 mbaQ offQ nn
         dFrozen <- M.freezeS md
         pure (MkVector dFrozen)
   in (dArr, MkMatrix qArr)
@@ -896,10 +900,11 @@ rawTridiagQRLoop :: MutableByteArray s -> Int   -- ^ diagonal array + offset
                  -> MutableByteArray s -> Int   -- ^ subdiagonal array + offset
                  -> MutableByteArray s -> Int   -- ^ Q matrix + offset
                  -> Int -> Int -> Double -> ST s ()
-rawTridiagQRLoop mbaD offD mbaSD offSD mbaQ offQ nn maxIter tol = go 0 0 (nn - 1)
+rawTridiagQRLoop mbaD offD mbaSD offSD mbaQ offQ nn maxIter tol = go 0 0 (nn - 1) (nn - 1) (0 :: Int)
   where
-    go !iter !lo !hi
+    go !iter !lo !hi !lastHi !stall
       | iter >= maxIter = pure ()
+      | stall >= 20 = pure ()  -- bail if 20 consecutive steps fail to deflate
       | lo >= hi = pure ()
       | otherwise = do
           -- Bottom deflation
@@ -907,29 +912,60 @@ rawTridiagQRLoop mbaD offD mbaSD offSD mbaQ offQ nn maxIter tol = go 0 0 (nn - 1
           dhi1 <- readRawD mbaD offD (hi - 1)
           dhi  <- readRawD mbaD offD hi
           if abs sdhi <= tol * (abs dhi1 + abs dhi)
-            then do writeRawD mbaSD offSD (hi - 1) 0; go iter lo (hi - 1)
+            then do writeRawD mbaSD offSD (hi - 1) 0; go iter lo (hi - 1) hi 0
             else do
               -- Top deflation
               sdlo <- readRawD mbaSD offSD lo
               dlo  <- readRawD mbaD offD lo
               dlo1 <- readRawD mbaD offD (lo + 1)
               if abs sdlo <= tol * (abs dlo + abs dlo1)
-                then do writeRawD mbaSD offSD lo 0; go iter (lo + 1) hi
+                then do writeRawD mbaSD offSD lo 0; go iter (lo + 1) hi hi 0
                 else do
                   -- Interior deflation: find split point
                   split <- rawFindSplit mbaD offD mbaSD offSD lo hi tol
                   case split of
                     Just q -> do
                       writeRawD mbaSD offSD q 0
-                      go iter lo q
-                      go iter (q + 1) hi
+                      go iter lo q hi 0
+                      go iter (q + 1) hi hi 0
                     Nothing -> do
-                      let sp1 = sdhi
-                          delta = (dhi1 - dhi) / 2
-                          sgn = if delta >= 0 then 1 else -1
-                          shift = dhi - sp1*sp1 / (delta + sgn * sqrt (delta*delta + sp1*sp1))
-                      rawImplicitQRStep mbaD offD mbaSD offSD mbaQ offQ nn shift lo hi
-                      go (iter + 1) lo hi
+                      -- AED: scan bottom window before committing to a QR step
+                      newHi <- if hi - lo >= 6
+                        then rawAEDScan mbaD offD mbaSD offSD tol lo hi
+                        else pure hi
+                      if newHi < hi
+                        then go iter lo newHi hi 0  -- deflated without QR sweep
+                        else do
+                          let sp1 = sdhi
+                              delta = (dhi1 - dhi) / 2
+                              sgn = if delta >= 0 then 1 else -1
+                              shift = dhi - sp1*sp1 / (delta + sgn * sqrt (delta*delta + sp1*sp1))
+                          rawImplicitQRStep mbaD offD mbaSD offSD mbaQ offQ nn shift lo hi
+                          let !newStall = if hi == lastHi then stall + 1 else 0
+                          go (iter + 1) lo hi hi newStall
+
+-- | Aggressive Early Deflation: scan bottom w entries for negligible subdiagonals.
+-- Returns the new (possibly lower) hi. Deflates from the bottom up, setting
+-- negligible subdiagonal entries to zero.
+rawAEDScan :: MutableByteArray s -> Int -> MutableByteArray s -> Int
+           -> Double -> Int -> Int -> ST s Int
+rawAEDScan mbaD offD mbaSD offSD tol lo hi = scan hi
+  where
+    !w = min 6 ((hi - lo + 1) `div` 3)
+    !bottom = max (lo + 1) (hi - w)
+    scan !h
+      | h <= bottom = pure h
+      | otherwise = do
+          sdk <- readRawD mbaSD offSD (h - 1)
+          dk1 <- readRawD mbaD offD (h - 1)
+          dk  <- readRawD mbaD offD h
+          let !absdk1 = abs dk1
+              !absdk  = abs dk
+              !threshold = tol * (absdk1 + absdk)
+          if abs sdk <= threshold
+            then do writeRawD mbaSD offSD (h - 1) 0; scan (h - 1)
+            else pure h
+{-# INLINE rawAEDScan #-}
 
 -- | Raw primop interior split search.
 rawFindSplit :: MutableByteArray s -> Int -> MutableByteArray s -> Int
@@ -983,37 +1019,46 @@ rawTridiagQRLoopCM :: MutableByteArray s -> Int   -- ^ diagonal array + offset
                    -> MutableByteArray s -> Int   -- ^ subdiagonal array + offset
                    -> MutableByteArray s -> Int   -- ^ Q matrix (COLUMN-MAJOR) + offset
                    -> Int -> Int -> Double -> ST s ()
-rawTridiagQRLoopCM mbaD offD mbaSD offSD mbaQ offQ nn maxIter tol = go 0 0 (nn - 1)
+rawTridiagQRLoopCM mbaD offD mbaSD offSD mbaQ offQ nn maxIter tol = go 0 0 (nn - 1) (nn - 1) (0 :: Int)
   where
-    go !iter !lo !hi
+    go !iter !lo !hi !lastHi !stall
       | iter >= maxIter = pure ()
+      | stall >= 20 = pure ()  -- bail if 20 consecutive steps fail to deflate
       | lo >= hi = pure ()
       | otherwise = do
           sdhi <- readRawD mbaSD offSD (hi - 1)
           dhi1 <- readRawD mbaD offD (hi - 1)
           dhi  <- readRawD mbaD offD hi
           if abs sdhi <= tol * (abs dhi1 + abs dhi)
-            then do writeRawD mbaSD offSD (hi - 1) 0; go iter lo (hi - 1)
+            then do writeRawD mbaSD offSD (hi - 1) 0; go iter lo (hi - 1) hi 0
             else do
               sdlo <- readRawD mbaSD offSD lo
               dlo  <- readRawD mbaD offD lo
               dlo1 <- readRawD mbaD offD (lo + 1)
               if abs sdlo <= tol * (abs dlo + abs dlo1)
-                then do writeRawD mbaSD offSD lo 0; go iter (lo + 1) hi
+                then do writeRawD mbaSD offSD lo 0; go iter (lo + 1) hi hi 0
                 else do
                   split <- rawFindSplit mbaD offD mbaSD offSD lo hi tol
                   case split of
                     Just q -> do
                       writeRawD mbaSD offSD q 0
-                      go iter lo q
-                      go iter (q + 1) hi
+                      go iter lo q hi 0
+                      go iter (q + 1) hi hi 0
                     Nothing -> do
-                      let sp1 = sdhi
-                          delta = (dhi1 - dhi) / 2
-                          sgn = if delta >= 0 then 1 else -1
-                          shift = dhi - sp1*sp1 / (delta + sgn * sqrt (delta*delta + sp1*sp1))
-                      rawImplicitQRStepCM mbaD offD mbaSD offSD mbaQ offQ nn shift lo hi
-                      go (iter + 1) lo hi
+                      -- AED: scan bottom window before committing to a QR step
+                      newHi <- if hi - lo >= 6
+                        then rawAEDScan mbaD offD mbaSD offSD tol lo hi
+                        else pure hi
+                      if newHi < hi
+                        then go iter lo newHi hi 0  -- deflated without QR sweep
+                        else do
+                          let sp1 = sdhi
+                              delta = (dhi1 - dhi) / 2
+                              sgn = if delta >= 0 then 1 else -1
+                              shift = dhi - sp1*sp1 / (delta + sgn * sqrt (delta*delta + sp1*sp1))
+                          rawImplicitQRStepCM mbaD offD mbaSD offSD mbaQ offQ nn shift lo hi
+                      let !newStall = if hi == lastHi then stall + 1 else 0
+                      go (iter + 1) lo hi hi newStall
 
 -- | Column-major implicit QR step: same as rawImplicitQRStep but uses
 -- SIMD Givens on column-major Q layout.

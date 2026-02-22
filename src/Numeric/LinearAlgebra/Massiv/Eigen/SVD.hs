@@ -145,7 +145,7 @@ svdAtAP a =
       !nn = dimVal @n
       !ata = matMulAtAP a  -- n×n symmetric positive semidefinite, fast transpose + SIMD GEMM
       -- Eigendecomposition of AᵀA using raw primop QR iteration
-      (!eigvalsRaw, !vRaw) = symmetricEigenP ata (10 * nn) 1e-12
+      (!eigvalsRaw, !vRaw) = symmetricEigenP ata (max 30 (6 * nn)) 1e-12
       -- Sort eigenvalues descending; build O(1) permutation array
       !permList = map snd $ sortBy (\(a_,_) (b_,_) -> compare (Down a_) (Down b_))
                         [(eigvalsRaw !. i, i) | i <- [0..nn-1]]
