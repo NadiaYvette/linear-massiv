@@ -4105,247 +4105,242 @@ account for ${\sim}70\%$ of SVD time beyond eigenSH, and our GEMM
 is ${\sim}2\times$ slower than OpenBLAS for $500{\times}500$ square
 multiplies.
 
-\subsection{Future Optimisation Opportunities}
+\subsection{Future Optimisation Opportunities (Post Round~18)}
 \label{sec:future-optimisations}
 
-With all nine operation categories now outperforming hmatrix
-(OpenBLAS/LAPACK) at $500{\times}500$, the remaining optimisation
-targets focus on closing medium-size gaps (eigenSH at
-$1.04\text{--}1.18\times$ for $n = 100\text{--}200$; SVD at
-$1.80\times$ for $n = 200$) and deepening existing advantages.
-Ten concrete targets are presented below in three priority tiers.
+After eighteen rounds of optimisation, \texttt{linear-massiv}
+outperforms hmatrix (OpenBLAS/LAPACK) in seven of nine categories
+at all benchmarked sizes.  The two remaining gaps---eigenSH at
+$n = 100\text{--}200$ ($1.18\text{--}1.19\times$) and SVD at
+$n = 100\text{--}200$ ($1.53\text{--}1.78\times$)---and the
+potential to deepen existing advantages define the roadmap below.
 
-\subsubsection{1.\ Divide-and-Conquer Eigensolver Crossover Tuning}
-\label{sec:future-dc-crossover}
+Round~18 empirically evaluated and eliminated three previously
+proposed targets: D\&C eigensolver crossover (numerical failures at
+$n \geq 128$), GEMM $k$-loop unrolling (register spills, 20--30\%
+regression), and svdGKP as a drop-in replacement ($22\text{--}24\times$
+slower than svdAtAP).  The revised analysis below accounts for these
+findings and proposes nine concrete targets in three priority tiers.
+
+%% ------------------------------------------------------------------
+\subsubsection{1.\ Multi-Shift QR with Aggressive Early Deflation for eigenSH}
+\label{sec:future-multishift-qr}
 
 \paragraph{Current state.}
-A full divide-and-conquer (D\&C) tridiagonal eigensolver
-(\texttt{symmetricEigenPDC}, Symmetric.hs) is implemented and tested
-at small sizes ($10{\times}10$, $30{\times}30$, $50{\times}50$), with
-secular equation solver, GEMM-based merge, and deflation heuristics.
-However, the crossover threshold is set to $n = 100{,}000$
-(Symmetric.hs:714), effectively disabling D\&C for all practical
-matrix sizes.  At medium sizes ($n = 100\text{--}200$), eigenSH
-ratios are $1.04\text{--}1.18\times$---the narrowest remaining gap.
+The tridiagonal QR iteration (\texttt{rawTridiagQRLoopCM},
+Symmetric.hs) uses single-shift implicit Wilkinson shifts with one
+Givens bulge chase per step.  LAPACK's \texttt{DSTEQR} uses the same
+algorithm, but its Fortran implementation has tighter constant
+factors.  At $n = 100\text{--}200$, QR iteration accounts for
+${\sim}40\%$ of \texttt{eigenSH} time (the remainder being
+tridiagonalisation and Q~accumulation), and the current implementation
+requires ${\sim}5$ iterations per eigenvalue on average.
 
 \paragraph{Proposed optimisation.}
-Reduce \texttt{dcCrossover} to $50\text{--}100$, benchmark D\&C
-against QR at $n = 50, 100, 200, 500$, and select the crossover
-that minimises wall-clock time.  D\&C replaces Level-2 QR Givens
-rotations with Level-3 GEMM merges, which should favour the
-register-blocked GEMM micro-kernel.
+Implement multi-shift QR (2 or 4 shifts per step) following
+Francis's implicit double-shift algorithm~\cite{gvl4}, combined with
+\emph{aggressive early deflation} (AED)~\cite{gvl4}: after every few
+QR steps, scan the subdiagonal for entries within a factor of
+$\epsilon \|T\|_F$ of zero and deflate them via targeted Givens
+rotations before they converge to machine zero.  This reduces the
+average iterations per eigenvalue from ${\sim}5$ to ${\sim}2\text{--}3$.
 
 \paragraph{Expected impact.}
-$1.15\text{--}1.30\times$ improvement at $n = 100\text{--}200$,
-potentially pushing eigenSH below $1.0\times$ at all sizes.
+$1.3\text{--}1.5\times$ QR iteration speedup, translating to
+$1.12\text{--}1.20\times$ overall eigenSH improvement at
+$n = 100\text{--}200$.  Combined with other eigenSH optimisations,
+this targets bringing ratios below $1.0\times$.
 
 %% ------------------------------------------------------------------
 \subsubsection{2.\ Blocked Bidiagonalisation for SVD}
 \label{sec:future-blocked-bidiag}
 
 \paragraph{Current state.}
-\texttt{svdAtAP} (SVD.hs) forms $A^\top A$ explicitly via GEMM, then
+\texttt{svdAtAP} (SVD.hs) forms $A^\top A$ via GEMM, then
 eigendecomposes the $n{\times}n$ product.  This squares the condition
-number ($\kappa(A^\top A) = \kappa(A)^2$) and is ${\sim}2\times$ more
-FLOP-intensive than direct bidiagonalisation.  The Golub--Kahan
-implementation (\texttt{svdGKP}, SVD.hs) bidiagonalises $A$ directly
-but remains $15\text{--}33\times$ slower than \texttt{svdAtAP} due to
-per-element Householder accumulation.  SVD at $200{\times}200$ is
-$1.80\times$---the widest remaining gap.
+number ($\kappa(A^\top A) = \kappa(A)^2$) and requires two
+$O(n^3)$ phases.  The alternative \texttt{svdGKP} (SVD.hs:322)
+bidiagonalises~$A$ directly via Golub--Kahan, but Round~18 benchmarks
+confirmed it is $22\text{--}24\times$ slower due to per-element
+Householder accumulation (a Level-2 bottleneck).  SVD at
+$100{\times}100$ is $1.78\times$---the widest remaining gap.
 
 \paragraph{Proposed optimisation.}
-Apply the same panel-based blocked WY strategy that succeeded for
-eigenSH tridiagonalisation (\S\ref{sec:round16}) to the
-bidiagonalisation phase of \texttt{svdGKP}:
-
+Apply the panel-based blocked WY strategy from
+\texttt{panelTridiagP} (Symmetric.hs) to \texttt{svdGKP}'s
+bidiagonalisation:
 \begin{itemize}
-\item Pack $\mathtt{nb}$ left/right Householder vectors into panels,
-  compute T-factors via GEMM, and apply block reflectors via Level-3
-  GEMM.
-\item Model on \texttt{panelTridiagP} (Symmetric.hs), which already
-  implements DLATRD-style deferred updates.
+\item Pack $\mathtt{nb}$ left and right Householder vectors into
+  panels, compute T-factors via GEMM, and apply block reflectors
+  via Level-3 GEMM---converting the Level-2 bottleneck to Level-3.
 \item For the bidiagonal QR iteration phase, apply the SIMD Givens
-  column-major transpose strategy to both $U$ and $V$ simultaneously.
+  column-major transpose strategy to both $U$ and $V$, and
+  implement aggressive early deflation on the bidiagonal.
+\item Use a tighter convergence tolerance scaled by
+  $\|B\|_F$ rather than per-element thresholds.
 \end{itemize}
 
 \paragraph{Expected impact.}
-$1.5\text{--}2.0\times$ SVD improvement at medium sizes, potentially
-bringing the $200{\times}200$ ratio from $1.80\times$ to near parity.
+$1.5\text{--}2.5\times$ SVD improvement at medium sizes, potentially
+bringing SVD $100{\times}100$ from $1.78\times$ to ${\sim}0.7\text{--}1.0\times$.
 
 %% ------------------------------------------------------------------
-\subsubsection{3.\ Panel-Based LU and Cholesky Factorisation}
+\subsubsection{3.\ Scalar QR Path for Small eigenSH}
+\label{sec:future-scalar-qr}
+
+\paragraph{Current state.}
+\texttt{symmetricEigenP} (Symmetric.hs:706--710) transposes $Q$ to
+column-major, runs the SIMD Givens QR loop, then transposes back.
+The two $O(n^2)$ transposes add ${\sim}5\text{--}8\%$ overhead for
+$n = 100$, but the SIMD Givens benefit is marginal when QR
+iteration is only ${\sim}40\%$ of total time.
+
+\paragraph{Proposed optimisation.}
+Add a size-based dispatch: for $n < 100$, skip the column-major
+transpose and use a scalar Givens QR loop that operates directly on
+the row-major $Q$ matrix.  The scalar loop avoids the transpose
+overhead and SIMD setup costs, which dominate at small sizes.
+
+\paragraph{Expected impact.}
+$1.05\text{--}1.10\times$ eigenSH improvement at $n \leq 100$,
+directly targeting the $1.18\times$ ratio.
+
+%% ------------------------------------------------------------------
+\subsubsection{4.\ Reduced Iteration Count for svdAtAP}
+\label{sec:future-svd-maxiter}
+
+\paragraph{Current state.}
+\texttt{svdAtAP} (SVD.hs:148) calls \texttt{symmetricEigenP} with
+$\mathtt{maxIter} = 10n$ iterations.  For $n = 100$, this budgets
+1000~QR steps, but typical convergence requires ${\sim}5$ iterations
+per eigenvalue (${\sim}500$ total).  The excess budget wastes time
+on per-step convergence checks after all eigenvalues have converged.
+
+\paragraph{Proposed optimisation.}
+Reduce to $\mathtt{maxIter} = \max(20, 5n)$ with an early-exit check
+that terminates when the largest remaining subdiagonal entry is below
+the convergence tolerance.  For $n = 100$ this reduces the budget
+from 1000 to 500 while maintaining identical accuracy.  Additionally,
+scale the tolerance adaptively: $\mathtt{tol} = \max(10^{-14},
+10^{-12} \cdot \|A^\top A\|_F)$ to improve convergence for
+well-conditioned matrices.
+
+\paragraph{Expected impact.}
+$1.05\text{--}1.15\times$ SVD improvement from faster eigenSH
+convergence, cascading through the $A^\top A$ pipeline.
+
+%% ------------------------------------------------------------------
+\subsubsection{5.\ D\&C Eigensolver Numerical Stabilisation}
+\label{sec:future-dc-stable}
+
+\paragraph{Current state.}
+The divide-and-conquer eigensolver (\texttt{symmetricEigenPDC},
+Symmetric.hs:724) is implemented and tested at small sizes ($n \leq 50$)
+but produces reconstruction errors of $166\text{--}573$ at $n \geq 128$
+(Round~18).  The crossover remains at $n = 100{,}000$, effectively
+disabled.  D\&C's $O(n^2)$ average-case complexity (vs.\ QR's $O(n^3)$)
+makes it critical for large-matrix competitiveness.
+
+\paragraph{Proposed optimisation.}
+Rewrite the secular equation solver using the Gu--Eisenstat
+algorithm~\cite{gvl4}, which guarantees orthogonality of computed
+eigenvectors via careful root-finding with Gragg's fixed-weight
+formula and targeted reorthogonalisation.  Add mixed-precision
+accumulation (compensated summation) in the rank-1 merge.
+Re-enable D\&C at $n \geq 256$ after validation at $128$, $256$,
+$512$, and $1024$.
+
+\paragraph{Expected impact.}
+$1.3\text{--}1.8\times$ eigenSH improvement at $n \geq 256$,
+deepening the existing $0.47\times$ advantage at $500{\times}500$.
+Asymptotically dominant for $n \geq 1000$.
+
+%% ------------------------------------------------------------------
+\subsubsection{6.\ Panel-Based LU and Cholesky Factorisation}
 \label{sec:future-panel-lu-chol}
 
 \paragraph{Current state.}
 Both LU (LU.hs) and Cholesky (Cholesky.hs) use column-by-column
-factorisation---Level-2 BLAS operations.  Each column performs an
-$O(n)$ vector update and an $O(n)$ scalar division, yielding $O(n^2)$
-memory traffic per column and $O(n^3)$ total.  Current ratios are
-$0.68\times$ (LU) and $0.63\times$ (Cholesky) at $100{\times}100$.
+factorisation---Level-2 BLAS operations.  Current ratios are
+$0.68\times$ (LU) and $0.48\times$ (Cholesky) at $100{\times}100$,
+already faster than LAPACK.
 
 \paragraph{Proposed optimisation.}
 Implement LAPACK-style panel factorisation (DGETRF/DPOTRF):
-\begin{itemize}
-\item Factor a panel of $\mathtt{nb}$ columns via the existing
-  column-by-column kernel (Level-2).
-\item Apply updates to the trailing $(n - \mathtt{nb}) \times (n - \mathtt{nb})$
-  submatrix via GEMM (Level-3): TRSM for the panel solve,
-  then GEMM for the rank-$\mathtt{nb}$ update.
-\item The register-blocked GEMM micro-kernel makes Level-3 updates
-  $10\times$ faster than hmatrix, amplifying the benefit of promoting
-  work from Level-2 to Level-3.
-\end{itemize}
+factor a panel of $\mathtt{nb}$ columns via Level-2, then update the
+trailing submatrix via TRSM and rank-$\mathtt{nb}$ GEMM (Level-3).
+The $10\times$-faster GEMM micro-kernel amplifies the Level-2 to
+Level-3 promotion.
 
 \paragraph{Expected impact.}
 $1.3\text{--}1.5\times$ improvement at $n \geq 100$, deepening
-existing advantages.
+advantages to ${\sim}0.3\text{--}0.5\times$.
 
 %% ------------------------------------------------------------------
-\subsubsection{4.\ Golub--Kahan SVD Benchmarking}
-\label{sec:future-svdgkp-bench}
+\subsubsection{7.\ Adaptive Tridiagonalisation Panel Size}
+\label{sec:future-adaptive-panel}
 
 \paragraph{Current state.}
-\texttt{svdGKP} (SVD.hs:322) is a complete Golub--Kahan bidiagonal
-SVD implementation that avoids condition-number squaring, but is not
-benchmarked or exposed as the default.  With the Round~17 GEMM
-improvements cascading into the internal GEMM calls, \texttt{svdGKP}'s
-relative cost profile may have shifted.
+The tridiagonalisation panel size is fixed at $\mathtt{nb} = 48$
+(Symmetric.hs:175) with a crossover at $n = 256$ from per-column
+(Level-2) to panel (Level-3) mode.  For $n = 100\text{--}200$, the
+per-column path is used, but its Q~accumulation threshold of $n = 256$
+(Symmetric.hs:213) forces the simple per-row path for all benchmarked
+sizes.
 
 \paragraph{Proposed optimisation.}
-Add \texttt{svdGKP} to the benchmark suite alongside \texttt{svdAtAP}
-at $n = 100, 200, 500$.  If \texttt{svdGKP} is competitive after
-the GEMM cascade, switch the default \texttt{svdP = svdGKP} to gain
-both numerical robustness and performance.
+Lower the blocked WY Q-accumulation threshold from 256 to 200, and
+for the per-column path at $n = 100\text{--}255$, tune workspace
+allocation (currently 3 temporary vectors of $n$ doubles each).
+Reduce allocation churn by hoisting vector allocation outside the
+column loop.
 
 \paragraph{Expected impact.}
-$1.0\text{--}1.5\times$ potential improvement (unknown until
-benchmarked), plus improved numerical stability for ill-conditioned
-matrices.
+$1.05\text{--}1.10\times$ eigenSH improvement at $n = 200$, where
+the Q-accumulation overhead is a measurable fraction of
+tridiagonalisation time.
 
 %% ------------------------------------------------------------------
-\subsubsection{5.\ GEMM $k$-Loop Unrolling}
-\label{sec:future-gemm-unroll}
-
-\paragraph{Current state.}
-The $4{\times}8$ register-blocked micro-kernel (Kernel.hs:238)
-processes one $k$ step per iteration: 4 scalar broadcasts from $A$,
-2 vector loads from $B$, and 8 FMAs.  This achieves $10\times$ faster
-than OpenBLAS at $500{\times}500$.
-
-\paragraph{Proposed optimisation.}
-Unroll the $k$-loop to $k_k \mathbin{{+}{=}} 2$ or $k_k \mathbin{{+}{=}} 4$:
-prefetch $B[k{+}1, j..j{+}7]$ while computing the current FMAs.
-This reduces branch prediction overhead and improves out-of-order
-execution scheduling.  GHC~9.14's LLVM backend should handle the
-register pressure from 16--32 simultaneous \texttt{DoubleX4\#} values.
-
-\paragraph{Expected impact.}
-$1.05\text{--}1.15\times$ GEMM improvement, cascading to eigenSH
-and SVD via tridiagonalisation GEMM calls.
-
-%% ------------------------------------------------------------------
-\subsubsection{6.\ Cache Tile Size Tuning}
-\label{sec:future-tile-tuning}
-
-\paragraph{Current state.}
-The GEMM tile size is $\mathtt{bs} = 64$ (Kernel.hs:156), giving a
-$64 \times 64 \times 8 = 32$\,KB working set per tile---exactly
-L1d size on AMD Zen.  The tridiagonalisation panel size is
-$\mathtt{nb} = 48$ (Symmetric.hs:175).
-
-\paragraph{Proposed optimisation.}
-Benchmark tile sizes $\mathtt{bs} \in \{32, 48, 64, 96, 128\}$ and
-panel sizes $\mathtt{nb} \in \{32, 48, 64\}$ across matrix sizes.
-On CPUs with larger L1d (e.g., Apple M-series at 128\,KB) or larger
-L2 (e.g., Intel Golden Cove at 1.25\,MB), larger tiles may improve
-reuse.  Optionally, detect cache sizes at runtime via
-\texttt{/sys/devices/system/cpu/cpu0/cache/} (Linux) or
-\texttt{sysctl} (macOS).
-
-\paragraph{Expected impact.}
-$1.05\text{--}1.20\times$ on non-default hardware; no regression on
-the development machine.
-
-%% ------------------------------------------------------------------
-\subsubsection{7.\ 2D Parallel GEMM Tiling}
+\subsubsection{8.\ 2D Parallel GEMM Tiling}
 \label{sec:future-2d-gemm}
 
 \paragraph{Current state.}
 \texttt{matMulPPar} (Level3.hs) partitions by rows: each of $p$
 threads computes $\lfloor m/p \rfloor$ rows of $C$, reading the
-\emph{entire} $B$ matrix.  On a 20-core system with
-$500{\times}500$ matrices, all 20~threads contend for the same
-$2$\,MB $B$ in L3 cache.
+entire $B$ matrix.  On a multi-core system with $500{\times}500$
+matrices, all threads contend for the same $2$\,MB $B$ in L3.
 
 \paragraph{Proposed optimisation.}
 Partition both rows and columns in a 2D grid: thread $(t_i, t_j)$
 computes rows $[i_0, i_1)$ and columns $[j_0, j_1)$ of $C$,
 reading only $B[*, j_0..j_1)$.  This reduces per-thread $B$ working
-set by $\sqrt{p}$, improving L3 utilisation on multi-core systems.
-Requires 2D thread indexing and per-block barrier synchronisation.
+set by $\sqrt{p}$, improving L3 utilisation on chiplet architectures
+(AMD EPYC, Intel Xeon).
 
 \paragraph{Expected impact.}
 $1.2\text{--}1.4\times$ parallel GEMM improvement at 16{+} threads,
-primarily by reducing L3 contention.  Most impactful on multi-socket
-or chiplet architectures (AMD EPYC, Intel Xeon).
+cascading to eigenSH and SVD via their internal GEMM calls.
 
 %% ------------------------------------------------------------------
-\subsubsection{8.\ SIMD Substitution Unrolling}
-\label{sec:future-subst-unroll}
+\subsubsection{9.\ Cache Tile and Panel Size Auto-Tuning}
+\label{sec:future-autotune}
 
 \paragraph{Current state.}
-Forward and backward substitution kernels
-(\texttt{rawForwardSubUnitPackedSIMD}, \texttt{rawBackSubPackedSIMD}
-in Kernel.hs) use 4-wide \texttt{DoubleX4\#} SIMD.  These kernels
-execute during every LU and Cholesky solve.
+GEMM tile size $\mathtt{bs} = 64$ (Kernel.hs) and tridiagonalisation
+panel size $\mathtt{nb} = 48$ (Symmetric.hs) are compile-time
+constants tuned on AMD Zen (32\,KB L1d, 512\,KB L2).  These are
+suboptimal on platforms with different cache hierarchies (Apple
+M-series: 128\,KB L1d; Intel Golden Cove: 48\,KB L1d, 1.25\,MB L2).
 
 \paragraph{Proposed optimisation.}
-Unroll to 8-wide with two independent accumulators, following the
-pattern applied to \texttt{rawMutSymMatvecSub} in Round~17.  Add a
-4-wide cleanup loop and scalar tail for remainder elements.
+Detect cache sizes at runtime via \texttt{/sys/devices/system/cpu/}
+(Linux) or \texttt{sysctl} (macOS), and select tile/panel sizes from
+a pre-validated lookup table.  Alternatively, implement a one-time
+auto-tuning pass at library initialisation.
 
 \paragraph{Expected impact.}
-$1.1\text{--}1.2\times$ improvement in LU/Cholesky solve, deepening
-the $0.63\text{--}0.68\times$ advantage.
-
-%% ------------------------------------------------------------------
-\subsubsection{9.\ Persistent Column-Major Q for eigenSH}
-\label{sec:future-colmajor-q}
-
-\paragraph{Current state.}
-\texttt{symmetricEigenPPar} (Symmetric.hs) transposes the eigenvector
-matrix $Q$ to column-major before QR iteration and transposes back
-afterwards---two $O(n^2)$ operations.  The column-major layout enables
-SIMD Givens rotations on contiguous column elements.
-
-\paragraph{Proposed optimisation.}
-Maintain $Q$ in column-major layout throughout the entire eigenSH
-pipeline, eliminating both transpose operations.  This requires
-adjusting the tridiagonalisation Q-accumulation and all downstream
-indexing to use column-major addressing.
-
-\paragraph{Expected impact.}
-$1.05\text{--}1.10\times$ improvement by saving $2 \times O(n^2)$
-memory traffic, meaningful when QR iteration dominates (small $n$).
-
-%% ------------------------------------------------------------------
-\subsubsection{10.\ Panel Size Auto-Tuning}
-\label{sec:future-panel-autotune}
-
-\paragraph{Current state.}
-Panel size $\mathtt{nb} = 48$ (Symmetric.hs) and GEMM tile size
-$\mathtt{bs} = 64$ (Kernel.hs) are compile-time constants tuned on a
-single machine (AMD Ryzen 9, 32\,KB L1d, 512\,KB L2, 32\,MB L3).
-
-\paragraph{Proposed optimisation.}
-Implement a one-time auto-tuning pass at library initialisation that
-benchmarks $\mathtt{nb} \in \{32, 48, 64\}$ on a small test matrix
-and caches the result.  Alternatively, select from a pre-validated
-lookup table indexed by detected cache sizes.
-
-\paragraph{Expected impact.}
-$1.05\text{--}1.15\times$ on non-default hardware (especially Apple
-M-series and Intel server CPUs).
+$1.05\text{--}1.20\times$ on non-default hardware; no regression
+on the development machine.
 
 %% ------------------------------------------------------------------
 \subsubsection{Summary of Future Opportunities}
@@ -4357,33 +4352,39 @@ M-series and Intel server CPUs).
 \textbf{\#} & \textbf{Optimisation} & \textbf{Priority} & \textbf{Difficulty} & \textbf{Expected gain} & \textbf{Primary beneficiary} \\
 \midrule
 \multicolumn{6}{l}{\textit{High priority --- closing remaining gaps}} \\
-1 & D\&C eigensolver crossover    & High   & Low    & $1.15\text{--}1.30\times$ & eigenSH ($n = 100\text{--}200$) \\
-2 & Blocked bidiagonalisation     & High   & High   & $1.5\text{--}2.0\times$   & SVD ($n = 100\text{--}500$) \\
-3 & Panel LU/Cholesky             & High   & Medium & $1.3\text{--}1.5\times$   & LU, Cholesky \\
-4 & svdGKP benchmarking           & High   & Low    & $1.0\text{--}1.5\times$   & SVD \\
+1 & Multi-shift QR / AED           & High   & High   & $1.12\text{--}1.20\times$ & eigenSH ($n = 100\text{--}200$) \\
+2 & Blocked bidiagonalisation      & High   & High   & $1.5\text{--}2.5\times$   & SVD ($n = 100\text{--}200$) \\
+3 & Scalar QR for small eigenSH    & High   & Low    & $1.05\text{--}1.10\times$ & eigenSH ($n \leq 100$) \\
+4 & Reduced svdAtAP iterations     & High   & Low    & $1.05\text{--}1.15\times$ & SVD (all sizes) \\
 \midrule
-\multicolumn{6}{l}{\textit{Medium priority --- deepening existing advantages}} \\
-5 & GEMM $k$-loop unrolling       & Medium & Low    & $1.05\text{--}1.15\times$ & GEMM, eigenSH, SVD \\
-6 & Cache tile size tuning         & Medium & Low    & $1.05\text{--}1.20\times$ & All operations \\
-7 & 2D parallel GEMM tiling        & Medium & High   & $1.2\text{--}1.4\times$   & Parallel GEMM \\
-8 & SIMD substitution unrolling    & Medium & Low    & $1.1\text{--}1.2\times$   & LU, Cholesky \\
+\multicolumn{6}{l}{\textit{Medium priority --- deepening advantages}} \\
+5 & D\&C eigensolver stabilisation & Medium & High   & $1.3\text{--}1.8\times$   & eigenSH ($n \geq 256$) \\
+6 & Panel LU/Cholesky              & Medium & Medium & $1.3\text{--}1.5\times$   & LU, Cholesky \\
+7 & Adaptive tridiag panel size    & Medium & Low    & $1.05\text{--}1.10\times$ & eigenSH ($n = 200$) \\
 \midrule
-\multicolumn{6}{l}{\textit{Lower priority --- diminishing returns}} \\
-9  & Persistent column-major Q     & Low    & Medium & $1.05\text{--}1.10\times$ & eigenSH (small $n$) \\
-10 & Panel size auto-tuning        & Low    & Low    & $1.05\text{--}1.15\times$ & All (non-default HW) \\
+\multicolumn{6}{l}{\textit{Lower priority --- architectural improvements}} \\
+8 & 2D parallel GEMM tiling        & Low    & High   & $1.2\text{--}1.4\times$   & Parallel GEMM \\
+9 & Cache/panel auto-tuning        & Low    & Low    & $1.05\text{--}1.20\times$ & All (non-default HW) \\
 \bottomrule
 \end{tabular}
 \end{center}
 
-The four high-priority items target the two remaining areas where
-\texttt{linear-massiv} is closest to hmatrix: eigenSH at medium sizes
-($1.04\text{--}1.18\times$) and SVD at medium sizes ($1.80\times$).
-D\&C crossover tuning and svdGKP benchmarking are quick wins (low
-difficulty, high potential payoff).  Blocked bidiagonalisation is the
-most complex item but addresses the widest remaining gap.  Panel-based
-LU/Cholesky would deepen existing $0.63\text{--}0.68\times$ advantages
-by promoting column-by-column Level-2 work to Level-3 GEMM, which
-is now $10\times$ faster than OpenBLAS.
+The four high-priority items target the two categories where
+\texttt{linear-massiv} still trails LAPACK: eigenSH at
+$n = 100\text{--}200$ ($1.18\text{--}1.19\times$) and SVD at
+$n = 100\text{--}200$ ($1.53\text{--}1.78\times$).  Items~3 and~4
+are quick wins (low difficulty), while items~1 and~2 require
+substantial algorithmic work but address the root causes: too many QR
+iterations (eigenSH) and the Level-2 bidiagonalisation bottleneck (SVD).
+
+Three previously proposed targets were empirically eliminated in
+Round~18 and are \emph{not} re-proposed: (a)~D\&C crossover tuning
+(numerical instability at $n \geq 128$---item~5 proposes a
+stabilisation rewrite instead); (b)~GEMM $k$-loop unrolling (GHC's
+LLVM~17 backend spills registers when holding $> 14$ simultaneous
+\texttt{DoubleX4\#} values); (c)~svdGKP as drop-in replacement
+($22\text{--}24\times$ slower without blocked bidiagonalisation---
+item~2 proposes the blocking prerequisite).
 
 \paragraph{Not recommended at current benchmark sizes.}
 Strassen/Winograd multiplication (breakeven at $n > 2000$; benchmarks
