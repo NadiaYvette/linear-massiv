@@ -11,12 +11,12 @@ import Data.List (sort)
 import Numeric.LinearAlgebra.Massiv.Types
 import Numeric.LinearAlgebra.Massiv.Internal
 import Numeric.LinearAlgebra.Massiv.BLAS.Level2 (matvec)
-import Numeric.LinearAlgebra.Massiv.BLAS.Level3 (matMul, transpose, mSub)
+import Numeric.LinearAlgebra.Massiv.BLAS.Level3 (matMul, matMulP, transpose, mSub)
 import Numeric.LinearAlgebra.Massiv.BLAS.Level1 (nrm2, scal)
 import Numeric.LinearAlgebra.Massiv.Eigen.Power
 import Numeric.LinearAlgebra.Massiv.Eigen.Hessenberg
 import Numeric.LinearAlgebra.Massiv.Eigen.Symmetric
-import Numeric.LinearAlgebra.Massiv.Eigen.SVD
+import Numeric.LinearAlgebra.Massiv.Eigen.SVD (svd, svdP, svdGKP)
 import Data.Proxy (Proxy(..))
 import Numeric.LinearAlgebra.Massiv.Eigen.Schur (schur, eigenvalues)
 import Numeric.LinearAlgebra.Massiv.Norms (normFrob, vnorm2)
@@ -43,6 +43,7 @@ eigenTests = testGroup "Eigenvalue"
   , testGroup "SVD"
     [ testProperty "A ≈ UΣVᵀ reconstruction" prop_svdReconstruction
     , testCase "singular values of diagonal" test_svdDiagonal
+    , testCase "svdGKP reconstruction 10x10" test_svdGKReconstruction
     ]
   , testGroup "Standard test matrices"
     [ testCase "Wilkinson eigenvalues" test_wilkinsonEigen
@@ -172,6 +173,68 @@ test_svdDiagonal = do
   assertBool "sv 1" $ abs (svs !! 0 - 1) < 0.1
   assertBool "sv 3" $ abs (svs !! 1 - 3) < 0.1
   assertBool "sv 5" $ abs (svs !! 2 - 5) < 0.1
+
+test_svdGKReconstruction :: Assertion
+test_svdGKReconstruction = do
+  -- Test 1: diagonal matrix (trivial bidiag, no QR needed)
+  let diag5 = makeMatrix @5 @5 @M.P $ \i j ->
+                if i == j then fromIntegral (5 - i) else 0 :: Double
+      (_, sigDiag, _) = svdGKP diag5
+      diagSorted = sort [sigDiag !. i | i <- [0..4]]
+      diagExpected = [1,2,3,4,5] :: [Double]
+      diagErr = maximum $ zipWith (\a_ b_ -> abs (a_ - b_)) diagSorted diagExpected
+  assertBool ("svdGKP diagonal sigma " ++ show diagSorted ++ " err=" ++ show diagErr) $ diagErr < 0.1
+  -- Test 2: already-bidiagonal matrix (tests QR iteration in isolation)
+  -- B = [[3,1,0],[0,2,1],[0,0,1]] — bidiag with d=[3,2,1], e=[1,1]
+  let bidiag3 = makeMatrix @3 @3 @M.P $ \i j -> case (i,j) of
+                  (0,0) -> 3; (0,1) -> 1; (1,1) -> 2; (1,2) -> 1; (2,2) -> 1
+                  _ -> 0 :: Double
+      (_, sigBidiag, _) = svdGKP bidiag3
+      (_, sigBidiagRef, _) = svdP bidiag3
+      bidiagSorted = sort [sigBidiag !. i | i <- [0..2]]
+      bidiagRefSorted = sort [sigBidiagRef !. i | i <- [0..2]]
+      bidiagDiff = maximum $ zipWith (\a_ b_ -> abs (a_ - b_)) bidiagSorted bidiagRefSorted
+  assertBool ("svdGKP bidiag diff " ++ show bidiagDiff
+              ++ "\n  gk=" ++ show bidiagSorted
+              ++ "\n  ref=" ++ show bidiagRefSorted) $ bidiagDiff < 1e-6
+  -- Test 3: general matrix
+  let a = makeMatrix @5 @5 @M.P $ \i j ->
+            let d = fromIntegral (abs (i - j) + 1) :: Double
+            in 1.0 / d + if i == j then 5 else 0
+      (_, sigmaGK, _) = svdGKP a
+      (_, sigmaRef, _) = svdP a
+      gkSorted = sort [sigmaGK !. i | i <- [0..4]]
+      refSorted = sort [sigmaRef !. i | i <- [0..4]]
+      svDiff = maximum $ zipWith (\a_ b_ -> abs (a_ - b_)) gkSorted refSorted
+  assertBool ("svdGKP sigma diff " ++ show svDiff ++ "\n  gk=" ++ show gkSorted
+              ++ "\n  ref=" ++ show refSorted) $ svDiff < 1e-6
+  -- Test 4: singular values match for 10×10
+  let a10 = makeMatrix @10 @10 @M.P $ \i j ->
+              let d = fromIntegral (abs (i - j) + 1) :: Double
+              in 1.0 / d + if i == j then 10 else 0
+      (u10, sig10, v10) = svdGKP a10
+      (_, sigRef10, _) = svdP a10
+      gk10Sorted = sort [sig10 !. i | i <- [0..9]]
+      ref10Sorted = sort [sigRef10 !. i | i <- [0..9]]
+      svDiff10 = maximum $ zipWith (\a_ b_ -> abs (a_ - b_)) gk10Sorted ref10Sorted
+  assertBool ("svdGKP 10x10 sigma diff " ++ show svDiff10
+              ++ "\n  gk=" ++ show gk10Sorted
+              ++ "\n  ref=" ++ show ref10Sorted) $ svDiff10 < 1e-6
+  -- Test 5: reconstruction A ≈ U Σ V^T for 10×10
+  let sigMat10 = makeMatrix @10 @10 @M.P $ \i j ->
+        if i == j then sig10 !. i else 0
+      usv10 = matMulP u10 (matMulP sigMat10 (transpose v10))
+      reconErr10 = maximum [abs (a10 ! (i,j) - usv10 ! (i,j))
+                           | i <- [0..9], j <- [0..9]]
+  assertBool ("svdGKP 10x10 reconstruction err " ++ show reconErr10) $ reconErr10 < 1e-10
+  -- Test 6: orthogonality of U and V
+  let utu = matMulP (transpose u10) u10
+      vtv = matMulP (transpose v10) v10
+      eye10 = identityMatrix @10 @M.P :: Matrix 10 10 M.P Double
+      uErr = maximum [abs (utu ! (i,j) - eye10 ! (i,j)) | i <- [0..9], j <- [0..9]]
+      vErr = maximum [abs (vtv ! (i,j) - eye10 ! (i,j)) | i <- [0..9], j <- [0..9]]
+  assertBool ("svdGKP 10x10 U ortho err " ++ show uErr) $ uErr < 1e-10
+  assertBool ("svdGKP 10x10 V ortho err " ++ show vErr) $ vErr < 1e-10
 
 -- Standard test matrices
 

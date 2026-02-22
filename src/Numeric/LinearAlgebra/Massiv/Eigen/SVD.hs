@@ -62,7 +62,8 @@ import Numeric.LinearAlgebra.Massiv.Internal.Kernel
   , rawMutQAccum
   , rawMutApplyGivensColumns
   , rawMutApplyGivensColumnsCM
-  , rawTransposeToColMajor, rawTransposeFromColMajor )
+  , rawTransposeToColMajor, rawTransposeFromColMajor
+  , rawGemmKernel, rawZeroDoubles, rawNegateDoubles )
 
 -- | Compute the full Singular Value Decomposition (GVL4 Theorem 8.6.1,
 -- p. 499).
@@ -133,7 +134,7 @@ svd a =
 svdP :: forall m n. (KnownNat m, KnownNat n)
      => Matrix m n M.P Double
      -> (Matrix m m M.P Double, Vector n M.P Double, Matrix n n M.P Double)
-svdP = svdAtAP
+svdP = svdGKP
 {-# NOINLINE svdP #-}
 
 -- | SVD via A^T A eigendecomposition.
@@ -365,13 +366,93 @@ svdGKP (MkMatrix a_) = runST $ do
   let baA = unwrapByteArray frozenA
       offFA = unwrapByteArrayOffset frozenA
 
-  -- Accumulate left Householder reflectors into U (backward)
+  -- Accumulate left Householder reflectors into U (forward: U = H₀ H₁ ⋯ H_{n-1})
   -- Left reflector k: v stored in column k of A, rows k+1..m-1, with v[k]=1 implicit
-  forM_ (reverse [0..nn-1]) $ \k -> do
-    betaK <- readRawD mbaBetaL 0 k
-    when (betaK /= 0) $
-      forM_ [0..mm-1] $ \row ->
-        rawMutQAccum mbaU offU mm baA offFA nn betaK k mm row
+  if nn <= 16
+    then
+      -- Small matrix: per-row accumulation (Level-2)
+      forM_ [0..nn-1] $ \k -> do
+        betaK <- readRawD mbaBetaL 0 k
+        when (betaK /= 0) $
+          forM_ [0..mm-1] $ \row ->
+            rawMutQAccum mbaU offU mm baA offFA nn betaK k mm row
+    else do
+      -- Blocked WY: batch nb Householder vectors at a time
+      let !nbU = min 32 nn
+      mbaYU  <- newByteArray (mm * nbU * 8)
+      mbaTfU <- newByteArray (nbU * nbU * 8)
+      mbaW1U <- newByteArray (mm * nbU * 8)
+      mbaW2U <- newByteArray (mm * nbU * 8)
+      mbaYTU <- newByteArray (nbU * mm * 8)
+      mbaGU  <- newByteArray (nbU * nbU * 8)
+
+      let goBlockU !k0
+            | k0 >= nn = pure ()
+            | otherwise = do
+                let !bsz = min nbU (nn - k0)
+                -- Pack Y (mm × bsz): Y[:,j] = left Householder vector k0+j
+                rawZeroDoubles mbaYU 0 (mm * bsz)
+                forM_ [0..bsz-1] $ \j -> do
+                  let !k = k0 + j
+                  writeRawD mbaYU 0 (k * bsz + j) 1.0
+                  forM_ [k+1..mm-1] $ \l ->
+                    writeRawD mbaYU 0 (l * bsz + j) (readBA baA offFA (l * nn + k))
+
+                -- Transpose Y → Y^T (bsz × mm) for GEMM reuse
+                rawZeroDoubles mbaYTU 0 (bsz * mm)
+                forM_ [0..bsz-1] $ \j -> do
+                  let !k = k0 + j
+                  writeRawD mbaYTU 0 (j * mm + k) 1.0
+                  forM_ [k+1..mm-1] $ \l ->
+                    writeRawD mbaYTU 0 (j * mm + l) (readBA baA offFA (l * nn + k))
+
+                baYU  <- unsafeFreezeByteArray mbaYU
+                baYTU <- unsafeFreezeByteArray mbaYTU
+
+                -- G = Y^T × Y (bsz × bsz)
+                rawZeroDoubles mbaGU 0 (bsz * bsz)
+                rawGemmKernel baYTU 0 baYU 0 mbaGU 0 bsz mm bsz
+
+                -- Build T-factor (bsz × bsz upper-triangular)
+                rawZeroDoubles mbaTfU 0 (bsz * bsz)
+                forM_ [0..bsz-1] $ \j -> do
+                  betaj <- readRawD mbaBetaL 0 (k0 + j)
+                  writeRawD mbaTfU 0 (j * bsz + j) betaj
+                  when (j > 0 && betaj /= 0) $ do
+                    -- T[0..j-1, j] = -betaj * T[0..j-1, 0..j-1] * G[0..j-1, j]
+                    forM_ [0..j-1] $ \i -> do
+                      g_ij <- readRawD mbaGU 0 (i * bsz + j)
+                      writeRawD mbaW1U 0 i g_ij
+                    forM_ [0..j-1] $ \i -> do
+                      let triLoop !l !acc
+                            | l >= j = pure acc
+                            | otherwise = do
+                                til <- readRawD mbaTfU 0 (i * bsz + l)
+                                dl  <- readRawD mbaW1U 0 l
+                                triLoop (l+1) (acc + til * dl)
+                      z <- triLoop 0 0
+                      writeRawD mbaTfU 0 (i * bsz + j) (negate betaj * z)
+
+                -- W1 = Q · Y (mm×mm * mm×bsz → mm×bsz)
+                baQU <- unsafeFreezeByteArray mbaU
+                rawZeroDoubles mbaW1U 0 (mm * bsz)
+                rawGemmKernel baQU offU baYU 0 mbaW1U 0 mm mm bsz
+
+                -- W2 = W1 · T (mm×bsz * bsz×bsz → mm×bsz)
+                baW1U <- unsafeFreezeByteArray mbaW1U
+                baTfU <- unsafeFreezeByteArray mbaTfU
+                rawZeroDoubles mbaW2U 0 (mm * bsz)
+                rawGemmKernel baW1U 0 baTfU 0 mbaW2U 0 mm bsz bsz
+
+                -- Negate W2
+                rawNegateDoubles mbaW2U 0 (mm * bsz)
+
+                -- Q += (-W2) · Y^T (mm×bsz * bsz×mm → mm×mm)
+                baNW2U <- unsafeFreezeByteArray mbaW2U
+                rawGemmKernel baNW2U 0 baYTU 0 mbaU offU mm bsz mm
+
+                goBlockU (k0 + bsz)
+      goBlockU 0
 
   -- V₀ = G₁ G₂ ... G_{n-3} (right reflectors)
   mV <- M.newMArray @M.P (Sz (nn :. nn)) (0 :: Double)
@@ -381,16 +462,98 @@ svdGKP (MkMatrix a_) = runST $ do
   forM_ [0..nn-1] $ \i ->
     writeRawD mbaV offV (i * nn + i) 1.0
 
-  -- Accumulate right Householder reflectors into V (backward)
+  -- Accumulate right Householder reflectors into V (forward: V = G₀ G₁ ⋯ G_{n-3})
   -- Right reflector k: v stored in row k of A, cols k+2..n-1, with v[k+1]=1 implicit
-  when (nn >= 3) $
-    forM_ (reverse [0..nn-3]) $ \k -> do
-      betaK <- readRawD mbaBetaR 0 k
-      when (betaK /= 0) $
-        forM_ [0..nn-1] $ \row ->
-          rightQAccum mbaV offV nn baA offFA nn betaK k nn row
+  if nn < 19
+    then
+      -- Small: per-row Level-2
+      when (nn >= 3) $
+        forM_ [0..nn-3] $ \k -> do
+          betaK <- readRawD mbaBetaR 0 k
+          when (betaK /= 0) $
+            forM_ [0..nn-1] $ \row ->
+              rightQAccum mbaV offV nn baA offFA nn betaK k nn row
+    else when (nn >= 3) $ do
+      -- Blocked WY for right reflectors
+      let !nRefl = nn - 2  -- right reflectors 0..nn-3
+          !nbV = min 32 nRefl
+      mbaYV  <- newByteArray (nn * nbV * 8)
+      mbaTfV <- newByteArray (nbV * nbV * 8)
+      mbaW1V <- newByteArray (nn * nbV * 8)
+      mbaW2V <- newByteArray (nn * nbV * 8)
+      mbaYTV <- newByteArray (nbV * nn * 8)
+      mbaGV  <- newByteArray (nbV * nbV * 8)
 
-  -- Phase 3: Implicit-shift bidiagonal QR iteration
+      let goBlockV !k0
+            | k0 >= nRefl = pure ()
+            | otherwise = do
+                let !bsz = min nbV (nRefl - k0)
+                -- Pack Y (nn × bsz): Y[:,j] = right Householder vector k0+j
+                -- Right vector k has implicit 1 at position k+1, stored values at k+2..nn-1
+                rawZeroDoubles mbaYV 0 (nn * bsz)
+                forM_ [0..bsz-1] $ \j -> do
+                  let !k = k0 + j
+                  writeRawD mbaYV 0 ((k+1) * bsz + j) 1.0
+                  forM_ [k+2..nn-1] $ \l ->
+                    writeRawD mbaYV 0 (l * bsz + j) (readBA baA offFA (k * nn + l))
+
+                -- Transpose Y → Y^T (bsz × nn)
+                rawZeroDoubles mbaYTV 0 (bsz * nn)
+                forM_ [0..bsz-1] $ \j -> do
+                  let !k = k0 + j
+                  writeRawD mbaYTV 0 (j * nn + (k+1)) 1.0
+                  forM_ [k+2..nn-1] $ \l ->
+                    writeRawD mbaYTV 0 (j * nn + l) (readBA baA offFA (k * nn + l))
+
+                baYV  <- unsafeFreezeByteArray mbaYV
+                baYTV <- unsafeFreezeByteArray mbaYTV
+
+                -- G = Y^T × Y (bsz × bsz)
+                rawZeroDoubles mbaGV 0 (bsz * bsz)
+                rawGemmKernel baYTV 0 baYV 0 mbaGV 0 bsz nn bsz
+
+                -- Build T-factor (bsz × bsz upper-triangular)
+                rawZeroDoubles mbaTfV 0 (bsz * bsz)
+                forM_ [0..bsz-1] $ \j -> do
+                  betaj <- readRawD mbaBetaR 0 (k0 + j)
+                  writeRawD mbaTfV 0 (j * bsz + j) betaj
+                  when (j > 0 && betaj /= 0) $ do
+                    -- T[0..j-1, j] = -betaj * T[0..j-1, 0..j-1] * G[0..j-1, j]
+                    forM_ [0..j-1] $ \i -> do
+                      g_ij <- readRawD mbaGV 0 (i * bsz + j)
+                      writeRawD mbaW1V 0 i g_ij
+                    forM_ [0..j-1] $ \i -> do
+                      let triLoop !l !acc
+                            | l >= j = pure acc
+                            | otherwise = do
+                                til <- readRawD mbaTfV 0 (i * bsz + l)
+                                dl  <- readRawD mbaW1V 0 l
+                                triLoop (l+1) (acc + til * dl)
+                      z <- triLoop 0 0
+                      writeRawD mbaTfV 0 (i * bsz + j) (negate betaj * z)
+
+                -- W1 = V · Y (nn×nn * nn×bsz → nn×bsz)
+                baQV <- unsafeFreezeByteArray mbaV
+                rawZeroDoubles mbaW1V 0 (nn * bsz)
+                rawGemmKernel baQV offV baYV 0 mbaW1V 0 nn nn bsz
+
+                -- W2 = W1 · T (nn×bsz * bsz×bsz → nn×bsz)
+                baW1V <- unsafeFreezeByteArray mbaW1V
+                baTfV <- unsafeFreezeByteArray mbaTfV
+                rawZeroDoubles mbaW2V 0 (nn * bsz)
+                rawGemmKernel baW1V 0 baTfV 0 mbaW2V 0 nn bsz bsz
+
+                -- Negate W2
+                rawNegateDoubles mbaW2V 0 (nn * bsz)
+
+                -- V += (-W2) · Y^T (nn×bsz * bsz×nn → nn×nn)
+                baNW2V <- unsafeFreezeByteArray mbaW2V
+                rawGemmKernel baNW2V 0 baYTV 0 mbaV offV nn bsz nn
+
+                goBlockV (k0 + bsz)
+      goBlockV 0
+
+  -- Phase 3: Implicit-shift bidiagonal QR iteration (CM SIMD Givens + AED)
   bidiagQRIterPCM mbaD 0 mbaE 0 mbaU offU mm mbaV offV nn nn (30 * nn)
 
   -- Phase 4: Ensure σᵢ ≥ 0 (flip sign of U column if needed)
@@ -696,6 +859,10 @@ bidiagQRStepCM mbaD offD mbaE offE mbaU offU mm mbaV offV nn lo hi = do
       writeRawD mbaE offE k ek'
       writeRawD mbaD offD (k + 1) dk1'
 
+      -- Update e[k-1]: right Givens rotates entry from row above
+      when (k > lo) $
+        writeRawD mbaE offE (k - 1) (cosR * y_ + sinR * z_)
+
       -- Accumulate right rotation into V (column-major, SIMD)
       rawMutApplyGivensColumnsCM mbaV offV nn cosR sinR k (k+1) nn
 
@@ -780,8 +947,11 @@ bidiagQRStep mbaD offD mbaE offE mbaU offU ucols mbaV offV vcols lo hi = do
       writeRawD mbaE offE k ek'
       writeRawD mbaD offD (k + 1) dk1'
 
-      -- Also handle e[k-1] if k > lo (it gets mixed by previous left rotation)
-      -- The bulge from the right rotation is at position (k+1, k), i.e. below the diagonal
+      -- Update e[k-1]: the right Givens also rotates the entry from the row above.
+      -- For k > lo: B[k-1,k] was y_, B[k-1,k+1] was z_ (the bulge).
+      -- After rotation: B[k-1,k] = cosR*y_ + sinR*z_ (= r), B[k-1,k+1] = 0.
+      when (k > lo) $
+        writeRawD mbaE offE (k - 1) (cosR * y_ + sinR * z_)
 
       -- Accumulate right rotation into V (columns k, k+1)
       rawMutApplyGivensColumns mbaV offV vcols cosR sinR k (k+1) vcols
@@ -816,17 +986,21 @@ bidiagQRStep mbaD offD mbaE offE mbaU offU ucols mbaV offV vcols lo hi = do
         rawMutApplyGivensColumns mbaU offU ucols cosL sinL k (k+1) ucols
 
 -- | Compute Givens rotation coefficients (c, s) such that
--- [c s; -s c]^T [a; b] = [r; 0].
+-- @[c, s; -s, c] [a; b] = [r; 0]@, i.e. @-s*a + c*b = 0@ and @r = c*a + s*b > 0@.
+--
+-- This convention is chosen so that the bidiag QR bulge-chase formulas
+-- @dk' = c*dk + s*ek@, @ek' = -s*dk + c*ek@ etc. are directly correct
+-- for both left and right Givens rotations (GVL4 Algorithm 8.6.2).
 givens :: Double -> Double -> (Double, Double)
 givens a b
   | b == 0    = (1, 0)
   | abs b > abs a =
-      let tau = -a / b
+      let tau = a / b
           s   = 1 / sqrt (1 + tau * tau)
           c   = s * tau
       in (c, s)
   | otherwise =
-      let tau = -b / a
+      let tau = b / a
           c   = 1 / sqrt (1 + tau * tau)
           s   = c * tau
       in (c, s)
