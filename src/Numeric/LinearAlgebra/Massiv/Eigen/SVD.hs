@@ -60,7 +60,9 @@ import Numeric.LinearAlgebra.Massiv.Internal.Kernel
   ( rawMutSumSqColumn, rawMutSumSqRow
   , rawMutHouseholderApply, rawMutHouseholderApplyRow
   , rawMutQAccum
-  , rawMutApplyGivensColumns )
+  , rawMutApplyGivensColumns
+  , rawMutApplyGivensColumnsCM
+  , rawTransposeToColMajor, rawTransposeFromColMajor )
 
 -- | Compute the full Singular Value Decomposition (GVL4 Theorem 8.6.1,
 -- p. 499).
@@ -389,7 +391,7 @@ svdGKP (MkMatrix a_) = runST $ do
           rightQAccum mbaV offV nn baA offFA nn betaK k nn row
 
   -- Phase 3: Implicit-shift bidiagonal QR iteration
-  bidiagQRIterP mbaD 0 mbaE 0 mbaU offU mm mbaV offV nn nn (30 * nn)
+  bidiagQRIterPCM mbaD 0 mbaE 0 mbaU offU mm mbaV offV nn nn (30 * nn)
 
   -- Phase 4: Ensure σᵢ ≥ 0 (flip sign of U column if needed)
   forM_ [0..nn-1] $ \k -> do
@@ -555,6 +557,171 @@ bidiagQRIterP mbaD offD mbaE offE mbaU offU ucols mbaV offV vcols nn maxIter = g
               return idx
             else findLo (idx - 1)
 {-# NOINLINE bidiagQRIterP #-}
+
+-- | Column-major bidiagonal QR iteration with AED and stall detection.
+-- Transposes U (mm×mm) and V (nn×nn) to column-major layout for SIMD Givens,
+-- runs bidiag QR with aggressive early deflation, then transposes back.
+-- Falls back to row-major path for nn < 10 (transpose overhead dominates).
+bidiagQRIterPCM :: MutableByteArray s -> Int  -- d + offset
+                -> MutableByteArray s -> Int  -- e + offset
+                -> MutableByteArray s -> Int -> Int  -- U + offset + ucols (= mm)
+                -> MutableByteArray s -> Int -> Int  -- V + offset + vcols (= nn)
+                -> Int -> Int  -- nn, maxIter
+                -> ST s ()
+bidiagQRIterPCM mbaD offD mbaE offE mbaU offU mm mbaV offV nn n maxIter
+  | n < 10 = bidiagQRIterP mbaD offD mbaE offE mbaU offU mm mbaV offV nn n maxIter
+  | otherwise = do
+      -- Transpose U (mm×mm) and V (nn×nn) to column-major
+      tmpU <- newByteArray (mm * mm * 8)
+      tmpV <- newByteArray (nn * nn * 8)
+      rawTransposeToColMajor mbaU offU tmpU 0 mm
+      rawTransposeToColMajor mbaV offV tmpV 0 nn
+      -- Run CM iteration
+      goCM 0 (n - 1) 0
+        mbaD offD mbaE offE tmpU 0 mm tmpV 0 nn n maxIter
+      -- Transpose back to row-major
+      rawTransposeFromColMajor tmpU 0 mbaU offU mm
+      rawTransposeFromColMajor tmpV 0 mbaV offV nn
+{-# NOINLINE bidiagQRIterPCM #-}
+
+-- | CM iteration core with AED and stall detection.
+-- Parameters: iter, lastQ, stallCount, then the usual d/e/U/V arrays + n + maxIter.
+goCM :: Int -> Int -> Int
+     -> MutableByteArray s -> Int -> MutableByteArray s -> Int
+     -> MutableByteArray s -> Int -> Int
+     -> MutableByteArray s -> Int -> Int
+     -> Int -> Int -> ST s ()
+goCM !iter !lastQ !stall mbaD offD mbaE offE mbaU offU mm mbaV offV nn n maxIter
+  | iter >= maxIter = return ()
+  | stall >= 20     = return ()  -- stall detection: bail after 20 steps without deflation
+  | otherwise = do
+      -- AED: scan bottom w superdiagonal entries for aggressive early deflation
+      let w = min 6 ((n + 2) `div` 3)
+      aedScan (n - 1) w
+      -- Find q — bottom of unreduced block
+      q <- defHiCM (n - 1)
+      if q <= 0
+        then return ()  -- fully deflated
+        else do
+          -- Find p — top of unreduced block
+          p <- findLoCM (q - 1)
+          -- Apply one CM QR step to [p..q]
+          bidiagQRStepCM mbaD offD mbaE offE mbaU offU mm mbaV offV nn p q
+          let !newStall = if q == lastQ then stall + 1 else 0
+          goCM (iter + 1) q newStall mbaD offD mbaE offE mbaU offU mm mbaV offV nn n maxIter
+  where
+    -- AED: scan bottom w entries, deflating negligible superdiagonals
+    aedScan _ 0 = return ()
+    aedScan k remaining
+      | k <= 0 = return ()
+      | otherwise = do
+          ek <- readRawD mbaE offE (k - 1)
+          dk <- readRawD mbaD offD k
+          dk1 <- readRawD mbaD offD (k - 1)
+          let tol = 1e-14 * (abs dk1 + abs dk)
+          if abs ek <= tol
+            then do
+              writeRawD mbaE offE (k - 1) 0
+              aedScan (k - 1) (remaining - 1)
+            else return ()  -- stop at first non-negligible entry
+
+    defHiCM !hi
+      | hi <= 0 = return 0
+      | otherwise = do
+          ehi <- readRawD mbaE offE (hi - 1)
+          dhi <- readRawD mbaD offD hi
+          dhi1 <- readRawD mbaD offD (hi - 1)
+          let tol = 1e-14 * (abs dhi1 + abs dhi)
+          if abs ehi <= tol
+            then do
+              writeRawD mbaE offE (hi - 1) 0
+              defHiCM (hi - 1)
+            else return hi
+
+    findLoCM !idx
+      | idx <= 0 = return 0
+      | otherwise = do
+          eidx <- readRawD mbaE offE (idx - 1)
+          didx <- readRawD mbaD offD idx
+          didx1 <- readRawD mbaD offD (idx - 1)
+          let tol = 1e-14 * (abs didx1 + abs didx)
+          if abs eidx <= tol
+            then do
+              writeRawD mbaE offE (idx - 1) 0
+              return idx
+            else findLoCM (idx - 1)
+{-# NOINLINE goCM #-}
+
+-- | One implicit-shift QR step on bidiagonal [lo..hi] using column-major U,V.
+-- Same as bidiagQRStep but calls rawMutApplyGivensColumnsCM for SIMD.
+bidiagQRStepCM :: MutableByteArray s -> Int  -- d + offset
+               -> MutableByteArray s -> Int  -- e + offset
+               -> MutableByteArray s -> Int -> Int  -- U_CM + offset + mm
+               -> MutableByteArray s -> Int -> Int  -- V_CM + offset + nn
+               -> Int -> Int  -- lo, hi
+               -> ST s ()
+bidiagQRStepCM mbaD offD mbaE offE mbaU offU mm mbaV offV nn lo hi = do
+  -- Compute Wilkinson shift from trailing 2×2 of T = B^T B
+  dhi1 <- readRawD mbaD offD (hi - 1)
+  dhi  <- readRawD mbaD offD hi
+  ehi1 <- readRawD mbaE offE (hi - 1)
+  ehi2 <- if hi >= 2 then readRawD mbaE offE (hi - 2) else return 0
+
+  let t11 = dhi1 * dhi1 + (if hi - 1 > lo then ehi2 * ehi2 else 0)
+      t12 = dhi1 * ehi1
+      t22 = dhi * dhi + ehi1 * ehi1
+      delta = (t11 - t22) / 2
+      signD = if delta >= 0 then 1 else -1
+      mu = t22 - t12 * t12 / (delta + signD * sqrt (delta * delta + t12 * t12))
+
+  dlo <- readRawD mbaD offD lo
+  elo <- readRawD mbaE offE lo
+  let y = dlo * dlo - mu
+      z = dlo * elo
+
+  goChase lo y z
+  where
+    goChase k y_ z_ = do
+      let (cosR, sinR) = givens y_ z_
+      dk  <- readRawD mbaD offD k
+      ek  <- readRawD mbaE offE k
+      dk1 <- readRawD mbaD offD (k + 1)
+
+      let dk'  = cosR * dk + sinR * ek
+          ek'  = -sinR * dk + cosR * ek
+          bulgeL = sinR * dk1
+          dk1'   = cosR * dk1
+
+      writeRawD mbaD offD k dk'
+      writeRawD mbaE offE k ek'
+      writeRawD mbaD offD (k + 1) dk1'
+
+      -- Accumulate right rotation into V (column-major, SIMD)
+      rawMutApplyGivensColumnsCM mbaV offV nn cosR sinR k (k+1) nn
+
+      let (cosL, sinL) = givens dk' bulgeL
+
+      let dk''  = cosL * dk' + sinL * bulgeL
+          ek''  = cosL * ek' + sinL * dk1'
+          dk1'' = -sinL * ek' + cosL * dk1'
+
+      writeRawD mbaD offD k dk''
+      writeRawD mbaE offE k ek''
+      writeRawD mbaD offD (k + 1) dk1''
+
+      when (k + 1 < hi) $ do
+        ek1 <- readRawD mbaE offE (k + 1)
+        let bulgeR = sinL * ek1
+            ek1'   = cosL * ek1
+        writeRawD mbaE offE (k + 1) ek1'
+
+        -- Accumulate left rotation into U (column-major, SIMD)
+        rawMutApplyGivensColumnsCM mbaU offU mm cosL sinL k (k+1) mm
+
+        goChase (k + 1) ek'' bulgeR
+
+      when (k + 1 >= hi) $
+        rawMutApplyGivensColumnsCM mbaU offU mm cosL sinL k (k+1) mm
 
 -- | One implicit-shift QR step on bidiagonal [lo..hi].
 -- Computes Wilkinson shift from bottom 2×2 of B^T B,
