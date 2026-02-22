@@ -4105,6 +4105,249 @@ account for ${\sim}70\%$ of SVD time beyond eigenSH, and our GEMM
 is ${\sim}2\times$ slower than OpenBLAS for $500{\times}500$ square
 multiplies.
 
+\subsection{Future Optimisation Opportunities}
+\label{sec:future-optimisations}
+
+Six concrete optimisation targets remain for closing the remaining
+performance gaps.  They are presented in priority order by expected
+impact.
+
+\subsubsection{1.\ GEMM Register Blocking}
+\label{sec:future-gemm}
+
+\paragraph{Current state.}
+\texttt{rawGemmKernel} (Kernel.hs) uses $64{\times}64$ tiles with a
+single \texttt{DoubleX4\#} accumulator per inner-loop iteration.  Each
+iteration broadcasts one scalar $a_{ik}$, loads a 4-wide vector from
+the $B$ row, performs an FMA, and stores the result back to $C$.  This
+achieves ${\sim}2\text{--}5$\,GFLOPS for panel-shaped products,
+vs.\ OpenBLAS's ${\sim}10\text{--}15$\,GFLOPS with hand-tuned
+assembly micro-kernels.
+
+\paragraph{Proposed optimisation.}
+Implement GotoBLAS/OpenBLAS-style \emph{register blocking}: accumulate
+a $k_r \times n_r$ tile of $C$ values (e.g., $4{\times}4$ or
+$6{\times}8$) entirely in SIMD registers before writing back.
+Specifically:
+
+\begin{itemize}
+\item Maintain $k_r \times (n_r / 4)$ \texttt{DoubleX4\#} accumulators
+  (e.g., $4 \times 2 = 8$ registers for a $4{\times}8$ micro-kernel).
+\item Loop over $k$, broadcasting $a_{ik}$ and performing $k_r$ FMAs
+  per iteration against $n_r / 4$ pre-loaded $B$-row vectors.
+\item After the $k$-loop, write all $k_r \times n_r$ accumulated values
+  back to $C$.
+\item Unroll the SIMD phase to process 8 or 12 columns per iteration
+  instead of 4, reducing loop overhead.
+\end{itemize}
+
+\paragraph{Expected impact.}
+$1.5\text{--}2.0\times$ improvement for large matrices
+($500{\times}500{+}$).  Since GEMM underlies eigenSH
+(tridiagonalisation SYR2K), SVD ($A^\top A$ and $A \cdot V$), and
+direct matrix multiplication, this single optimisation would cascade
+across multiple operation categories.
+
+\subsubsection{2.\ SIMD Unrolling in Symmetric Matvec}
+\label{sec:future-symv}
+
+\paragraph{Current state.}
+\texttt{rawMutSymMatvecSub} (Kernel.hs) computes $p = T \cdot v$ for
+the symmetric matrix during panel tridiagonalisation.  The inner dot
+product loop processes 4 doubles per iteration via a single
+\texttt{DoubleX4\#} FMA, with a scalar cleanup tail.  This kernel is
+called $O(n)$ times per panel and each call is $O(n)$, making it the
+innermost loop of the $O(n^3)$ tridiagonalisation.  Our breakdown
+benchmarks (\S\ref{sec:round16}) showed tridiagonalisation accounts for
+90--97\% of eigenSH time.
+
+\paragraph{Proposed optimisation.}
+Unroll the inner loop to process $2 \times \texttt{DoubleX4\#}$ (8
+doubles) per iteration with two independent accumulator registers:
+
+\begin{itemize}
+\item \texttt{accV0} and \texttt{accV1}: two independent SIMD
+  accumulators, reduced to a scalar sum at the end.
+\item Halves the loop iteration count, improving instruction-level
+  parallelism and reducing branch prediction overhead.
+\item For very large rows ($n > 256$), a $4 \times \texttt{DoubleX4\#}$
+  (16-wide) unroll may further help by saturating the load/FMA pipeline.
+\end{itemize}
+
+Additionally, the symmetric structure of $T$ is currently unexploited:
+only $T[i, \mathtt{from}..\mathtt{to}]$ is read row-wise.  A
+DSYMV-style kernel that reads only the lower triangle and accumulates
+both $p_i \mathbin{{+}{=}} T_{ij} v_j$ and
+$p_j \mathbin{{+}{=}} T_{ij} v_i$ in a single pass would halve the
+memory traffic.
+
+\paragraph{Expected impact.}
+$1.2\text{--}1.5\times$ improvement in tridiagonalisation, translating
+to $1.1\text{--}1.4\times$ improvement in eigenSH at
+$200{\times}200$--$500{\times}500$.
+
+\subsubsection{3.\ SVD: Direct Bidiagonalisation}
+\label{sec:future-svd}
+
+\paragraph{Current state.}
+\texttt{svdAtAP} forms $A^\top A$ explicitly via \texttt{matMulAtAP}
+(an $O(mn^2)$ GEMM), then eigendecomposes the $n{\times}n$ result.
+This approach squares the condition number ($\kappa(A^\top A) =
+\kappa(A)^2$), and the explicit $A^\top A$ formation followed by a
+full eigendecomposition is approximately $2\times$ more FLOP-intensive
+than direct bidiagonalisation.
+
+The library already contains a complete Golub--Kahan SVD
+implementation (\texttt{svdGKP}, SVD.hs) that bidiagonalises $A$
+directly via interleaved left/right Householder reflectors, then applies
+bidiagonal QR iteration.  However, it is currently $15\text{--}33\times$
+slower than \texttt{svdAtAP} due to per-element Householder
+accumulation in the Q~matrices.
+
+\paragraph{Proposed optimisation.}
+Apply the same blocked WY Q-accumulation strategy that was successful
+for eigenSH tridiagonalisation (\S\ref{sec:round16}) to the
+bidiagonalisation phase of \texttt{svdGKP}:
+
+\begin{itemize}
+\item Pack $\mathtt{bs}$ Householder vectors into a panel $Y$, compute
+  the WY T-factor via GEMM ($G = Y^\top Y$), and apply the block
+  reflector $I - Y T Y^\top$ via Level-3 GEMM.
+\item Apply this independently to the left and right Householder
+  sequences.
+\item For the bidiagonal QR iteration phase, apply the SIMD Givens
+  column-major transpose strategy (already implemented but not yet
+  beneficial for tridiagonal QR) since the bidiag QR operates on both
+  $U$ and $V$ matrices simultaneously.
+\end{itemize}
+
+\paragraph{Expected impact.}
+$1.5\text{--}2.0\times$ improvement in SVD, potentially bringing the
+ratio from $1.6\text{--}2.1\times$ to near parity with LAPACK for
+$n \geq 200$.  Combined with GEMM register blocking
+(\S\ref{sec:future-gemm}), the cascade effect could yield
+$2\text{--}3\times$ total SVD improvement.
+
+\subsubsection{4.\ Compact WY Representation for QR Factorisation}
+\label{sec:future-wy-qr}
+
+\paragraph{Current state.}
+QR factorisation (\texttt{qrP}, QR.hs) accumulates $Q$ eagerly via
+back-multiplication: each Householder reflector is applied immediately
+to the running $Q$ matrix.  For least-squares problems, this requires
+forming the full $m{\times}m$ $Q$ matrix even when only $Q^\top b$ is
+needed.
+
+\paragraph{Proposed optimisation.}
+Store the compact WY representation (GVL4~\cite{gvl4} \S5.1.6):
+retain the Householder vectors $V$ and the upper-triangular T-factor
+alongside $R$, and defer $Q$ construction until needed.
+
+\begin{itemize}
+\item For least-squares: apply $Q^\top b$ via blocked reflector
+  application ($I - V T V^\top) b$, touching only $O(n)$ of the
+  $O(m^2)$ $Q$ entries.
+\item For explicit $Q$: form $Q$ by GEMM-based blocked application
+  of reflectors, as already done for eigenSH Q-accumulation.
+\item Block size $\mathtt{bs} \in \{32, 48, 64\}$; the T-factor
+  construction reuses the GEMM-based Gram matrix approach from
+  Round~16.
+\end{itemize}
+
+\paragraph{Expected impact.}
+$1.3\text{--}1.5\times$ improvement for explicit QR, with
+substantially larger gains for least-squares problems where $Q$ need
+not be formed explicitly.  The current QR is already
+$7.6\text{--}33\times$ faster than LAPACK, so this widens an existing
+advantage rather than closing a gap.
+
+\subsubsection{5.\ NUMA-Aware Parallelism}
+\label{sec:future-numa}
+
+\paragraph{Current state.}
+\texttt{matMulPPar} (Level3.hs) partitions row ranges across GHC
+lightweight threads via \texttt{forkIO} and an \texttt{MVar} barrier.
+Benchmarks show $6\text{--}7\times$ speedup at 16~threads for
+$100{\times}100$ and $3.4\text{--}3.6\times$ at $200{\times}200$,
+with non-monotonic scaling (slowdowns at 20 threads vs.\ 16 threads)
+that suggests memory bandwidth saturation and NUMA effects.
+
+\paragraph{Proposed optimisation.}
+\begin{itemize}
+\item \textbf{Thread affinity}: Pin GHC capabilities to physical cores
+  via \texttt{+RTS -qa} or explicit \texttt{sched\_setaffinity} calls
+  to avoid OS migration across NUMA domains.
+\item \textbf{NUMA-aware block partitioning}: On multi-socket systems,
+  partition tile blocks so that each thread's working set falls within
+  its local NUMA domain, reducing cross-socket memory traffic.
+\item \textbf{Finer-grained synchronisation}: The current row
+  partitioning synchronises at the full-matrix level; partitioning
+  into $k$-block slices with per-block barriers would improve load
+  balancing.
+\item \textbf{Adaptive thread count}: Detect the optimal thread count
+  per matrix size at library initialisation (or via a one-time
+  calibration), avoiding the performance cliff observed beyond 16
+  threads.
+\end{itemize}
+
+\paragraph{Expected impact.}
+$1.2\text{--}1.5\times$ improvement at 16{+} threads, primarily by
+eliminating the non-monotonic scaling regression.  Most impactful on
+multi-socket servers; minimal effect on single-socket desktop systems.
+
+\subsubsection{6.\ Adaptive Tile and Panel Sizes}
+\label{sec:future-tuning}
+
+\paragraph{Current state.}
+Both the GEMM tile size ($\mathtt{bs} = 64$) and the tridiagonalisation
+panel size ($\mathtt{nb} = 32$) are compile-time constants.  These
+were tuned on a single machine (AMD Ryzen, 32\,KB L1d, 512\,KB L2)
+and may not be optimal for other cache hierarchies.
+
+\paragraph{Proposed optimisation.}
+\begin{itemize}
+\item \textbf{GEMM tile size}: A $64{\times}64$ double tile occupies
+  $64 \times 64 \times 8 = 32$\,KB---exactly the L1d size.  On CPUs
+  with larger L1d (e.g., Apple M-series with 128\,KB), larger tiles
+  ($\mathtt{bs} \in \{96, 128\}$) would improve reuse.  On CPUs with
+  smaller L1d, $\mathtt{bs} = 48$ may be needed.
+\item \textbf{Panel size}: For tridiagonalisation, larger panels
+  ($\mathtt{nb} \in \{48, 64\}$) increase the GEMM-to-matvec ratio
+  in the DLATRD panel factorisation, favouring Level-3 BLAS.  However,
+  too-large panels increase the scalar within-panel cost.
+\item \textbf{Runtime detection}: Query L1/L2 cache sizes via
+  \texttt{/sys/devices/system/cpu/cpu0/cache/} on Linux or
+  \texttt{sysctl} on macOS, and select tile/panel sizes from a
+  pre-validated set $\{32, 48, 64, 96, 128\}$.
+\end{itemize}
+
+\paragraph{Expected impact.}
+$1.1\text{--}1.2\times$ improvement on non-default hardware, with no
+regression on the development machine.  Low implementation cost but
+requires cross-platform testing.
+
+\subsubsection{Summary of Future Opportunities}
+
+\begin{center}
+\begin{tabular}{clccc}
+\toprule
+\textbf{Priority} & \textbf{Optimisation} & \textbf{Difficulty} & \textbf{Expected gain} & \textbf{Primary beneficiary} \\
+\midrule
+1 & GEMM register blocking     & Medium & $1.5\text{--}2.0\times$ & GEMM, eigenSH, SVD \\
+2 & Symmetric matvec unrolling  & Low    & $1.2\text{--}1.5\times$ & eigenSH \\
+3 & Direct bidiagonalisation    & Medium & $1.5\text{--}2.0\times$ & SVD \\
+4 & Compact WY for QR           & Medium & $1.3\text{--}1.5\times$ & QR, least-squares \\
+5 & NUMA-aware parallelism      & Medium & $1.2\text{--}1.5\times$ & Parallel GEMM \\
+6 & Adaptive tile/panel sizes   & Low    & $1.1\text{--}1.2\times$ & All operations \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+If all six optimisations were implemented, the compounding effect would
+likely bring SVD to within $1.0\text{--}1.3\times$ of LAPACK and
+improve single-threaded GEMM by $1.5\text{--}2\times$, while
+strengthening the existing advantages in LU, Cholesky, and QR.
+
 %% ====================================================================
 \section{Conclusion}
 \label{sec:conclusion}
