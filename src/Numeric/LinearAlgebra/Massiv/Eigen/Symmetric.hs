@@ -711,7 +711,7 @@ symmetricEigenP a maxIter tol
         dFrozen <- M.freezeS md
         pure (MkVector dFrozen)
   in (dArr, MkMatrix qArr)
-  where dcCrossover = 100000  -- Initial: only QR path; tune after D&C optimisation
+  where dcCrossover = 100000  -- D&C has numerical issues at n≥128; keep QR path
 {-# NOINLINE symmetricEigenP #-}
 
 -- | Parallel specialised symmetric eigenvalue decomposition for @P Double@.

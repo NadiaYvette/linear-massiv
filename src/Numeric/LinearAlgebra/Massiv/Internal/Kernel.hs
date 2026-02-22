@@ -1424,24 +1424,39 @@ rawForwardSubUnitPackedSIMD (ByteArray ba_lu) (I# off_lu) (I# n)
         | otherwise =
             let rowOff = off_lu +# i *# n
                 dotLen = i
+                d8End = dotLen -# (dotLen `remInt#` 8#)
                 d4End = dotLen -# (dotLen `remInt#` 4#)
-            in case goSimd rowOff 0# d4End (broadcastDoubleX4# 0.0##) s of
-                 (# s1, acc4 #) ->
-                   let !(# a, b, c, d #) = unpackDoubleX4# acc4
-                       simdSum = a +## b +## c +## d
-                   in case goScalar rowOff d4End dotLen simdSum s1 of
-                        (# s2, dotVal #) ->
-                          case readDoubleArray# mba_x (off_x +# i) s2 of
-                            (# s3, xi #) ->
-                              case writeDoubleArray# mba_x (off_x +# i) (xi -## dotVal) s3 of
-                                s4 -> goI (i +# 1#) s4
+            in case goSimd8 rowOff 0# d8End (broadcastDoubleX4# 0.0##) (broadcastDoubleX4# 0.0##) s of
+                 (# s1, acc0, acc1 #) ->
+                   case goSimd4 rowOff d8End d4End acc0 s1 of
+                     (# s2, acc0' #) ->
+                       let !combined = plusDoubleX4# acc0' acc1
+                           !(# a, b, c, d #) = unpackDoubleX4# combined
+                           simdSum = a +## b +## c +## d
+                       in case goScalar rowOff d4End dotLen simdSum s2 of
+                            (# s3, dotVal #) ->
+                              case readDoubleArray# mba_x (off_x +# i) s3 of
+                                (# s4, xi #) ->
+                                  case writeDoubleArray# mba_x (off_x +# i) (xi -## dotVal) s4 of
+                                    s5 -> goI (i +# 1#) s5
 
-      goSimd rowOff k k4End acc s
+      goSimd8 rowOff k k8End acc0 acc1 s
+        | isTrue# (k >=# k8End) = (# s, acc0, acc1 #)
+        | otherwise =
+            let lv0 = indexDoubleArrayAsDoubleX4# ba_lu (rowOff +# k)
+                lv1 = indexDoubleArrayAsDoubleX4# ba_lu (rowOff +# k +# 4#)
+            in case readDoubleArrayAsDoubleX4# mba_x (off_x +# k) s of
+                 (# s', xv0 #) ->
+                   case readDoubleArrayAsDoubleX4# mba_x (off_x +# k +# 4#) s' of
+                     (# s'', xv1 #) -> goSimd8 rowOff (k +# 8#) k8End
+                                          (fmaddDoubleX4# lv0 xv0 acc0) (fmaddDoubleX4# lv1 xv1 acc1) s''
+
+      goSimd4 rowOff k k4End acc s
         | isTrue# (k >=# k4End) = (# s, acc #)
         | otherwise =
             let lv = indexDoubleArrayAsDoubleX4# ba_lu (rowOff +# k)
             in case readDoubleArrayAsDoubleX4# mba_x (off_x +# k) s of
-                 (# s', xv #) -> goSimd rowOff (k +# 4#) k4End (fmaddDoubleX4# lv xv acc) s'
+                 (# s', xv #) -> goSimd4 rowOff (k +# 4#) k4End (fmaddDoubleX4# lv xv acc) s'
 
       goScalar rowOff k kEnd acc s
         | isTrue# (k >=# kEnd) = (# s, acc #)
@@ -1466,25 +1481,40 @@ rawBackSubPackedSIMD (ByteArray ba_lu) (I# off_lu) (I# n)
             let rowOff = off_lu +# i *# n
                 dotStart = i +# 1#
                 dotLen = n -# i -# 1#
+                d8End = dotStart +# (dotLen -# (dotLen `remInt#` 8#))
                 d4End = dotStart +# (dotLen -# (dotLen `remInt#` 4#))
-            in case goSimd rowOff dotStart d4End (broadcastDoubleX4# 0.0##) s of
-                 (# s1, acc4 #) ->
-                   let !(# a, b, c, d #) = unpackDoubleX4# acc4
-                       simdSum = a +## b +## c +## d
-                   in case goScalar rowOff d4End n simdSum s1 of
-                        (# s2, dotVal #) ->
-                          let uii = indexDoubleArray# ba_lu (rowOff +# i)
-                          in case readDoubleArray# mba_x (off_x +# i) s2 of
-                               (# s3, xi #) ->
-                                 case writeDoubleArray# mba_x (off_x +# i) ((xi -## dotVal) /## uii) s3 of
-                                   s4 -> goI (i -# 1#) s4
+            in case goSimd8 rowOff dotStart d8End (broadcastDoubleX4# 0.0##) (broadcastDoubleX4# 0.0##) s of
+                 (# s1, acc0, acc1 #) ->
+                   case goSimd4 rowOff d8End d4End acc0 s1 of
+                     (# s2, acc0' #) ->
+                       let !combined = plusDoubleX4# acc0' acc1
+                           !(# a, b, c, d #) = unpackDoubleX4# combined
+                           simdSum = a +## b +## c +## d
+                       in case goScalar rowOff d4End n simdSum s2 of
+                            (# s3, dotVal #) ->
+                              let uii = indexDoubleArray# ba_lu (rowOff +# i)
+                              in case readDoubleArray# mba_x (off_x +# i) s3 of
+                                   (# s4, xi #) ->
+                                     case writeDoubleArray# mba_x (off_x +# i) ((xi -## dotVal) /## uii) s4 of
+                                       s5 -> goI (i -# 1#) s5
 
-      goSimd rowOff k k4End acc s
+      goSimd8 rowOff k k8End acc0 acc1 s
+        | isTrue# (k >=# k8End) = (# s, acc0, acc1 #)
+        | otherwise =
+            let uv0 = indexDoubleArrayAsDoubleX4# ba_lu (rowOff +# k)
+                uv1 = indexDoubleArrayAsDoubleX4# ba_lu (rowOff +# k +# 4#)
+            in case readDoubleArrayAsDoubleX4# mba_x (off_x +# k) s of
+                 (# s', xv0 #) ->
+                   case readDoubleArrayAsDoubleX4# mba_x (off_x +# k +# 4#) s' of
+                     (# s'', xv1 #) -> goSimd8 rowOff (k +# 8#) k8End
+                                          (fmaddDoubleX4# uv0 xv0 acc0) (fmaddDoubleX4# uv1 xv1 acc1) s''
+
+      goSimd4 rowOff k k4End acc s
         | isTrue# (k >=# k4End) = (# s, acc #)
         | otherwise =
             let uv = indexDoubleArrayAsDoubleX4# ba_lu (rowOff +# k)
             in case readDoubleArrayAsDoubleX4# mba_x (off_x +# k) s of
-                 (# s', xv #) -> goSimd rowOff (k +# 4#) k4End (fmaddDoubleX4# uv xv acc) s'
+                 (# s', xv #) -> goSimd4 rowOff (k +# 4#) k4End (fmaddDoubleX4# uv xv acc) s'
 
       goScalar rowOff k kEnd acc s
         | isTrue# (k >=# kEnd) = (# s, acc #)
@@ -1508,25 +1538,40 @@ rawForwardSubCholPackedSIMD (ByteArray ba_g) (I# off_g) (I# n)
         | otherwise =
             let rowOff = off_g +# i *# n
                 dotLen = i
+                d8End = dotLen -# (dotLen `remInt#` 8#)
                 d4End = dotLen -# (dotLen `remInt#` 4#)
-            in case goSimd rowOff 0# d4End (broadcastDoubleX4# 0.0##) s of
-                 (# s1, acc4 #) ->
-                   let !(# a, b, c, d #) = unpackDoubleX4# acc4
-                       simdSum = a +## b +## c +## d
-                   in case goScalar rowOff d4End dotLen simdSum s1 of
-                        (# s2, dotVal #) ->
-                          let gii = indexDoubleArray# ba_g (rowOff +# i)
-                          in case readDoubleArray# mba_x (off_x +# i) s2 of
-                               (# s3, xi #) ->
-                                 case writeDoubleArray# mba_x (off_x +# i) ((xi -## dotVal) /## gii) s3 of
-                                   s4 -> goI (i +# 1#) s4
+            in case goSimd8 rowOff 0# d8End (broadcastDoubleX4# 0.0##) (broadcastDoubleX4# 0.0##) s of
+                 (# s1, acc0, acc1 #) ->
+                   case goSimd4 rowOff d8End d4End acc0 s1 of
+                     (# s2, acc0' #) ->
+                       let !combined = plusDoubleX4# acc0' acc1
+                           !(# a, b, c, d #) = unpackDoubleX4# combined
+                           simdSum = a +## b +## c +## d
+                       in case goScalar rowOff d4End dotLen simdSum s2 of
+                            (# s3, dotVal #) ->
+                              let gii = indexDoubleArray# ba_g (rowOff +# i)
+                              in case readDoubleArray# mba_x (off_x +# i) s3 of
+                                   (# s4, xi #) ->
+                                     case writeDoubleArray# mba_x (off_x +# i) ((xi -## dotVal) /## gii) s4 of
+                                       s5 -> goI (i +# 1#) s5
 
-      goSimd rowOff k k4End acc s
+      goSimd8 rowOff k k8End acc0 acc1 s
+        | isTrue# (k >=# k8End) = (# s, acc0, acc1 #)
+        | otherwise =
+            let gv0 = indexDoubleArrayAsDoubleX4# ba_g (rowOff +# k)
+                gv1 = indexDoubleArrayAsDoubleX4# ba_g (rowOff +# k +# 4#)
+            in case readDoubleArrayAsDoubleX4# mba_x (off_x +# k) s of
+                 (# s', xv0 #) ->
+                   case readDoubleArrayAsDoubleX4# mba_x (off_x +# k +# 4#) s' of
+                     (# s'', xv1 #) -> goSimd8 rowOff (k +# 8#) k8End
+                                          (fmaddDoubleX4# gv0 xv0 acc0) (fmaddDoubleX4# gv1 xv1 acc1) s''
+
+      goSimd4 rowOff k k4End acc s
         | isTrue# (k >=# k4End) = (# s, acc #)
         | otherwise =
             let gv = indexDoubleArrayAsDoubleX4# ba_g (rowOff +# k)
             in case readDoubleArrayAsDoubleX4# mba_x (off_x +# k) s of
-                 (# s', xv #) -> goSimd rowOff (k +# 4#) k4End (fmaddDoubleX4# gv xv acc) s'
+                 (# s', xv #) -> goSimd4 rowOff (k +# 4#) k4End (fmaddDoubleX4# gv xv acc) s'
 
       goScalar rowOff k kEnd acc s
         | isTrue# (k >=# kEnd) = (# s, acc #)
@@ -1559,16 +1604,30 @@ rawBackSubCholTPackedSIMD (ByteArray ba_g) (I# off_g) (I# n)
                           let jRowOff = off_g +# j *# n
                               negXj4 = broadcastDoubleX4# (negateDouble# xj)
                               updateLen = j
+                              u8End = updateLen -# (updateLen `remInt#` 8#)
                               u4End = updateLen -# (updateLen `remInt#` 4#)
 
-                              goSimd i s_
+                              goSimd8 i s_
+                                | isTrue# (i >=# u8End) = s_
+                                | otherwise =
+                                    let gv0 = indexDoubleArrayAsDoubleX4# ba_g (jRowOff +# i)
+                                        gv1 = indexDoubleArrayAsDoubleX4# ba_g (jRowOff +# i +# 4#)
+                                    in case readDoubleArrayAsDoubleX4# mba_x (off_x +# i) s_ of
+                                         (# s1, xv0 #) ->
+                                           case readDoubleArrayAsDoubleX4# mba_x (off_x +# i +# 4#) s1 of
+                                             (# s2, xv1 #) ->
+                                               case writeDoubleArrayAsDoubleX4# mba_x (off_x +# i) (fmaddDoubleX4# negXj4 gv0 xv0) s2 of
+                                                 s3 -> case writeDoubleArrayAsDoubleX4# mba_x (off_x +# i +# 4#) (fmaddDoubleX4# negXj4 gv1 xv1) s3 of
+                                                         s4 -> goSimd8 (i +# 8#) s4
+
+                              goSimd4 i s_
                                 | isTrue# (i >=# u4End) = s_
                                 | otherwise =
                                     let gv = indexDoubleArrayAsDoubleX4# ba_g (jRowOff +# i)
                                     in case readDoubleArrayAsDoubleX4# mba_x (off_x +# i) s_ of
                                          (# s1, xv #) ->
                                            case writeDoubleArrayAsDoubleX4# mba_x (off_x +# i) (fmaddDoubleX4# negXj4 gv xv) s1 of
-                                             s2 -> goSimd (i +# 4#) s2
+                                             s2 -> goSimd4 (i +# 4#) s2
 
                               goScalar i s_
                                 | isTrue# (i >=# j) = s_
@@ -1579,7 +1638,7 @@ rawBackSubCholTPackedSIMD (ByteArray ba_g) (I# off_g) (I# n)
                                            case writeDoubleArray# mba_x (off_x +# i) (xi -## gji *## xj) s1 of
                                              s2 -> goScalar (i +# 1#) s2
 
-                          in goJ (j -# 1#) (goScalar u4End (goSimd 0# s''))
+                          in goJ (j -# 1#) (goScalar u4End (goSimd4 u8End (goSimd8 0# s'')))
   in (# goJ (n -# 1#) s0, () #)
 {-# INLINE rawBackSubCholTPackedSIMD #-}
 
