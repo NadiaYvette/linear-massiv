@@ -172,7 +172,7 @@ tridiagonalizeP a =
             betas <- mapM (\k -> tridiagStepP mbaT offT nn mbaV mbaP mbaW k) [0..nn-3]
             pure betas
           else do
-            let !nb = 32
+            let !nb = 48
                 !numRef = nn - 2  -- number of Householder reflectors
             -- V_panel (nn × nb) and W_panel (nn × nb) for deferred rank-2 updates
             mbaVp <- newByteArray (nn * nb * 8)
@@ -220,7 +220,7 @@ tridiagonalizeP a =
           else do
             -- Blocked WY approach: Q <- Q * (I - Y * T * Y^T) per block
             let !numRef = nn - 2
-                !nb = min 32 numRef
+                !nb = min 48 numRef
             mbaBetas <- newByteArray (numRef * 8)
             forM_ (zip [0..] betaList) $ \(i, b) -> writeRawD mbaBetas 0 i b
             mbaY  <- newByteArray (nn * nb * 8)

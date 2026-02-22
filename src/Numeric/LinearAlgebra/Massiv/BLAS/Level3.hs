@@ -77,7 +77,7 @@ import Data.Array.Byte (MutableByteArray(..))
 import Data.Primitive.ByteArray (ByteArray(..), newByteArray, unsafeFreezeByteArray)
 import Numeric.LinearAlgebra.Massiv.Types
 import Numeric.LinearAlgebra.Massiv.Internal
-import Control.Concurrent (forkIO, newEmptyMVar, putMVar, takeMVar, getNumCapabilities)
+import Control.Concurrent (forkOn, newEmptyMVar, putMVar, takeMVar, getNumCapabilities)
 import System.IO.Unsafe (unsafePerformIO)
 import GHC.IO (stToIO)
 import Numeric.LinearAlgebra.Massiv.Internal.Kernel (rawGemmKernel, rawGemmBISlice)
@@ -221,7 +221,11 @@ matMulPPar a b = unsafePerformIO $ do
       !baB = unwrapByteArray (unMatrix b)
       !offB = unwrapByteArrayOffset (unMatrix b)
   caps <- getNumCapabilities
-  let numThreads = min caps mm  -- no point having more threads than rows
+  -- Adaptive thread count: ensure each thread gets enough rows to
+  -- amortize fork/join overhead (minimum 16 rows per thread).
+  let !minRowsPerThread = 16
+      !maxThreads = max 1 (mm `div` minRowsPerThread)
+      !numThreads = min caps (min mm maxThreads)
   if numThreads <= 1
     then pure (matMulP a b)
     else do
@@ -230,12 +234,12 @@ matMulPPar a b = unsafePerformIO $ do
       let !mbaC = unwrapMutableByteArray mc
           !offC = unwrapMutableByteArrayOffset mc
           !chunkSize = (mm + numThreads - 1) `div` numThreads
-      -- Fork threads, each processing a row range
+      -- Fork threads pinned to capabilities (avoids OS migration)
       mvars <- mapM (\t -> do
         let !biStart = t * chunkSize
             !biEnd = min (biStart + chunkSize) mm
         mv <- newEmptyMVar
-        _ <- forkIO $ do
+        _ <- forkOn t $ do
           stToIO $ rawGemmBISlice baA offA baB offB mbaC offC biStart biEnd mm kk nn
           putMVar mv ()
         pure mv

@@ -171,44 +171,210 @@ rawGemmBISlice (ByteArray ba_a) (I# off_a) (ByteArray ba_b) (I# off_b)
         | isTrue# (bj >=# n) = s
         | otherwise =
             let jEnd = minI (bj +# bs) n
-            in goBJ bi iEnd bk kEnd (bj +# bs) (innerIKJ bi iEnd bk kEnd bj jEnd s)
+            in goBJ bi iEnd bk kEnd (bj +# bs) (innerBlock bi iEnd bk kEnd bj jEnd s)
 
-      innerIKJ bi iEnd bk kEnd bj jEnd s0_ = goI bi s0_
-        where
-          goI i s
-            | isTrue# (i >=# iEnd) = s
-            | otherwise = goI (i +# 1#) (goK i bk s)
+      -- Register-blocked micro-kernel: process 4 rows × 8 columns of C
+      -- in SIMD registers across the full k-range, writing back once.
+      innerBlock bi iEnd bk kEnd bj jEnd s0_ =
+        let !jSpan = jEnd -# bj
+            !j8End = bj +# (jSpan -# (jSpan `remInt#` 8#))
+            !j4End = bj +# (jSpan -# (jSpan `remInt#` 4#))
+            !iSpan = iEnd -# bi
+            !i4End = bi +# (iSpan -# (iSpan `remInt#` 4#))
+        in goI4 bi i4End iEnd j8End j4End bk kEnd bj jEnd s0_
 
-          goK i kk s
-            | isTrue# (kk >=# kEnd) = s
-            | otherwise =
-                let aik = indexDoubleArray# ba_a (off_a +# i *# k +# kk)
-                    aikV = broadcastDoubleX4# aik
-                    bRowOff = off_b +# kk *# n
-                    cRowOff = off_c +# i *# n
-                    jSpan = jEnd -# bj
-                    j4End = bj +# (jSpan -# (jSpan `remInt#` 4#))
-                in goK i (kk +# 1#) (goJSimd bj j4End aikV bRowOff cRowOff
-                                      (goJScalar j4End jEnd aik bRowOff cRowOff s))
+      -- Process 4 rows at a time
+      goI4 i i4End iEnd_ j8End j4End bk kEnd bj jEnd s
+        | isTrue# (i >=# i4End) = goI1 i iEnd_ j8End j4End bk kEnd bj jEnd s
+        | otherwise =
+            goI4 (i +# 4#) i4End iEnd_ j8End j4End bk kEnd bj jEnd
+              (goJ8_4x8 i bk kEnd bj j8End
+                (goJ4_4x4 i bk kEnd j8End j4End
+                  (goJScalar4 i bk kEnd j4End jEnd s)))
 
-          goJSimd j j4End aikV bRowOff cRowOff s
-            | isTrue# (j >=# j4End) = s
-            | otherwise =
-                let bv = indexDoubleArrayAsDoubleX4# ba_b (bRowOff +# j)
-                in case readDoubleArrayAsDoubleX4# mba_c (cRowOff +# j) s of
-                     (# s', cv #) ->
-                       let cv' = fmaddDoubleX4# aikV bv cv
-                       in case writeDoubleArrayAsDoubleX4# mba_c (cRowOff +# j) cv' s' of
-                            s'' -> goJSimd (j +# 4#) j4End aikV bRowOff cRowOff s''
+      -- Process remaining 1 row at a time (up to tile boundary iEnd_, not biEnd)
+      goI1 i iEnd_ j8End j4End bk kEnd bj jEnd s
+        | isTrue# (i >=# iEnd_) = s
+        | otherwise =
+            goI1 (i +# 1#) iEnd_ j8End j4End bk kEnd bj jEnd
+              (goJ8_1x8 i bk kEnd bj j8End
+                (goJ4_1x4 i bk kEnd j8End j4End
+                  (goJScalar1 i bk kEnd j4End jEnd s)))
 
-          goJScalar j jEnd_ aik bRowOff cRowOff s
-            | isTrue# (j >=# jEnd_) = s
-            | otherwise =
-                let bkj = indexDoubleArray# ba_b (bRowOff +# j)
-                in case readDoubleArray# mba_c (cRowOff +# j) s of
-                     (# s', cij #) ->
-                       case writeDoubleArray# mba_c (cRowOff +# j) (cij +## aik *## bkj) s' of
-                         s'' -> goJScalar (j +# 1#) jEnd_ aik bRowOff cRowOff s''
+      -- 4×8 micro-kernel: 4 rows of i, 8 columns of j (2× DoubleX4#)
+      -- Load 8 C accumulators, sweep k, write back
+      goJ8_4x8 i bk kEnd j j8End s
+        | isTrue# (j >=# j8End) = s
+        | otherwise =
+          let !cOff0 = off_c +# i *# n +# j
+              !cOff1 = off_c +# (i +# 1#) *# n +# j
+              !cOff2 = off_c +# (i +# 2#) *# n +# j
+              !cOff3 = off_c +# (i +# 3#) *# n +# j
+          in case readDoubleArrayAsDoubleX4# mba_c cOff0 s of { (# s0a, c00 #) ->
+             case readDoubleArrayAsDoubleX4# mba_c (cOff0 +# 4#) s0a of { (# s0b, c01 #) ->
+             case readDoubleArrayAsDoubleX4# mba_c cOff1 s0b of { (# s1a, c10 #) ->
+             case readDoubleArrayAsDoubleX4# mba_c (cOff1 +# 4#) s1a of { (# s1b, c11 #) ->
+             case readDoubleArrayAsDoubleX4# mba_c cOff2 s1b of { (# s2a, c20 #) ->
+             case readDoubleArrayAsDoubleX4# mba_c (cOff2 +# 4#) s2a of { (# s2b, c21 #) ->
+             case readDoubleArrayAsDoubleX4# mba_c cOff3 s2b of { (# s3a, c30 #) ->
+             case readDoubleArrayAsDoubleX4# mba_c (cOff3 +# 4#) s3a of { (# s3b, c31 #) ->
+             -- Now sweep k, accumulating in registers
+             case goK4x8 i j bk kEnd c00 c01 c10 c11 c20 c21 c30 c31 of
+               (# r00, r01, r10, r11, r20, r21, r30, r31 #) ->
+                 -- Write back all 8 SIMD registers
+                 case writeDoubleArrayAsDoubleX4# mba_c cOff0 r00 s3b of { sw0 ->
+                 case writeDoubleArrayAsDoubleX4# mba_c (cOff0 +# 4#) r01 sw0 of { sw1 ->
+                 case writeDoubleArrayAsDoubleX4# mba_c cOff1 r10 sw1 of { sw2 ->
+                 case writeDoubleArrayAsDoubleX4# mba_c (cOff1 +# 4#) r11 sw2 of { sw3 ->
+                 case writeDoubleArrayAsDoubleX4# mba_c cOff2 r20 sw3 of { sw4 ->
+                 case writeDoubleArrayAsDoubleX4# mba_c (cOff2 +# 4#) r21 sw4 of { sw5 ->
+                 case writeDoubleArrayAsDoubleX4# mba_c cOff3 r30 sw5 of { sw6 ->
+                 case writeDoubleArrayAsDoubleX4# mba_c (cOff3 +# 4#) r31 sw6 of { sw7 ->
+                 goJ8_4x8 i bk kEnd (j +# 8#) j8End sw7
+                 }}}}}}}}
+             }}}}}}}}
+
+      -- Pure k-loop for 4×8: no state threading needed (immutable A, B reads)
+      goK4x8 i j kk kEnd c00 c01 c10 c11 c20 c21 c30 c31
+        | isTrue# (kk >=# kEnd) =
+            (# c00, c01, c10, c11, c20, c21, c30, c31 #)
+        | otherwise =
+            let !bOff = off_b +# kk *# n +# j
+                !bv0 = indexDoubleArrayAsDoubleX4# ba_b bOff
+                !bv1 = indexDoubleArrayAsDoubleX4# ba_b (bOff +# 4#)
+                !a0 = broadcastDoubleX4# (indexDoubleArray# ba_a (off_a +# i *# k +# kk))
+                !a1 = broadcastDoubleX4# (indexDoubleArray# ba_a (off_a +# (i +# 1#) *# k +# kk))
+                !a2 = broadcastDoubleX4# (indexDoubleArray# ba_a (off_a +# (i +# 2#) *# k +# kk))
+                !a3 = broadcastDoubleX4# (indexDoubleArray# ba_a (off_a +# (i +# 3#) *# k +# kk))
+            in goK4x8 i j (kk +# 1#) kEnd
+                 (fmaddDoubleX4# a0 bv0 c00) (fmaddDoubleX4# a0 bv1 c01)
+                 (fmaddDoubleX4# a1 bv0 c10) (fmaddDoubleX4# a1 bv1 c11)
+                 (fmaddDoubleX4# a2 bv0 c20) (fmaddDoubleX4# a2 bv1 c21)
+                 (fmaddDoubleX4# a3 bv0 c30) (fmaddDoubleX4# a3 bv1 c31)
+
+      -- 4×4 cleanup: 4 rows, 4 columns (1× DoubleX4#)
+      goJ4_4x4 i bk kEnd j j4End s
+        | isTrue# (j >=# j4End) = s
+        | otherwise =
+          let !cOff0 = off_c +# i *# n +# j
+              !cOff1 = off_c +# (i +# 1#) *# n +# j
+              !cOff2 = off_c +# (i +# 2#) *# n +# j
+              !cOff3 = off_c +# (i +# 3#) *# n +# j
+          in case readDoubleArrayAsDoubleX4# mba_c cOff0 s of { (# s0, c0 #) ->
+             case readDoubleArrayAsDoubleX4# mba_c cOff1 s0 of { (# s1, c1 #) ->
+             case readDoubleArrayAsDoubleX4# mba_c cOff2 s1 of { (# s2, c2 #) ->
+             case readDoubleArrayAsDoubleX4# mba_c cOff3 s2 of { (# s3, c3 #) ->
+             case goK4x4 i j bk kEnd c0 c1 c2 c3 of
+               (# r0, r1, r2, r3 #) ->
+                 case writeDoubleArrayAsDoubleX4# mba_c cOff0 r0 s3 of { sw0 ->
+                 case writeDoubleArrayAsDoubleX4# mba_c cOff1 r1 sw0 of { sw1 ->
+                 case writeDoubleArrayAsDoubleX4# mba_c cOff2 r2 sw1 of { sw2 ->
+                 case writeDoubleArrayAsDoubleX4# mba_c cOff3 r3 sw2 of { sw3 ->
+                 goJ4_4x4 i bk kEnd (j +# 4#) j4End sw3
+                 }}}}
+             }}}}
+
+      goK4x4 i j kk kEnd c0 c1 c2 c3
+        | isTrue# (kk >=# kEnd) = (# c0, c1, c2, c3 #)
+        | otherwise =
+            let !bv = indexDoubleArrayAsDoubleX4# ba_b (off_b +# kk *# n +# j)
+                !a0 = broadcastDoubleX4# (indexDoubleArray# ba_a (off_a +# i *# k +# kk))
+                !a1 = broadcastDoubleX4# (indexDoubleArray# ba_a (off_a +# (i +# 1#) *# k +# kk))
+                !a2 = broadcastDoubleX4# (indexDoubleArray# ba_a (off_a +# (i +# 2#) *# k +# kk))
+                !a3 = broadcastDoubleX4# (indexDoubleArray# ba_a (off_a +# (i +# 3#) *# k +# kk))
+            in goK4x4 i j (kk +# 1#) kEnd
+                 (fmaddDoubleX4# a0 bv c0) (fmaddDoubleX4# a1 bv c1)
+                 (fmaddDoubleX4# a2 bv c2) (fmaddDoubleX4# a3 bv c3)
+
+      -- Scalar cleanup for 4 rows (columns not a multiple of 4)
+      goJScalar4 i bk kEnd j jEnd_ s
+        | isTrue# (j >=# jEnd_) = s
+        | otherwise =
+          let goK_s4 kk acc0 acc1 acc2 acc3
+                | isTrue# (kk >=# kEnd) = (# acc0, acc1, acc2, acc3 #)
+                | otherwise =
+                    let !bkj = indexDoubleArray# ba_b (off_b +# kk *# n +# j)
+                        !a0_ = indexDoubleArray# ba_a (off_a +# i *# k +# kk)
+                        !a1_ = indexDoubleArray# ba_a (off_a +# (i +# 1#) *# k +# kk)
+                        !a2_ = indexDoubleArray# ba_a (off_a +# (i +# 2#) *# k +# kk)
+                        !a3_ = indexDoubleArray# ba_a (off_a +# (i +# 3#) *# k +# kk)
+                    in goK_s4 (kk +# 1#)
+                         (acc0 +## a0_ *## bkj) (acc1 +## a1_ *## bkj)
+                         (acc2 +## a2_ *## bkj) (acc3 +## a3_ *## bkj)
+              !cOff0 = off_c +# i *# n +# j
+              !cOff1 = off_c +# (i +# 1#) *# n +# j
+              !cOff2 = off_c +# (i +# 2#) *# n +# j
+              !cOff3 = off_c +# (i +# 3#) *# n +# j
+          in case (# goK_s4 bk 0.0## 0.0## 0.0## 0.0## #) of
+               (# (# d0, d1, d2, d3 #) #) ->
+                 case readDoubleArray# mba_c cOff0 s of { (# s0, v0 #) ->
+                 case writeDoubleArray# mba_c cOff0 (v0 +## d0) s0 of { s1 ->
+                 case readDoubleArray# mba_c cOff1 s1 of { (# s2, v1 #) ->
+                 case writeDoubleArray# mba_c cOff1 (v1 +## d1) s2 of { s3 ->
+                 case readDoubleArray# mba_c cOff2 s3 of { (# s4, v2 #) ->
+                 case writeDoubleArray# mba_c cOff2 (v2 +## d2) s4 of { s5 ->
+                 case readDoubleArray# mba_c cOff3 s5 of { (# s6, v3 #) ->
+                 case writeDoubleArray# mba_c cOff3 (v3 +## d3) s6 of { s7 ->
+                 goJScalar4 i bk kEnd (j +# 1#) jEnd_ s7
+                 }}}}}}}}
+
+      -- 1×8 micro-kernel: 1 row of i, 8 columns of j
+      goJ8_1x8 i bk kEnd j j8End s
+        | isTrue# (j >=# j8End) = s
+        | otherwise =
+          let !cOff = off_c +# i *# n +# j
+          in case readDoubleArrayAsDoubleX4# mba_c cOff s of { (# s0, c0 #) ->
+             case readDoubleArrayAsDoubleX4# mba_c (cOff +# 4#) s0 of { (# s1, c1 #) ->
+             case goK1x8 i j bk kEnd c0 c1 of
+               (# r0, r1 #) ->
+                 case writeDoubleArrayAsDoubleX4# mba_c cOff r0 s1 of { sw0 ->
+                 case writeDoubleArrayAsDoubleX4# mba_c (cOff +# 4#) r1 sw0 of { sw1 ->
+                 goJ8_1x8 i bk kEnd (j +# 8#) j8End sw1
+                 }}
+             }}
+
+      goK1x8 i j kk kEnd c0 c1
+        | isTrue# (kk >=# kEnd) = (# c0, c1 #)
+        | otherwise =
+            let !bOff = off_b +# kk *# n +# j
+                !bv0 = indexDoubleArrayAsDoubleX4# ba_b bOff
+                !bv1 = indexDoubleArrayAsDoubleX4# ba_b (bOff +# 4#)
+                !av = broadcastDoubleX4# (indexDoubleArray# ba_a (off_a +# i *# k +# kk))
+            in goK1x8 i j (kk +# 1#) kEnd
+                 (fmaddDoubleX4# av bv0 c0) (fmaddDoubleX4# av bv1 c1)
+
+      -- 1×4 cleanup
+      goJ4_1x4 i bk kEnd j j4End s
+        | isTrue# (j >=# j4End) = s
+        | otherwise =
+          let !cOff = off_c +# i *# n +# j
+          in case readDoubleArrayAsDoubleX4# mba_c cOff s of { (# s0, c0 #) ->
+             case goK1x4 i j bk kEnd c0 of { r0 ->
+             case writeDoubleArrayAsDoubleX4# mba_c cOff r0 s0 of { s1 ->
+             goJ4_1x4 i bk kEnd (j +# 4#) j4End s1
+             }}}
+
+      goK1x4 i j kk kEnd c0
+        | isTrue# (kk >=# kEnd) = c0
+        | otherwise =
+            let !bv = indexDoubleArrayAsDoubleX4# ba_b (off_b +# kk *# n +# j)
+                !av = broadcastDoubleX4# (indexDoubleArray# ba_a (off_a +# i *# k +# kk))
+            in goK1x4 i j (kk +# 1#) kEnd (fmaddDoubleX4# av bv c0)
+
+      -- Scalar cleanup for 1 row
+      goJScalar1 i bk kEnd j jEnd_ s
+        | isTrue# (j >=# jEnd_) = s
+        | otherwise =
+          let goK_s1 kk acc
+                | isTrue# (kk >=# kEnd) = acc
+                | otherwise =
+                    let !bkj = indexDoubleArray# ba_b (off_b +# kk *# n +# j)
+                        !aik = indexDoubleArray# ba_a (off_a +# i *# k +# kk)
+                    in goK_s1 (kk +# 1#) (acc +## aik *## bkj)
+          in case readDoubleArray# mba_c (off_c +# i *# n +# j) s of
+               (# s', cij #) ->
+                 case writeDoubleArray# mba_c (off_c +# i *# n +# j) (cij +## goK_s1 bk 0.0##) s' of
+                   s'' -> goJScalar1 i bk kEnd (j +# 1#) jEnd_ s''
 
   in (# goBI biStart s0, () #)
 {-# INLINE rawGemmBISlice #-}
@@ -419,21 +585,48 @@ rawMutSymMatvecSub (MutableByteArray mba_t) (I# off_t) (I# ncols)
                    (MutableByteArray mba_p) (I# off_p)
                    (I# from_) (I# to) = ST $ \s0 ->
   let !len = to -# from_
+      !len8 = len -# (len `remInt#` 8#)
       !len4 = len -# (len `remInt#` 4#)
 
       goI i s
         | isTrue# (i >=# to) = s
         | otherwise =
             let !rowBase = off_t +# i *# ncols +# from_
-            in case goJ4 rowBase 0# (broadcastDoubleX4# 0.0##) s of
-                (# s1, accV #) ->
-                  let !(# a0, a1, a2, a3 #) = unpackDoubleX4# accV
-                      !simdSum = a0 +## a1 +## a2 +## a3
-                  in case goJTail rowBase len4 simdSum s1 of
-                      (# s2, acc #) ->
-                        case writeDoubleArray# mba_p (off_p +# (i -# from_)) acc s2 of
-                          s3 -> goI (i +# 1#) s3
+            -- 8-wide SIMD phase: two independent accumulators
+            in case goJ8 rowBase 0#
+                      (broadcastDoubleX4# 0.0##)
+                      (broadcastDoubleX4# 0.0##) s of
+                (# s1, accV0, accV1 #) ->
+                  -- 4-wide cleanup phase
+                  case goJ4 rowBase len8 accV0 s1 of
+                    (# s2, accV0' #) ->
+                      -- Reduce both SIMD accumulators to scalar
+                      let !combined = plusDoubleX4# accV0' accV1
+                          !(# a0, a1, a2, a3 #) = unpackDoubleX4# combined
+                          !simdSum = a0 +## a1 +## a2 +## a3
+                      -- Scalar tail
+                      in case goJTail rowBase len4 simdSum s2 of
+                          (# s3, acc #) ->
+                            case writeDoubleArray# mba_p (off_p +# (i -# from_)) acc s3 of
+                              s4 -> goI (i +# 1#) s4
 
+      -- Process 8 doubles (2× DoubleX4#) per iteration
+      goJ8 rowBase j accV0 accV1 s
+        | isTrue# (j >=# len8) = (# s, accV0, accV1 #)
+        | otherwise =
+            case readDoubleArrayAsDoubleX4# mba_t (rowBase +# j) s of
+              (# s1, tv0 #) ->
+                case readDoubleArrayAsDoubleX4# mba_v (off_v +# j) s1 of
+                  (# s2, vv0 #) ->
+                    case readDoubleArrayAsDoubleX4# mba_t (rowBase +# j +# 4#) s2 of
+                      (# s3, tv1 #) ->
+                        case readDoubleArrayAsDoubleX4# mba_v (off_v +# j +# 4#) s3 of
+                          (# s4, vv1 #) ->
+                            goJ8 rowBase (j +# 8#)
+                              (fmaddDoubleX4# tv0 vv0 accV0)
+                              (fmaddDoubleX4# tv1 vv1 accV1) s4
+
+      -- 4-wide cleanup for elements between len8 and len4
       goJ4 rowBase j accV s
         | isTrue# (j >=# len4) = (# s, accV #)
         | otherwise =

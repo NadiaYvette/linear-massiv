@@ -65,17 +65,19 @@ import qualified Data.Massiv.Array as M
 import Data.Massiv.Array (Ix1, Ix2(..), Sz(..), unwrapByteArray, unwrapByteArrayOffset,
                           unwrapMutableByteArray, unwrapMutableByteArrayOffset)
 import GHC.TypeNats (KnownNat)
+import Control.Monad (when)
 import Control.Monad.ST (ST)
 import GHC.Exts
 import GHC.ST (ST(..))
-import Data.Primitive.ByteArray (ByteArray(..), MutableByteArray(..))
+import Data.Primitive.ByteArray (ByteArray(..), MutableByteArray(..), newByteArray, unsafeFreezeByteArray)
 
 import Numeric.LinearAlgebra.Massiv.Types
 import Numeric.LinearAlgebra.Massiv.Internal
 import Numeric.LinearAlgebra.Massiv.Orthogonal.Givens
   (givensRotation)
 import Numeric.LinearAlgebra.Massiv.Internal.Kernel
-  (rawMutSumSqColumn, rawMutSumProdColumns, rawMutHouseholderApply, rawMutQAccum)
+  (rawMutSumSqColumn, rawMutSumProdColumns, rawMutHouseholderApply, rawMutQAccum,
+   rawGemmKernel, rawZeroDoubles, rawNegateDoubles)
 
 -- | Full QR factorisation via Householder reflections (GVL4 Algorithm 5.2.1, p. 249).
 --
@@ -218,25 +220,116 @@ qrP a =
           ) [0..steps-1]
         pure betas
 
-      -- Phase 2: Backward accumulation of Q using raw kernels.
+      -- Phase 2: Blocked WY Q accumulation using GEMM.
+      -- Group Householder vectors into panels of size nb, compute T-factor
+      -- via GEMM, and apply block reflectors via Level-3 GEMM.
       qMat = createMatrix @m @m @M.P $ \mq -> do
-        -- Initialize Q = I
-        mapM_ (\i -> mapM_ (\j ->
-          M.write_ mq (i :. j) (if i == j then 1 else 0)
-          ) [0..mm-1]) [0..mm-1]
         let mbaQ = unwrapMutableByteArray mq
             offQ = unwrapMutableByteArrayOffset mq
             baR = unwrapByteArray rArr
             offFR = unwrapByteArrayOffset rArr
-        -- Forward accumulation: Q <- Q·H_0·H_1·…·H_{steps-1}
-        mapM_ (\k -> do
-          let beta_k = betaList !! k
-          if beta_k == 0 then pure ()
-          else
-            mapM_ (\i ->
-              rawMutQAccum mbaQ offQ mm baR offFR nn beta_k k mm i
-              ) [0..mm-1]
-          ) [0..steps-1]
+        -- Initialize Q = I via rawZeroDoubles + diagonal writes
+        rawZeroDoubles mbaQ offQ (mm * mm)
+        mapM_ (\i -> writeRawD mbaQ offQ (i * mm + i) 1) [0..mm-1]
+
+        if steps <= 16
+          then
+            -- Small matrix: per-row accumulation (Level-2)
+            mapM_ (\k -> do
+              let beta_k = betaList !! k
+              if beta_k == 0 then pure ()
+              else
+                mapM_ (\i ->
+                  rawMutQAccum mbaQ offQ mm baR offFR nn beta_k k mm i
+                  ) [0..mm-1]
+              ) [0..steps-1]
+          else do
+            -- Blocked WY: batch nb Householder vectors at a time
+            let !nb = min 32 steps
+            mbaBetas <- newByteArray (steps * 8)
+            mapM_ (\(i, b) -> writeRawD mbaBetas 0 i b) (zip [0..] betaList)
+            mbaY  <- newByteArray (mm * nb * 8)
+            mbaTf <- newByteArray (nb * nb * 8)
+            mbaW1 <- newByteArray (mm * nb * 8)
+            mbaW2 <- newByteArray (mm * nb * 8)
+            mbaYT <- newByteArray (nb * mm * 8)
+            mbaG  <- newByteArray (nb * nb * 8)
+
+            let goBlock !k0
+                  | k0 >= steps = pure ()
+                  | otherwise = do
+                      let !bs = min nb (steps - k0)
+                      -- Pack Y (mm × bs): Y[:,j] = v_{k0+j}
+                      -- v_k has implicit 1 at position k, stored values at k+1..mm-1
+                      rawZeroDoubles mbaY 0 (mm * bs)
+                      mapM_ (\j -> do
+                        let !k = k0 + j
+                        writeRawD mbaY 0 (k * bs + j) 1.0
+                        mapM_ (\l ->
+                          writeRawD mbaY 0 (l * bs + j) (indexRawD baR offFR (l * nn + k))
+                          ) [k+1..mm-1]
+                        ) [0..bs-1]
+
+                      -- Transpose Y → Y^T (bs × mm) for GEMM reuse
+                      rawZeroDoubles mbaYT 0 (bs * mm)
+                      mapM_ (\j -> do
+                        let !k = k0 + j
+                        writeRawD mbaYT 0 (j * mm + k) 1.0
+                        mapM_ (\l ->
+                          writeRawD mbaYT 0 (j * mm + l) (indexRawD baR offFR (l * nn + k))
+                          ) [k+1..mm-1]
+                        ) [0..bs-1]
+
+                      baY  <- unsafeFreezeByteArray mbaY
+                      baYT <- unsafeFreezeByteArray mbaYT
+
+                      -- Compute G = Y^T × Y (bs × bs) via GEMM
+                      rawZeroDoubles mbaG 0 (bs * bs)
+                      rawGemmKernel baYT 0 baY 0 mbaG 0 bs mm bs
+
+                      -- Build T-factor (bs × bs upper-triangular)
+                      rawZeroDoubles mbaTf 0 (bs * bs)
+                      mapM_ (\j -> do
+                        betaj <- readRawD mbaBetas 0 (k0 + j)
+                        writeRawD mbaTf 0 (j * bs + j) betaj
+                        when (j > 0 && betaj /= 0) $ do
+                          -- T[0..j-1, j] = -betaj * T[0..j-1, 0..j-1] * G[0..j-1, j]
+                          mapM_ (\i -> do
+                            g_ij <- readRawD mbaG 0 (i * bs + j)
+                            writeRawD mbaW1 0 i g_ij
+                            ) [0..j-1]
+                          mapM_ (\i -> do
+                            let triLoop !l !acc
+                                  | l >= j = pure acc
+                                  | otherwise = do
+                                      til <- readRawD mbaTf 0 (i * bs + l)
+                                      dl  <- readRawD mbaW1 0 l
+                                      triLoop (l+1) (acc + til * dl)
+                            z <- triLoop 0 0
+                            writeRawD mbaTf 0 (i * bs + j) (negate betaj * z)
+                            ) [0..j-1]
+                        ) [0..bs-1]
+
+                      -- W1 = Q · Y (mm×mm * mm×bs → mm×bs)
+                      baQ <- unsafeFreezeByteArray mbaQ
+                      rawZeroDoubles mbaW1 0 (mm * bs)
+                      rawGemmKernel baQ offQ baY 0 mbaW1 0 mm mm bs
+
+                      -- W2 = W1 · T (mm×bs * bs×bs → mm×bs)
+                      baW1 <- unsafeFreezeByteArray mbaW1
+                      baTf <- unsafeFreezeByteArray mbaTf
+                      rawZeroDoubles mbaW2 0 (mm * bs)
+                      rawGemmKernel baW1 0 baTf 0 mbaW2 0 mm bs bs
+
+                      -- Negate W2 in-place
+                      rawNegateDoubles mbaW2 0 (mm * bs)
+
+                      -- Q += (-W2) · Y^T (mm×bs * bs×mm → mm×mm)
+                      baNW2 <- unsafeFreezeByteArray mbaW2
+                      rawGemmKernel baNW2 0 baYT 0 mbaQ offQ mm bs mm
+
+                      goBlock (k0 + bs)
+            goBlock 0
 
       -- Extract clean R
       rClean = makeMatrix @m @n @M.P $ \i j ->
@@ -368,3 +461,21 @@ qrGivens a =
           ) rots
 
   in (qMat, MkMatrix rArr)
+
+-- Raw ByteArray# helpers for blocked WY Q accumulation
+readRawD :: MutableByteArray s -> Int -> Int -> ST s Double
+readRawD (MutableByteArray mba) (I# off) (I# i) = ST $ \s ->
+  case readDoubleArray# mba (off +# i) s of
+    (# s', v #) -> (# s', D# v #)
+{-# INLINE readRawD #-}
+
+writeRawD :: MutableByteArray s -> Int -> Int -> Double -> ST s ()
+writeRawD (MutableByteArray mba) (I# off) (I# i) (D# v) = ST $ \s ->
+  case writeDoubleArray# mba (off +# i) v s of
+    s' -> (# s', () #)
+{-# INLINE writeRawD #-}
+
+indexRawD :: ByteArray -> Int -> Int -> Double
+indexRawD (ByteArray ba) (I# off) (I# i) =
+  D# (indexDoubleArray# ba (off +# i))
+{-# INLINE indexRawD #-}
