@@ -16,6 +16,8 @@ module Numeric.LinearAlgebra.Massiv.Internal.Kernel
     -- * BLAS-3: matrix multiply (GEMM)
   , rawGemmKernel
   , rawGemmBISlice
+    -- * BLAS-3: symmetric rank-k update (SYRK)
+  , rawSyrkLowerKernel
     -- * QR helpers (immutable)
   , rawSumSqRange
   , rawSumProdRange
@@ -378,6 +380,259 @@ rawGemmBISlice (ByteArray ba_a) (I# off_a) (ByteArray ba_b) (I# off_b)
 
   in (# goBI biStart s0, () #)
 {-# INLINE rawGemmBISlice #-}
+
+-- | @rawSyrkLowerKernel ba_a off_a mba_c off_c m n@
+-- computes C = A^T * A where A is m×n (row-major).
+-- Only the lower triangle of C (n×n) is computed via tiled SIMD micro-kernels,
+-- then mirrored to the upper triangle.  C must be pre-zeroed.
+-- This avoids materialising A^T and halves the flop count vs full GEMM.
+rawSyrkLowerKernel :: ByteArray -> Int
+                   -> MutableByteArray s -> Int
+                   -> Int -> Int -> ST s ()
+rawSyrkLowerKernel (ByteArray ba_a) (I# off_a)
+                   (MutableByteArray mba_c) (I# off_c)
+                   (I# m) (I# n) = ST $ \s0 ->
+  let bs = 64#
+
+      -- Tile rows of C (i dimension)
+      goBI bi s
+        | isTrue# (bi >=# n) = s
+        | otherwise =
+            let iEnd = minI (bi +# bs) n
+            in goBI (bi +# bs) (goBK bi iEnd 0# s)
+
+      -- Tile inner dimension (k = rows of A, 0..m-1)
+      goBK bi iEnd bk s
+        | isTrue# (bk >=# m) = s
+        | otherwise =
+            let kEnd = minI (bk +# bs) m
+            in goBK bi iEnd (bk +# bs) (goBJ bi iEnd bk kEnd 0# s)
+
+      -- Tile columns of C (j dimension) — lower triangle only: bj <= bi
+      goBJ bi iEnd bk kEnd bj s
+        | isTrue# (bj ># bi) = s  -- stop past diagonal
+        | otherwise =
+            let jEnd = minI (bj +# bs) n
+            in goBJ bi iEnd bk kEnd (bj +# bs) (innerBlock bi iEnd bk kEnd bj jEnd s)
+
+      -- Micro-kernel dispatch (same structure as GEMM)
+      innerBlock bi iEnd bk kEnd bj jEnd s0_ =
+        let !jSpan = jEnd -# bj
+            !j8End = bj +# (jSpan -# (jSpan `remInt#` 8#))
+            !j4End = bj +# (jSpan -# (jSpan `remInt#` 4#))
+            !iSpan = iEnd -# bi
+            !i4End = bi +# (iSpan -# (iSpan `remInt#` 4#))
+        in goI4 bi i4End iEnd j8End j4End bk kEnd bj jEnd s0_
+
+      goI4 i i4End iEnd_ j8End j4End bk kEnd bj jEnd s
+        | isTrue# (i >=# i4End) = goI1 i iEnd_ j8End j4End bk kEnd bj jEnd s
+        | otherwise =
+            goI4 (i +# 4#) i4End iEnd_ j8End j4End bk kEnd bj jEnd
+              (goJ8s i bk kEnd bj j8End
+                (goJ4s i bk kEnd j8End j4End
+                  (goJSs4 i bk kEnd j4End jEnd s)))
+
+      goI1 i iEnd_ j8End j4End bk kEnd bj jEnd s
+        | isTrue# (i >=# iEnd_) = s
+        | otherwise =
+            goI1 (i +# 1#) iEnd_ j8End j4End bk kEnd bj jEnd
+              (goJ8s1 i bk kEnd bj j8End
+                (goJ4s1 i bk kEnd j8End j4End
+                  (goJSs1 i bk kEnd j4End jEnd s)))
+
+      -- 4×8 micro-kernel for SYRK
+      -- A^T[i,kk] = A[kk,i] at off_a + kk*n + i
+      -- A[kk,j]   at off_a + kk*n + j
+      goJ8s i bk kEnd j j8End s
+        | isTrue# (j >=# j8End) = s
+        | otherwise =
+          let !cOff0 = off_c +# i *# n +# j
+              !cOff1 = off_c +# (i +# 1#) *# n +# j
+              !cOff2 = off_c +# (i +# 2#) *# n +# j
+              !cOff3 = off_c +# (i +# 3#) *# n +# j
+          in case readDoubleArrayAsDoubleX4# mba_c cOff0 s of { (# s0a, c00 #) ->
+             case readDoubleArrayAsDoubleX4# mba_c (cOff0 +# 4#) s0a of { (# s0b, c01 #) ->
+             case readDoubleArrayAsDoubleX4# mba_c cOff1 s0b of { (# s1a, c10 #) ->
+             case readDoubleArrayAsDoubleX4# mba_c (cOff1 +# 4#) s1a of { (# s1b, c11 #) ->
+             case readDoubleArrayAsDoubleX4# mba_c cOff2 s1b of { (# s2a, c20 #) ->
+             case readDoubleArrayAsDoubleX4# mba_c (cOff2 +# 4#) s2a of { (# s2b, c21 #) ->
+             case readDoubleArrayAsDoubleX4# mba_c cOff3 s2b of { (# s3a, c30 #) ->
+             case readDoubleArrayAsDoubleX4# mba_c (cOff3 +# 4#) s3a of { (# s3b, c31 #) ->
+             case goK8s i j bk kEnd c00 c01 c10 c11 c20 c21 c30 c31 of
+               (# r00, r01, r10, r11, r20, r21, r30, r31 #) ->
+                 case writeDoubleArrayAsDoubleX4# mba_c cOff0 r00 s3b of { sw0 ->
+                 case writeDoubleArrayAsDoubleX4# mba_c (cOff0 +# 4#) r01 sw0 of { sw1 ->
+                 case writeDoubleArrayAsDoubleX4# mba_c cOff1 r10 sw1 of { sw2 ->
+                 case writeDoubleArrayAsDoubleX4# mba_c (cOff1 +# 4#) r11 sw2 of { sw3 ->
+                 case writeDoubleArrayAsDoubleX4# mba_c cOff2 r20 sw3 of { sw4 ->
+                 case writeDoubleArrayAsDoubleX4# mba_c (cOff2 +# 4#) r21 sw4 of { sw5 ->
+                 case writeDoubleArrayAsDoubleX4# mba_c cOff3 r30 sw5 of { sw6 ->
+                 case writeDoubleArrayAsDoubleX4# mba_c (cOff3 +# 4#) r31 sw6 of { sw7 ->
+                 goJ8s i bk kEnd (j +# 8#) j8End sw7
+                 }}}}}}}}
+             }}}}}}}}
+
+      -- k-loop for 4×8 SYRK: A^T[i,kk]=A[kk,i], A[kk,j..j+7]
+      goK8s i j kk kEnd c00 c01 c10 c11 c20 c21 c30 c31
+        | isTrue# (kk >=# kEnd) =
+            (# c00, c01, c10, c11, c20, c21, c30, c31 #)
+        | otherwise =
+            let !rowOff = off_a +# kk *# n
+                !bv0 = indexDoubleArrayAsDoubleX4# ba_a (rowOff +# j)
+                !bv1 = indexDoubleArrayAsDoubleX4# ba_a (rowOff +# j +# 4#)
+                !a0 = broadcastDoubleX4# (indexDoubleArray# ba_a (rowOff +# i))
+                !a1 = broadcastDoubleX4# (indexDoubleArray# ba_a (rowOff +# i +# 1#))
+                !a2 = broadcastDoubleX4# (indexDoubleArray# ba_a (rowOff +# i +# 2#))
+                !a3 = broadcastDoubleX4# (indexDoubleArray# ba_a (rowOff +# i +# 3#))
+            in goK8s i j (kk +# 1#) kEnd
+                 (fmaddDoubleX4# a0 bv0 c00) (fmaddDoubleX4# a0 bv1 c01)
+                 (fmaddDoubleX4# a1 bv0 c10) (fmaddDoubleX4# a1 bv1 c11)
+                 (fmaddDoubleX4# a2 bv0 c20) (fmaddDoubleX4# a2 bv1 c21)
+                 (fmaddDoubleX4# a3 bv0 c30) (fmaddDoubleX4# a3 bv1 c31)
+
+      -- 4×4 cleanup for SYRK
+      goJ4s i bk kEnd j j4End s
+        | isTrue# (j >=# j4End) = s
+        | otherwise =
+          let !cOff0 = off_c +# i *# n +# j
+              !cOff1 = off_c +# (i +# 1#) *# n +# j
+              !cOff2 = off_c +# (i +# 2#) *# n +# j
+              !cOff3 = off_c +# (i +# 3#) *# n +# j
+          in case readDoubleArrayAsDoubleX4# mba_c cOff0 s of { (# s0, c0 #) ->
+             case readDoubleArrayAsDoubleX4# mba_c cOff1 s0 of { (# s1, c1 #) ->
+             case readDoubleArrayAsDoubleX4# mba_c cOff2 s1 of { (# s2, c2 #) ->
+             case readDoubleArrayAsDoubleX4# mba_c cOff3 s2 of { (# s3, c3 #) ->
+             case goK4s i j bk kEnd c0 c1 c2 c3 of
+               (# r0, r1, r2, r3 #) ->
+                 case writeDoubleArrayAsDoubleX4# mba_c cOff0 r0 s3 of { sw0 ->
+                 case writeDoubleArrayAsDoubleX4# mba_c cOff1 r1 sw0 of { sw1 ->
+                 case writeDoubleArrayAsDoubleX4# mba_c cOff2 r2 sw1 of { sw2 ->
+                 case writeDoubleArrayAsDoubleX4# mba_c cOff3 r3 sw2 of { sw3 ->
+                 goJ4s i bk kEnd (j +# 4#) j4End sw3
+                 }}}}
+             }}}}
+
+      goK4s i j kk kEnd c0 c1 c2 c3
+        | isTrue# (kk >=# kEnd) = (# c0, c1, c2, c3 #)
+        | otherwise =
+            let !rowOff = off_a +# kk *# n
+                !bv = indexDoubleArrayAsDoubleX4# ba_a (rowOff +# j)
+                !a0 = broadcastDoubleX4# (indexDoubleArray# ba_a (rowOff +# i))
+                !a1 = broadcastDoubleX4# (indexDoubleArray# ba_a (rowOff +# i +# 1#))
+                !a2 = broadcastDoubleX4# (indexDoubleArray# ba_a (rowOff +# i +# 2#))
+                !a3 = broadcastDoubleX4# (indexDoubleArray# ba_a (rowOff +# i +# 3#))
+            in goK4s i j (kk +# 1#) kEnd
+                 (fmaddDoubleX4# a0 bv c0) (fmaddDoubleX4# a1 bv c1)
+                 (fmaddDoubleX4# a2 bv c2) (fmaddDoubleX4# a3 bv c3)
+
+      -- Scalar cleanup for 4 rows (SYRK)
+      goJSs4 i bk kEnd j jEnd_ s
+        | isTrue# (j >=# jEnd_) = s
+        | otherwise =
+          let goK_s4 kk acc0 acc1 acc2 acc3
+                | isTrue# (kk >=# kEnd) = (# acc0, acc1, acc2, acc3 #)
+                | otherwise =
+                    let !rowOff = off_a +# kk *# n
+                        !bkj = indexDoubleArray# ba_a (rowOff +# j)
+                        !a0_ = indexDoubleArray# ba_a (rowOff +# i)
+                        !a1_ = indexDoubleArray# ba_a (rowOff +# i +# 1#)
+                        !a2_ = indexDoubleArray# ba_a (rowOff +# i +# 2#)
+                        !a3_ = indexDoubleArray# ba_a (rowOff +# i +# 3#)
+                    in goK_s4 (kk +# 1#)
+                         (acc0 +## a0_ *## bkj) (acc1 +## a1_ *## bkj)
+                         (acc2 +## a2_ *## bkj) (acc3 +## a3_ *## bkj)
+              !cOff0 = off_c +# i *# n +# j
+              !cOff1 = off_c +# (i +# 1#) *# n +# j
+              !cOff2 = off_c +# (i +# 2#) *# n +# j
+              !cOff3 = off_c +# (i +# 3#) *# n +# j
+          in case (# goK_s4 bk 0.0## 0.0## 0.0## 0.0## #) of
+               (# (# d0, d1, d2, d3 #) #) ->
+                 case readDoubleArray# mba_c cOff0 s of { (# s0, v0 #) ->
+                 case writeDoubleArray# mba_c cOff0 (v0 +## d0) s0 of { s1 ->
+                 case readDoubleArray# mba_c cOff1 s1 of { (# s2, v1 #) ->
+                 case writeDoubleArray# mba_c cOff1 (v1 +## d1) s2 of { s3 ->
+                 case readDoubleArray# mba_c cOff2 s3 of { (# s4, v2 #) ->
+                 case writeDoubleArray# mba_c cOff2 (v2 +## d2) s4 of { s5 ->
+                 case readDoubleArray# mba_c cOff3 s5 of { (# s6, v3 #) ->
+                 case writeDoubleArray# mba_c cOff3 (v3 +## d3) s6 of { s7 ->
+                 goJSs4 i bk kEnd (j +# 1#) jEnd_ s7
+                 }}}}}}}}
+
+      -- 1×8 micro-kernel for SYRK
+      goJ8s1 i bk kEnd j j8End s
+        | isTrue# (j >=# j8End) = s
+        | otherwise =
+          let !cOff = off_c +# i *# n +# j
+          in case readDoubleArrayAsDoubleX4# mba_c cOff s of { (# s0, c0 #) ->
+             case readDoubleArrayAsDoubleX4# mba_c (cOff +# 4#) s0 of { (# s1, c1 #) ->
+             case goK8s1 i j bk kEnd c0 c1 of
+               (# r0, r1 #) ->
+                 case writeDoubleArrayAsDoubleX4# mba_c cOff r0 s1 of { sw0 ->
+                 case writeDoubleArrayAsDoubleX4# mba_c (cOff +# 4#) r1 sw0 of { sw1 ->
+                 goJ8s1 i bk kEnd (j +# 8#) j8End sw1
+                 }}
+             }}
+
+      goK8s1 i j kk kEnd c0 c1
+        | isTrue# (kk >=# kEnd) = (# c0, c1 #)
+        | otherwise =
+            let !rowOff = off_a +# kk *# n
+                !bv0 = indexDoubleArrayAsDoubleX4# ba_a (rowOff +# j)
+                !bv1 = indexDoubleArrayAsDoubleX4# ba_a (rowOff +# j +# 4#)
+                !av = broadcastDoubleX4# (indexDoubleArray# ba_a (rowOff +# i))
+            in goK8s1 i j (kk +# 1#) kEnd
+                 (fmaddDoubleX4# av bv0 c0) (fmaddDoubleX4# av bv1 c1)
+
+      -- 1×4 cleanup for SYRK
+      goJ4s1 i bk kEnd j j4End s
+        | isTrue# (j >=# j4End) = s
+        | otherwise =
+          let !cOff = off_c +# i *# n +# j
+          in case readDoubleArrayAsDoubleX4# mba_c cOff s of { (# s0, c0 #) ->
+             case goK4s1 i j bk kEnd c0 of { r0 ->
+             case writeDoubleArrayAsDoubleX4# mba_c cOff r0 s0 of { s1 ->
+             goJ4s1 i bk kEnd (j +# 4#) j4End s1
+             }}}
+
+      goK4s1 i j kk kEnd c0
+        | isTrue# (kk >=# kEnd) = c0
+        | otherwise =
+            let !rowOff = off_a +# kk *# n
+                !bv = indexDoubleArrayAsDoubleX4# ba_a (rowOff +# j)
+                !av = broadcastDoubleX4# (indexDoubleArray# ba_a (rowOff +# i))
+            in goK4s1 i j (kk +# 1#) kEnd (fmaddDoubleX4# av bv c0)
+
+      -- Scalar cleanup for 1 row (SYRK)
+      goJSs1 i bk kEnd j jEnd_ s
+        | isTrue# (j >=# jEnd_) = s
+        | otherwise =
+          let goK_s1 kk acc
+                | isTrue# (kk >=# kEnd) = acc
+                | otherwise =
+                    let !rowOff = off_a +# kk *# n
+                        !bkj = indexDoubleArray# ba_a (rowOff +# j)
+                        !aik = indexDoubleArray# ba_a (rowOff +# i)
+                    in goK_s1 (kk +# 1#) (acc +## aik *## bkj)
+          in case readDoubleArray# mba_c (off_c +# i *# n +# j) s of
+               (# s', cij #) ->
+                 case writeDoubleArray# mba_c (off_c +# i *# n +# j) (cij +## goK_s1 bk 0.0##) s' of
+                   s'' -> goJSs1 i bk kEnd (j +# 1#) jEnd_ s''
+
+      -- Mirror lower triangle to upper: C[j,i] = C[i,j] for j < i
+      mirror i s
+        | isTrue# (i >=# n) = s
+        | otherwise = mirror (i +# 1#) (mirrorRow i 0# s)
+
+      mirrorRow i j s
+        | isTrue# (j >=# i) = s
+        | otherwise =
+          case readDoubleArray# mba_c (off_c +# i *# n +# j) s of { (# s0, cij #) ->
+          case writeDoubleArray# mba_c (off_c +# j *# n +# i) cij s0 of { s1 ->
+          mirrorRow i (j +# 1#) s1
+          }}
+
+  in (# mirror 0# (goBI 0# s0), () #)
+{-# INLINE rawSyrkLowerKernel #-}
 
 -- --------------------------------------------------------------------------
 -- QR helpers

@@ -80,7 +80,7 @@ import Numeric.LinearAlgebra.Massiv.Internal
 import Control.Concurrent (forkOn, newEmptyMVar, putMVar, takeMVar, getNumCapabilities)
 import System.IO.Unsafe (unsafePerformIO)
 import GHC.IO (stToIO)
-import Numeric.LinearAlgebra.Massiv.Internal.Kernel (rawGemmKernel, rawGemmBISlice)
+import Numeric.LinearAlgebra.Massiv.Internal.Kernel (rawGemmKernel, rawGemmBISlice, rawSyrkLowerKernel)
 
 -- | Block size for cache-tiled GEMM (generic fallback path).
 gemmBlockSize :: Int
@@ -305,13 +305,29 @@ transposeP (MkMatrix a) =
 {-# NOINLINE transposeP #-}
 
 -- | P-specialised A^T * A without materialising A^T.
--- Computes C = A^T * A using the SIMD GEMM kernel on an explicit fast transpose.
--- Saves one allocation vs @matMulP (transpose a) a@.
+-- Computes C = A^T * A using a fused DSYRK kernel that processes only the
+-- lower triangle (halving flops) and mirrors to the upper triangle.
+-- Avoids materialising A^T entirely — one allocation, no transpose pass.
 matMulAtAP :: forall m n. (KnownNat m, KnownNat n)
            => Matrix m n M.P Double -> Matrix n n M.P Double
-matMulAtAP a =
-  let !at = transposeP a
-  in matMulP at a
+matMulAtAP (MkMatrix arrA) =
+  let mm = dimVal @m
+      nn = dimVal @n
+      baA = unwrapByteArray arrA
+      offA = unwrapByteArrayOffset arrA
+  in createMatrix @n @n @M.P $ \mc -> do
+    -- Zero-initialise C (n×n)
+    let mbaC = unwrapMutableByteArray mc
+        offC = unwrapMutableByteArrayOffset mc
+        !(I# nn#) = nn
+    ST $ \s0 ->
+      let go i s
+            | isTrue# (i >=# (nn# *# nn#)) = s
+            | otherwise = case writeDoubleArray# (unMBA# mbaC) (unI offC +# i) 0.0## s of
+                            s' -> go (i +# 1#) s'
+      in (# go 0# s0, () #)
+    -- Run the fused SYRK kernel: C = A^T * A (lower triangle + mirror)
+    rawSyrkLowerKernel baA offA mbaC offC mm nn
 {-# NOINLINE matMulAtAP #-}
 
 -- | Element-wise matrix addition.
