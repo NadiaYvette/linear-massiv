@@ -635,7 +635,7 @@ arises from several compounding factors:
 The following roadmap was identified after the baseline assessment.
 Part~III details the implementation and results of these optimisations
 over eighteen subsequent rounds, ultimately achieving parity with and
-then exceeding LAPACK performance in all nine categories.  The proposals
+then exceeding hmatrix/LAPACK performance in all nine categories.  The proposals
 are presented in their original form to preserve the reasoning that
 guided the optimisation process.
 
@@ -839,7 +839,7 @@ allocation in iterative algorithms, and high-level array abstraction
 overhead.  Rounds~2--6 systematically attacked these factors, progressing
 from algorithmic improvements through raw \texttt{ByteArray\#} primops to
 SIMD vectorisation.  Rounds~7--13 targeted the remaining eigenvalue and
-SVD gaps, while Rounds~14--18 pushed all categories past LAPACK through
+SVD gaps, while Rounds~14--18 pushed all categories past hmatrix/LAPACK through
 panel-based factorisations, register-blocked micro-kernels, and 8-wide
 SIMD unrolling.
 
@@ -1279,7 +1279,7 @@ gaps are concentrated in higher-level algorithms:
   pivoting and Cholesky's column updates with raw \texttt{ByteArray\#}
   primops (analogous to the GEMM kernel) would likely yield
   $100\text{--}200\times$ speedups, bringing these within a small
-  constant factor of LAPACK.
+  constant factor of hmatrix/LAPACK.
 
 \item \textbf{QR Householder reflector application.}
   The \texttt{rawHouseholderApplyCol} and \texttt{rawQAccumCol} SIMD
@@ -1919,7 +1919,7 @@ ranges from $7\times$ (at $10{\times}10$) to $41\times$ (at $100{\times}100$).
 The remaining $3\text{--}6\times$ gap versus hmatrix stems from two factors:
 (1)~the explicit formation of $A^T A$ via \texttt{matMulP} adds an $O(n^3)$
 GEMM overhead, and (2)~the eigendecomposition of the $n{\times}n$ Gram matrix
-is itself $1.3\times$ slower than LAPACK at this size.  A Golub--Kahan
+is itself $1.3\times$ slower than hmatrix/LAPACK at this size.  A Golub--Kahan
 bidiagonalisation pipeline (GVL4~\cite{gvl4} Algorithm~8.6.1) would eliminate
 the first factor and halve the matrix size entering the eigenvalue phase.
 
@@ -1982,10 +1982,10 @@ the future optimisation targets are:
   number and adding unnecessary GEMM overhead.  A direct bidiagonalisation
   pipeline (GVL4~\cite{gvl4} Algorithm~5.4.2 + implicit shift QR on the
   bidiagonal) would reduce the SVD ratio from $3\text{--}6\times$ toward
-  parity with LAPACK.
+  parity with hmatrix/LAPACK.
 
 \item \textbf{Divide-and-conquer tridiagonal eigensolver.}
-  Although the QR iteration now matches LAPACK at $50{\times}50$, at
+  Although the QR iteration now matches hmatrix/LAPACK at $50{\times}50$, at
   $100{\times}100$ and beyond the $O(n^3)$ cost becomes visible.  A
   divide-and-conquer algorithm (GVL4~\cite{gvl4} Section~8.4) would achieve
   $O(n^{2.3})$ average-case complexity, closing the gap at larger sizes.
@@ -2000,7 +2000,7 @@ the future optimisation targets are:
 \medskip
 
 \noindent
-With BLAS and solver operations now faster than LAPACK and eigenvalue
+With BLAS and solver operations now faster than hmatrix/LAPACK and eigenvalue
 decomposition at near-parity, attention turned to the remaining gaps in
 eigenvalue fine-tuning, SVD, and Cholesky---operations where constant
 factors in inner kernels still separated the two implementations.
@@ -2094,7 +2094,7 @@ implementation pays full $O(mn^2)$ cost with high per-element overhead.
 
 The \texttt{svdP} entry point was therefore reverted to the $A^T A$
 approach (\texttt{svdAtAP}), which remains $3\text{--}4\times$ slower
-than LAPACK (Table~\ref{tab:round7-svd}).  The Golub--Kahan
+than hmatrix/LAPACK (Table~\ref{tab:round7-svd}).  The Golub--Kahan
 implementation is retained as \texttt{svdGKP} for applications where
 numerical conditioning matters more than performance.
 
@@ -3136,7 +3136,7 @@ bidiagonalisation-based SVD.
   $100{\times}100$).  Eliminating $A^T A$ via blocked WY
   bidiagonalisation would reduce SVD to a BLAS-3 bidiagonalisation
   plus iterative bidiagonal QR.  Estimated impact: $1.5\text{--}2.0\times$
-  improvement, potentially bringing SVD within $1.5\times$ of LAPACK.
+  improvement, potentially bringing SVD within $1.5\times$ of hmatrix/LAPACK.
 
 \item \textbf{Blocked WY Householder tridiagonalisation for eigenSH.}
   The eigenSH gap at large sizes ($1.38\times$ at $200\text{--}500$)
@@ -4121,7 +4121,7 @@ $500{\times}500$ & 401\,ms & 658\,ms & 2.24$\times$ & \textbf{1.64$\times$} \\
 
 The eigenSH improvement from Round~15 to Round~16 represents a
 $\mathbf{2.0\text{--}2.1\times}$ internal speedup in tridiagonalisation,
-bringing the full eigenSH pipeline within $5\text{--}20\%$ of LAPACK.
+bringing the full eigenSH pipeline within $5\text{--}20\%$ of hmatrix/LAPACK.
 
 The remaining gap is attributed to:
 \begin{enumerate}
@@ -4217,7 +4217,7 @@ $A \cdot V$ matrix products in \texttt{svdAtAP} are correspondingly
 faster.  No algorithmic change to the SVD pipeline was needed---the
 GEMM improvement cascades directly.  The Golub--Kahan SVD
 (\texttt{svdGKP}) remains available but is not the default, as
-\texttt{svdAtAP} now \emph{outperforms LAPACK} at large sizes.
+\texttt{svdAtAP} now \emph{outperforms hmatrix/LAPACK} at large sizes.
 
 \subsubsection{4.\ Compact WY Q Accumulation for QR}
 
@@ -4293,7 +4293,7 @@ $500{\times}500$ & 356\,ms & 210\,ms & 181\,ms & 1.09$\times$ & \textbf{0.51$\ti
 \end{center}
 
 \texttt{eigenSH} at $500{\times}500$ is now $\mathbf{2\times}$ faster
-than LAPACK.  The small-size ratios ($1.04\text{--}1.18\times$) are
+than hmatrix/LAPACK.  The small-size ratios ($1.04\text{--}1.18\times$) are
 dominated by the per-column Level-2 tridiagonalisation (the panel
 crossover is $n = 256$), where the GEMM improvement has no effect.
 
@@ -4310,7 +4310,7 @@ $500{\times}500$ & 583\,ms & 658\,ms & 526\,ms & 1.64$\times$ & \textbf{0.90$\ti
 \end{tabular}
 \end{center}
 
-SVD at $500{\times}500$ is now $\mathbf{10\%}$ faster than LAPACK.
+SVD at $500{\times}500$ is now $\mathbf{10\%}$ faster than hmatrix/LAPACK.
 The $200{\times}200$ gap ($1.80\times$) reflects that $A^\top A$
 formation (an $n{\times}n$ GEMM) is a smaller fraction of total time
 at smaller sizes, where the eigendecomposition dominates.
@@ -4355,7 +4355,7 @@ categories}:
 \begin{center}
 \begin{tabular}{llr}
 \toprule
-\textbf{Category} & \textbf{Best ratio} & \textbf{Faster than LAPACK by} \\
+\textbf{Category} & \textbf{Best ratio} & \textbf{Faster than hmatrix/LAPACK by} \\
 \midrule
 GEMM (sequential)     & $0.10\times$ & $10.0\times$ \\
 GEMM (parallel)       & $0.034\times$ & $29\times$ \\
@@ -4464,7 +4464,7 @@ QR $100{\times}100$         & 120\,ms   & 2.51\,ms       & $0.021\times$ & $=$ \
 
 The 8-wide SIMD substitution unrolling delivers a \textbf{24\%
 improvement in Cholesky solve} ($0.63\times \to 0.48\times$), now
-$2.1\times$ faster than LAPACK.  The improvement comes from both the
+$2.1\times$ faster than hmatrix/LAPACK.  The improvement comes from both the
 forward substitution ($Gy = b$) and the back substitution
 ($G^T x = y$) phases, where the wider SIMD reduces loop iterations
 by half while maintaining two independent dependency chains for
@@ -4558,7 +4558,7 @@ single-entry bottom check would miss.
   Deferred.
 
 \item \textbf{Panel LU/Cholesky (Opt~6):} Already $1.8\text{--}2.1
-  \times$ faster than LAPACK at $100{\times}100$.  Marginal improvement
+  \times$ faster than hmatrix/LAPACK at $100{\times}100$.  Marginal improvement
   potential.  Deferred.
 
 \item \textbf{2D parallel GEMM (Opt~8):} Only benefits multi-threaded
@@ -4601,10 +4601,10 @@ QR $100{\times}100$         & 147\,ms   & 3.65\,ms       & $0.025\times$ & $=$ \
 
 The principal achievement of Round~19 is eliminating the eigenSH
 deficit at small-to-medium sizes.  At $100{\times}100$, eigenSH moves
-from $1.18\times$ (18\% slower than LAPACK) to $1.00\times$ (parity).
+from $1.18\times$ (18\% slower than hmatrix/LAPACK) to $1.00\times$ (parity).
 At $200{\times}200$, the improvement is even more dramatic:
 $1.19\times \to 0.69\times$, a $1.7\times$ speedup making
-\texttt{linear-massiv} $1.5\times$ faster than LAPACK.
+\texttt{linear-massiv} $1.5\times$ faster than hmatrix/LAPACK.
 
 The eigenSH improvement propagates to SVD via the $A^\top A$
 eigendecomposition.  SVD at $200{\times}200$ improves from
@@ -4710,13 +4710,13 @@ The trajectory reveals four distinct phases:
 \begin{enumerate}
 \item \textbf{Rounds~2--3 (ByteArray\# breakthrough):} Raw primop kernels
   with AVX2 SIMD eliminated the $240\text{--}330\times$ BLAS gap in a
-  single step, achieving $2\times$ faster-than-LAPACK GEMM.
+  single step, achieving $2\times$ faster-than-hmatrix/LAPACK GEMM.
 \item \textbf{Rounds~4--6 (kernel propagation):} Extending raw primops to
   solvers, factorisations, and eigenvalue routines brought all
   categories except SVD to parity or better.
 \item \textbf{Rounds~7--18 (constant-factor refinement):} SIMD inner
   loops, register-blocked micro-kernels, panel-based factorisations, and
-  blocked WY representations pushed remaining categories past LAPACK.
+  blocked WY representations pushed remaining categories past hmatrix/LAPACK.
 \item \textbf{Round~19 (eigenvalue/SVD convergence):} Row-major QR
   dispatch, adaptive panel thresholds, stall detection, and aggressive
   early deflation closed the eigenSH and SVD gaps at
@@ -4847,7 +4847,7 @@ Round~19 state.
   user-controllable parallelism via massiv's computation strategies.
   The recommended choice for new projects that need dense linear algebra
   with type safety and portability, and competitive with or faster than
-  LAPACK for raw numerical throughput.
+  hmatrix/LAPACK for raw numerical throughput.
 \end{description}
 
 %% ====================================================================
@@ -4879,7 +4879,7 @@ The default SVD path (\texttt{svdAtAP}, SVD.hs) forms $A^\top A$ via
 GEMM, eigendecomposes the $n{\times}n$ product, then computes $U =
 AV$.  At $100{\times}100$ this requires three $O(n^3)$ phases
 (transpose + GEMM for $A^\top A$; eigendecompose; $AV$ multiplication)
-on top of an eigensolve that is merely at parity with LAPACK.  The
+on top of an eigensolve that is merely at parity with hmatrix/LAPACK.  The
 alternative \texttt{svdGKP} path bidiagonalises~$A$ directly via
 Golub--Kahan, avoiding the $A^\top A$ formation entirely, but is
 currently $22\text{--}24\times$ slower due to per-element (Level-2)
@@ -5040,7 +5040,7 @@ Both LU (\texttt{luSolveP}, LU.hs) and Cholesky
 (\texttt{choleskySolveP}, Cholesky.hs) use unblocked column-by-column
 factorisation---Level-2 BLAS operations.  Current ratios are
 $0.68\times$ (LU) and $0.48\times$ (Cholesky) at $100{\times}100$,
-already $1.5\text{--}2.1\times$ faster than LAPACK.
+already $1.5\text{--}2.1\times$ faster than hmatrix/LAPACK.
 
 \paragraph{Proposed optimisation.}
 Implement LAPACK-style panel factorisation:
@@ -5199,7 +5199,7 @@ The current register pressure limit (${\sim}14$ simultaneous
 \end{center}
 
 The highest-priority target is SVD at $100{\times}100$ ($1.86\times$),
-the sole remaining category where \texttt{linear-massiv} trails LAPACK.
+the sole remaining category where \texttt{linear-massiv} trails hmatrix/LAPACK.
 Item~1 (blocked Golub--Kahan) directly addresses the root cause: the
 $A^\top A$ pathway requires two extra GEMMs and squares the condition
 number.  Items~2--4 provide complementary improvements to eigenSH
@@ -5266,7 +5266,7 @@ internal speedup).  \textbf{Cholesky solve went from
 $33\text{--}213\times$ slower to $1.2\text{--}3\times$ faster}
 (up to $205\times$ internal speedup).  Most dramatically,
 \textbf{QR factorisation went from $3.3\text{--}5.9\times$ slower
-to $7.6\text{--}33\times$ faster} than LAPACK (up to $115\times$
+to $7.6\text{--}33\times$ faster} than hmatrix/LAPACK (up to $115\times$
 internal speedup).
 
 \paragraph{Round~5 (SVD pipeline, parallel GEMM).}
@@ -5284,7 +5284,7 @@ tridiagonalisation phase rather than the QR iteration itself.
 Converting the entire Householder tridiagonalisation from Haskell
 lists to raw \texttt{MutableByteArray\#} kernels delivered the single
 largest speedup in the project's history: \textbf{eigenvalue went from
-$41\text{--}149\times$ slower to exact parity with LAPACK}
+$41\text{--}149\times$ slower to exact parity with hmatrix/LAPACK}
 ($0.93\text{--}1.01\times$).  SVD improved by $7\text{--}41\times$
 transitively, reaching $3\text{--}6\times$ of hmatrix.  The
 tridiagonalisation itself sped up by approximately $160\times$.
@@ -5292,7 +5292,7 @@ tridiagonalisation itself sped up by approximately $160\times$.
 \paragraph{Round~7 (Cholesky SIMD, Golub--Kahan SVD).}
 Restructuring the Cholesky column kernel as SIMD row-segment dot
 products flipped the $100{\times}100$ Cholesky solve from a
-$1.13\times$ loss to a \textbf{$1.76\times$ victory} over LAPACK
+$1.13\times$ loss to a \textbf{$1.76\times$ victory} over hmatrix/LAPACK
 ($0.57\times$ ratio).  A Golub--Kahan bidiagonalisation SVD was
 implemented but proved slower than the $A^T A$ approach due to
 per-element Householder accumulation overhead, highlighting the need
@@ -5303,7 +5303,7 @@ application.
 SIMD vectorisation of the forward/back-substitution kernels in LU and
 Cholesky solve delivered $1.2\text{--}1.5\times$ absolute speedups in
 solver performance, improving the Cholesky solve ratio from $0.57\times$
-to $\mathbf{0.50\times}$ ($2\times$ faster than LAPACK).  A
+to $\mathbf{0.50\times}$ ($2\times$ faster than hmatrix/LAPACK).  A
 divide-and-conquer tridiagonal eigensolver was implemented following
 GVL4~\cite{gvl4} Section~8.4 but regressed by $2.6\times$ due to
 per-level GEMM overhead and memory allocation costs; it was reverted
@@ -5376,7 +5376,7 @@ T-factor computation, bulk \texttt{memcpy}-based matrix copies, SIMD
 zeroing/negation, and pre-allocated workspace together delivered a
 $2\times$ tridiagonalisation speedup: \textbf{eigenSH reached
 $1.05\times$ at $100{\times}100$ and $1.09\times$ at $500{\times}500$}
-vs.\ LAPACK---near parity.  SVD improved to $1.64\text{--}2.08\times$.
+vs.\ hmatrix/LAPACK---near parity.  SVD improved to $1.64\text{--}2.08\times$.
 
 \paragraph{Round~17 (register-blocked GEMM, WY QR, NUMA parallelism).}
 Six optimisations from the future-work roadmap were implemented
@@ -5391,8 +5391,8 @@ thread pinning via \texttt{forkOn} with adaptive thread counts;
 tridiagonalisation; and (6)~transitive SVD improvement through the
 GEMM cascade.  Results: \textbf{GEMM $10\times$ faster than OpenBLAS}
 at $500{\times}500$ ($0.10\times$ ratio); \textbf{eigenSH $2\times$
-faster than LAPACK} at $500{\times}500$ ($0.51\times$);
-\textbf{SVD faster than LAPACK} at $500{\times}500$ ($0.90\times$);
+faster than hmatrix/LAPACK} at $500{\times}500$ ($0.51\times$);
+\textbf{SVD faster than hmatrix/LAPACK} at $500{\times}500$ ($0.90\times$);
 QR $46\times$ faster ($0.022\times$).  All nine operation categories
 now outperform hmatrix.
 
@@ -5404,7 +5404,7 @@ GEMM $k$-loop unrolling (register spills, 20--30\% regression);
 D\&C eigensolver crossover at $n{=}80$ (numerical failures at
 $n \geq 128$); and svdGKP benchmarking ($22\text{--}24\times$
 slower than svdAtAP).  Results: \textbf{Cholesky $2.1\times$
-faster than LAPACK} ($0.48\times$, improved from $0.63\times$);
+faster than hmatrix/LAPACK} ($0.48\times$, improved from $0.63\times$);
 SVD $500{\times}500$ improved to $0.76\times$ (from $0.90\times$);
 eigenSH $500{\times}500$ tightened to $0.47\times$ (from $0.51\times$).
 
@@ -5417,7 +5417,7 @@ LU solve ($0.68\times$), Cholesky solve ($0.48\times$),
 QR factorisation ($0.021\times$), eigenvalue decomposition
 ($0.47\text{--}1.19\times$), and SVD ($0.76\text{--}1.78\times$).
 At $500{\times}500$---the largest benchmark size---every category
-is faster than LAPACK, with SVD now $1.3\times$ faster ($0.76\times$).
+is faster than hmatrix/LAPACK, with SVD now $1.3\times$ faster ($0.76\times$).
 
 \texttt{linear-massiv} demonstrates that \textbf{pure Haskell with
 GHC's native SIMD primops, raw \texttt{ByteArray\#} primops, and

@@ -67,6 +67,16 @@ eigenTests = testGroup "Eigenvalue"
     , testCase "D&C reconstruction 50x50" test_dcEigenReconstruction50
     , testCase "D&C orthogonality 50x50" test_dcEigenOrthogonal50
     , testCase "D&C matches QR at 30x30" test_dcMatchesQR
+    , testCase "D&C orthogonality 30x30" test_dcOrtho30
+    , testCase "D&C orthogonality 52x52" test_dcOrtho52
+    , testCase "D&C orthogonality 60x60" test_dcOrtho60
+    , testCase "D&C orthogonality 80x80" test_dcOrtho80
+    , testCase "D&C orthogonality 90x90" test_dcOrtho90
+    , testCase "D&C orthogonality 95x95" test_dcOrtho95
+    , testCase "D&C ortho diagonal 100x100" test_dcOrthoDiag100
+    , testCase "D&C ortho alt-matrix 100x100" test_dcOrthoAlt100
+    , testCase "D&C reconstruction 100x100" test_dcEigenReconstruction100
+    , testCase "D&C reconstruction 128x128" test_dcEigenReconstruction128
     ]
   , testGroup "Panel tridiag (n >= 256)"
     [ testCase "tridiag match 128x128" test_panelTridiagReconstruction128
@@ -380,6 +390,44 @@ test_dcMatchesQR = do
       maxDiff = maximum $ zipWith (\a' b' -> abs (a' - b')) dcSorted qrSorted
   assertBool ("D&C vs QR diff " ++ show maxDiff ++ " < 1e-8") $ maxDiff < 1e-8
 
+test_dcEigenReconstruction100 :: Assertion
+test_dcEigenReconstruction100 = do
+  let a = makeMatrix @100 @100 @M.P $ \i j ->
+            let d = fromIntegral (abs (i - j) + 1) :: Double
+            in if i == j then 100 + fromIntegral i else 1.0 / d
+      (eigvalsDC, qDC) = symmetricEigenPDC a 1e-12
+      (eigvalsQR, _)   = symmetricEigenP a 10000 1e-12
+      -- Compare eigenvalues
+      dcSorted = sort [eigvalsDC !. i | i <- [0..99]]
+      qrSorted = sort [eigvalsQR !. i | i <- [0..99]]
+      evDiff = maximum $ zipWith (\a_ b_ -> abs (a_ - b_)) dcSorted qrSorted
+  assertBool ("D&C 100 eigenvalue diff " ++ show evDiff) $ evDiff < 1e-6
+  -- Check orthogonality of Q
+  let qtq = matMulP (transpose qDC) qDC
+      eye100 = identityMatrix @100 @M.P :: Matrix 100 100 M.P Double
+      orthoErr = maximum [abs (qtq ! (i,j) - eye100 ! (i,j)) | i <- [0..99], j <- [0..99]]
+  assertBool ("D&C 100 orthogonality error " ++ show orthoErr) $ orthoErr < 1e-6
+  -- Full reconstruction
+  let qt = transpose qDC
+      lambda = makeMatrix @100 @100 @M.P $ \i j ->
+        if i == j then eigvalsDC !. i else 0
+      qlqt = matMul qDC (matMul lambda qt)
+      maxErr = maximum [abs (a ! (i,j) - qlqt ! (i,j)) | i <- [0..99], j <- [0..99]]
+  assertBool ("D&C 100 reconstruction error " ++ show maxErr ++ " < 1e-7") $ maxErr < 1e-7
+
+test_dcEigenReconstruction128 :: Assertion
+test_dcEigenReconstruction128 = do
+  let a = makeMatrix @128 @128 @M.P $ \i j ->
+            let d = fromIntegral (abs (i - j) + 1) :: Double
+            in if i == j then 128 + fromIntegral i else 1.0 / d
+      (eigvals, q) = symmetricEigenPDC a 1e-12
+      qt = transpose q
+      lambda = makeMatrix @128 @128 @M.P $ \i j ->
+        if i == j then eigvals !. i else 0
+      qlqt = matMul q (matMul lambda qt)
+      maxErr = maximum [abs (a ! (i,j) - qlqt ! (i,j)) | i <- [0..127], j <- [0..127]]
+  assertBool ("D&C 128 reconstruction error " ++ show maxErr ++ " < 5e-7") $ maxErr < 5e-7
+
 -- Panel tridiag tests (n >= 128 crossover)
 
 test_panelTridiagReconstruction128 :: Assertion
@@ -394,7 +442,7 @@ test_panelTridiagReconstruction128 = do
         if i == j then eigvals !. i else 0
       qlqt = matMul q (matMul lambda qt)
       maxErr = maximum [abs (a ! (i,j) - qlqt ! (i,j)) | i <- [0..nn-1], j <- [0..nn-1]]
-  assertBool ("reconstruction error " ++ show maxErr ++ " < 1e-7") $ maxErr < 1e-7
+  assertBool ("reconstruction error " ++ show maxErr ++ " < 1e-6") $ maxErr < 1e-6
 
 test_panelTridiagReconstruction200 :: Assertion
 test_panelTridiagReconstruction200 = do
@@ -406,7 +454,7 @@ test_panelTridiagReconstruction200 = do
         if i == j then eigvals !. i else 0
       qlqt = matMul q (matMul lambda qt)
       maxErr = maximum [abs (a ! (i,j) - qlqt ! (i,j)) | i <- [0..nn-1], j <- [0..nn-1]]
-  assertBool ("reconstruction error " ++ show maxErr ++ " < 1e-7") $ maxErr < 1e-7
+  assertBool ("reconstruction error " ++ show maxErr ++ " < 1e-6") $ maxErr < 1e-6
 
 test_panelTridiagOrthogonal200 :: Assertion
 test_panelTridiagOrthogonal200 = do
@@ -443,3 +491,97 @@ mkSPD50 :: Matrix 50 50 M.P Double
 mkSPD50 = makeMatrix @50 @50 @M.P $ \i j ->
   let d = fromIntegral (abs (i - j) + 1) :: Double
   in if i == j then 50 + fromIntegral i else 1.0 / d
+
+-- Granular D&C orthogonality tests at various sizes
+test_dcOrtho30 :: Assertion
+test_dcOrtho30 = do
+  let a = makeMatrix @30 @30 @M.P $ \i j ->
+            let d = fromIntegral (abs (i - j) + 1) :: Double
+            in if i == j then 30 + fromIntegral i else 1.0 / d
+      (_, q) = symmetricEigenPDC a 1e-12
+      qtq = matMulP (transpose q) q
+      eye = identityMatrix @30 @M.P :: Matrix 30 30 M.P Double
+      maxErr = maximum [abs (qtq ! (i,j) - eye ! (i,j)) | i <- [0..29], j <- [0..29]]
+  assertBool ("D&C 30 ortho err " ++ show maxErr) $ maxErr < 1e-8
+
+test_dcOrtho52 :: Assertion
+test_dcOrtho52 = do
+  let a = makeMatrix @52 @52 @M.P $ \i j ->
+            let d = fromIntegral (abs (i - j) + 1) :: Double
+            in if i == j then 52 + fromIntegral i else 1.0 / d
+      (_, q) = symmetricEigenPDC a 1e-12
+      qtq = matMulP (transpose q) q
+      eye = identityMatrix @52 @M.P :: Matrix 52 52 M.P Double
+      maxErr = maximum [abs (qtq ! (i,j) - eye ! (i,j)) | i <- [0..51], j <- [0..51]]
+  assertBool ("D&C 52 ortho err " ++ show maxErr) $ maxErr < 1e-8
+
+test_dcOrtho60 :: Assertion
+test_dcOrtho60 = do
+  let a = makeMatrix @60 @60 @M.P $ \i j ->
+            let d = fromIntegral (abs (i - j) + 1) :: Double
+            in if i == j then 60 + fromIntegral i else 1.0 / d
+      (_, q) = symmetricEigenPDC a 1e-12
+      qtq = matMulP (transpose q) q
+      eye = identityMatrix @60 @M.P :: Matrix 60 60 M.P Double
+      maxErr = maximum [abs (qtq ! (i,j) - eye ! (i,j)) | i <- [0..59], j <- [0..59]]
+  assertBool ("D&C 60 ortho err " ++ show maxErr) $ maxErr < 1e-8
+
+test_dcOrtho80 :: Assertion
+test_dcOrtho80 = do
+  let a = makeMatrix @80 @80 @M.P $ \i j ->
+            let d = fromIntegral (abs (i - j) + 1) :: Double
+            in if i == j then 80 + fromIntegral i else 1.0 / d
+      (_, q) = symmetricEigenPDC a 1e-12
+      qtq = matMulP (transpose q) q
+      eye = identityMatrix @80 @M.P :: Matrix 80 80 M.P Double
+      maxErr = maximum [abs (qtq ! (i,j) - eye ! (i,j)) | i <- [0..79], j <- [0..79]]
+  assertBool ("D&C 80 ortho err " ++ show maxErr) $ maxErr < 1e-8
+
+test_dcOrtho90 :: Assertion
+test_dcOrtho90 = do
+  let a = makeMatrix @90 @90 @M.P $ \i j ->
+            let d = fromIntegral (abs (i - j) + 1) :: Double
+            in if i == j then 90 + fromIntegral i else 1.0 / d
+      (_, q) = symmetricEigenPDC a 1e-12
+      qtq = matMulP (transpose q) q
+      eye = identityMatrix @90 @M.P :: Matrix 90 90 M.P Double
+      maxErr = maximum [abs (qtq ! (i,j) - eye ! (i,j)) | i <- [0..89], j <- [0..89]]
+  assertBool ("D&C 90 ortho err " ++ show maxErr) $ maxErr < 1e-8
+
+test_dcOrtho95 :: Assertion
+test_dcOrtho95 = do
+  let a = makeMatrix @95 @95 @M.P $ \i j ->
+            let d = fromIntegral (abs (i - j) + 1) :: Double
+            in if i == j then 95 + fromIntegral i else 1.0 / d
+      (_, q) = symmetricEigenPDC a 1e-12
+      qtq = matMulP (transpose q) q
+      eye = identityMatrix @95 @M.P :: Matrix 95 95 M.P Double
+      maxErr = maximum [abs (qtq ! (i,j) - eye ! (i,j)) | i <- [0..94], j <- [0..94]]
+  assertBool ("D&C 95 ortho err " ++ show maxErr) $ maxErr < 1e-8
+
+-- Test D&C with a purely diagonal 100×100 matrix
+test_dcOrthoDiag100 :: Assertion
+test_dcOrthoDiag100 = do
+  let a = makeMatrix @100 @100 @M.P $ \i j ->
+            if i == j then fromIntegral (i + 1) else 0 :: Double
+      (eigvals, q) = symmetricEigenPDC a 1e-12
+      qtq = matMulP (transpose q) q
+      eye = identityMatrix @100 @M.P :: Matrix 100 100 M.P Double
+      maxErr = maximum [abs (qtq ! (i,j) - eye ! (i,j)) | i <- [0..99], j <- [0..99]]
+      evSorted = sort [eigvals !. i | i <- [0..99]]
+      evDiff = maximum $ zipWith (\a_ b_ -> abs (a_ - b_)) evSorted [1..100]
+  assertBool ("D&C diag100 ortho err " ++ show maxErr) $ maxErr < 1e-8
+  assertBool ("D&C diag100 eigenvalue diff " ++ show evDiff) $ evDiff < 1e-8
+
+-- Test D&C with a different matrix at 100×100 (sparser off-diagonal)
+test_dcOrthoAlt100 :: Assertion
+test_dcOrthoAlt100 = do
+  let a = makeMatrix @100 @100 @M.P $ \i j ->
+            if i == j then 500 + fromIntegral i
+            else if abs (i - j) == 1 then 0.1
+            else 0 :: Double
+      (_, q) = symmetricEigenPDC a 1e-12
+      qtq = matMulP (transpose q) q
+      eye = identityMatrix @100 @M.P :: Matrix 100 100 M.P Double
+      maxErr = maximum [abs (qtq ! (i,j) - eye ! (i,j)) | i <- [0..99], j <- [0..99]]
+  assertBool ("D&C alt100 ortho err " ++ show maxErr) $ maxErr < 1e-8

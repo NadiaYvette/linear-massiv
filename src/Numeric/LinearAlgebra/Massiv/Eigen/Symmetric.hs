@@ -30,6 +30,7 @@ import Control.Monad (when, forM_)
 import Control.Monad.ST (ST, stToIO)
 import Control.Concurrent (forkIO, newEmptyMVar, putMVar, takeMVar)
 import System.IO.Unsafe (unsafePerformIO)
+
 import GHC.Exts
 import GHC.ST (ST(..))
 import Data.Primitive.ByteArray (ByteArray(..), MutableByteArray(..), newByteArray, unsafeFreezeByteArray)
@@ -715,7 +716,7 @@ symmetricEigenP a maxIter tol
         dFrozen <- M.freezeS md
         pure (MkVector dFrozen)
   in (dArr, MkMatrix qArr)
-  where dcCrossover = 100000  -- D&C has numerical issues at n≥128; keep QR path
+  where dcCrossover = 1000  -- D&C merge GEMM overhead doesn't amortise below ~1000
 {-# NOINLINE symmetricEigenP #-}
 
 -- | Parallel specialised symmetric eigenvalue decomposition for @P Double@.
@@ -1247,16 +1248,47 @@ dcEigenTridiagOpt mbaD offD mbaE offE mbaQ offQ fullN lo0 hi0 tol
                                 writeRawD wsIdx 0 (j+1) idxi
                   insertAt (i - 1)
 
-                -- Deflation: partition into non-deflated and deflated
-                zn2 <- sumZSq wsZSort 0 nn
-                -- Use a practical deflation tolerance: max of the user tolerance
-                -- and a machine-epsilon-based criterion.  Entries with tiny z[i]
-                -- contribute perturbations below machine precision and should be
-                -- deflated to avoid ill-conditioned secular equation roots.
+                -- Close-d deflation (cf. LAPACK dlaed2): when consecutive
+                -- sorted d values are nearly equal, a Givens rotation zeros
+                -- one z entry, preventing ill-conditioned secular roots.
                 dMaxAbs <- readRawD wsDSort 0 (nn - 1)
                 dMinAbs <- readRawD wsDSort 0 0
-                let !matNorm = max (abs dMaxAbs) (abs dMinAbs) + rho * zn2
-                    !deflTol = max (tol * sqrt zn2) (8 * 2.220446049250313e-16 * matNorm)
+                let !closeDTol = 8 * 2.220446049250313e-16
+                              * max (abs dMaxAbs) (abs dMinAbs + rho)
+                forM_ [0..nn-2] $ \i -> do
+                  di  <- readRawD wsDSort 0 i
+                  di1 <- readRawD wsDSort 0 (i + 1)
+                  when (abs (di1 - di) <= closeDTol) $ do
+                    zi  <- readRawD wsZSort 0 i
+                    zi1 <- readRawD wsZSort 0 (i + 1)
+                    let !r = sqrt (zi * zi + zi1 * zi1)
+                    when (r > 1e-300) $ do
+                      let !c = zi1 / r
+                          !s = zi / r
+                      -- Zero z[i], combine into z[i+1]
+                      writeRawD wsZSort 0 i 0
+                      writeRawD wsZSort 0 (i + 1) r
+                      -- Apply same Givens to eigenvector columns
+                      origI  <- readRawD wsIdx 0 i
+                      origI1 <- readRawD wsIdx 0 (i + 1)
+                      let !colI  = loL + (round origI  :: Int)
+                          !colI1 = loL + (round origI1 :: Int)
+                      rawMutApplyGivensColumns wsQlocal 0 maxN c s colI colI1 maxN
+
+                -- Deflation: partition into non-deflated and deflated.
+                -- The perturbation-based criterion ensures that entries whose
+                -- eigenvalue shift rho*z[i]² is below machine precision
+                -- relative to |d[i]| are deflated, preventing the eigenvector
+                -- formula from dividing by zero (d[j] - lambda == 0 in FP).
+                zn2 <- sumZSq wsZSort 0 nn
+                let !eps_ = 2.220446049250313e-16
+                    !matNorm = max (abs dMaxAbs) (abs dMinAbs) + rho * zn2
+                    !basicDeflTol = max (tol * sqrt zn2) (8 * eps_ * matNorm)
+                    -- Perturbation deflation: deflate when rho*z²<eps*matNorm,
+                    -- i.e. |z| < sqrt(eps*matNorm/rho)
+                    !pertDeflTol = sqrt (eps_ * (1 + matNorm)
+                                        / max rho 1e-300)
+                    !deflTol = max basicDeflTol pertDeflTol
                 kND <- deflatePartition wsZSort 0 wsPerm 0 nn deflTol
 
                 -- Extract Qlocal_sub with permuted columns into wsQsub (maxN × nn)
@@ -1282,10 +1314,12 @@ dcEigenTridiagOpt mbaD offD mbaE offE mbaQ offQ fullN lo0 hi0 tol
                       -- No deflation: full secular solve + full GEMM
                       secularSolve wsLam 0 wsDSort 0 wsZSort 0 rho nn deflTol
                       dcEigenvectors wsW 0 wsDSort 0 wsZSort 0 wsLam 0 rho nn
+
                       baQsub <- unsafeFreezeByteArray wsQsub
                       baW    <- unsafeFreezeByteArray wsW
                       rawZeroDoubles wsResult 0 (maxN * nn)
                       rawGemmKernel baQsub 0 baW 0 wsResult 0 maxN nn nn
+
                       forM_ [0..nn-1] $ \i ->
                         rawCopyColumn wsResult 0 nn i wsQlocal 0 maxN (loL + i) maxN
                       forM_ [0..nn-1] $ \i -> do
@@ -1360,22 +1394,14 @@ dcEigenTridiagOpt mbaD offD mbaE offE mbaQ offQ fullN lo0 hi0 tol
 
       -- Final step: apply wsQlocal to global Q via GEMM
       -- Q[:, lo0..hi0] = Q[:, lo0..hi0] * wsQlocal
-      -- wsQlocal is maxN × maxN; Q is fullN × fullN
-      -- We need: for each output column j in [lo0..hi0],
-      --   Q_new[row][lo0+j'] = Σ_i Q[row][lo0+i] * wsQlocal[i][j']
-      -- where j' = j - lo0, i ranges over [0..maxN-1]
-      --
-      -- Extract Q[:, lo0..hi0] into wsQsub (fullN × maxN)
       forM_ [0..maxN-1] $ \j ->
         rawCopyColumn mbaQ offQ fullN (lo0 + j) wsQsub 0 maxN j fullN
-      -- Freeze both for GEMM
+
       baQsub   <- unsafeFreezeByteArray wsQsub
       baQlocal <- unsafeFreezeByteArray wsQlocal
-      -- Zero result
       rawZeroDoubles wsResult 0 (fullN * maxN)
-      -- GEMM: result(fullN × maxN) = Qsub(fullN × maxN) * Qlocal(maxN × maxN)
       rawGemmKernel baQsub 0 baQlocal 0 wsResult 0 fullN maxN maxN
-      -- Copy result back to global Q
+
       forM_ [0..maxN-1] $ \j ->
         rawCopyColumn wsResult 0 maxN j mbaQ offQ fullN (lo0 + j) fullN
 
@@ -1433,7 +1459,7 @@ secularSolveOne mbaD offD mbaZ offZ rho j nn = do
         -- Interior root between d[j] and d[j+1]
         let !gap = dj1 - dj
             !mid = dj + gap * 0.5
-        lam0 <- fixedWeightLoop 0 mid dj dj1 gap zj2 (zj1 * zj1)
+        lam0 <- fixedWeightLoop 0 mid dj dj1 dj dj1 gap zj2 (zj1 * zj1)
         -- Polish with Newton iterations for higher accuracy
         newtonPolish 0 lam0 dj dj1
       else do
@@ -1456,7 +1482,7 @@ secularSolveOne mbaD offD mbaZ offZ rho j nn = do
         -- Interior root between d[j-1] and d[j] (rho < 0)
         let !gap = dj - dj0
             !mid = dj0 + gap * 0.5
-        fixedWeightLoop 0 mid dj0 dj gap (zj0 * zj0) zj2
+        fixedWeightLoop 0 mid dj0 dj dj0 dj gap (zj0 * zj0) zj2
       else do
         -- First root when rho < 0
         zn2 <- sumZSq mbaZ offZ nn
@@ -1488,20 +1514,21 @@ secularSolveOne mbaD offD mbaZ offZ rho j nn = do
                 else newtonPolish (iter + 1) clamped lb ub
 
     -- Fixed-weight quadratic iteration for interior roots.
-    -- dLo, dHi are the two closest poles; gap = dHi - dLo.
-    -- z2Lo, z2Hi are z²[lo_pole] and z²[hi_pole].
-    fixedWeightLoop !iter !lam !lb !ub !gap !z2Lo !z2Hi
+    -- dLo, dHi are the two FIXED closest poles (never change during iteration).
+    -- lb, ub are the bracket bounds (narrow during iteration).
+    -- gap = dHi - dLo.  z2Lo, z2Hi are z²[lo_pole] and z²[hi_pole].
+    fixedWeightLoop !iter !lam !lb !ub !dLo !dHi !gap !z2Lo !z2Hi
       | iter >= maxIter_ = pure lam
       | otherwise = do
-          -- Evaluate f(λ) with split at dLo and dHi
-          (psiSum, phiSum) <- secularFuncSplit mbaD offD mbaZ offZ nn lam lb ub
+          -- Evaluate f(λ) with split at the fixed poles dLo and dHi
+          (psiSum, phiSum) <- secularFuncSplit mbaD offD mbaZ offZ nn lam dLo dHi
           let !f = 1 + rho * (psiSum + phiSum)
           if abs f < 1e-15 * (1 + abs lam)
             then pure lam
             else do
-              -- Extract close-pole contributions
-              let !deltaLo = lb - lam   -- d[lo_pole] - λ (negative for interior root)
-                  !deltaHi = ub - lam   -- d[hi_pole] - λ (positive for interior root)
+              -- Extract close-pole contributions using FIXED poles
+              let !deltaLo = dLo - lam  -- fixed pole - λ (negative for interior root)
+                  !deltaHi = dHi - lam  -- fixed pole - λ (positive for interior root)
                   -- Protect against division by zero near poles
                   !aClose = if abs deltaLo > 1e-300 then z2Lo / deltaLo else 0
                   !bClose = if abs deltaHi > 1e-300 then z2Hi / deltaHi else 0
@@ -1518,7 +1545,7 @@ secularSolveOne mbaD offD mbaZ offZ rho j nn = do
                   -- Degenerate: fall back to bisection
                   let !(lb', ub') = if f * rho > 0 then (lb, lam) else (lam, ub)
                       !lamNew = (lb' + ub') * 0.5
-                  fixedWeightLoop (iter + 1) lamNew lb' ub' gap z2Lo z2Hi
+                  fixedWeightLoop (iter + 1) lamNew lb' ub' dLo dHi gap z2Lo z2Hi
                 else do
                   let !sqrtDisc = sqrt disc
                       -- Two roots for τ = dLo - λ, i.e. λ = dLo - τ
@@ -1529,9 +1556,9 @@ secularSolveOne mbaD offD mbaZ offZ rho j nn = do
                       !tauB = if qb <= 0
                               then 2 * qc / (-qb + sqrtDisc)
                               else (-qb + sqrtDisc) / (2 * qa)
-                      -- λ = dLo - τ; pick the root in (dLo, dHi) i.e. τ in (-gap, 0)
-                      !lamA = lb - tauA
-                      !lamB = lb - tauB
+                      -- λ = dLo - τ; pick the root in bracket
+                      !lamA = dLo - tauA
+                      !lamB = dLo - tauB
                       !lamNew0 = if lamA > lb && lamA < ub then lamA
                                  else if lamB > lb && lamB < ub then lamB
                                  else (lb + ub) * 0.5  -- bisection fallback
@@ -1543,7 +1570,7 @@ secularSolveOne mbaD offD mbaZ offZ rho j nn = do
                                 else (lb' + ub') * 0.5
                   if abs (lamNew - lam) < 1e-15 * (1 + abs lam)
                     then pure lamNew
-                    else fixedWeightLoop (iter + 1) lamNew lb' ub' gap z2Lo z2Hi
+                    else fixedWeightLoop (iter + 1) lamNew lb' ub' dLo dHi gap z2Lo z2Hi
 
     -- Newton+bisection fallback for edge roots (first/last eigenvalue).
     newtonLoop !iter !lam !lb !ub
@@ -1568,7 +1595,7 @@ secularSolveOne mbaD offD mbaZ offZ rho j nn = do
 -- ψ = Σ_{d[i] ≤ dLo} z[i]²/(d[i] - λ), φ = Σ_{d[i] ≥ dHi} z[i]²/(d[i] - λ)
 secularFuncSplit :: MutableByteArray s -> Int -> MutableByteArray s -> Int
                  -> Int -> Double -> Double -> Double -> ST s (Double, Double)
-secularFuncSplit mbaD offD mbaZ offZ nn lam dLo dHi = go 0 0 0
+secularFuncSplit mbaD offD mbaZ offZ nn lam dLo _dHi = go 0 0 0
   where
     go i !psiAcc !phiAcc
       | i >= nn = pure (psiAcc, phiAcc)
@@ -1680,6 +1707,18 @@ deflatePartition mbaZ offZ mbaPerm offPerm nn deflTol = do
 -- W[j,i] = z[j] / (d[j] - lambda[i]), each column normalised.
 -- Single-pass: writes unnormalised entries and accumulates norm² simultaneously,
 -- then normalises each column with SIMD.
+-- | Compute eigenvector matrix W for the D&C merge step using the
+-- Gu-Eisenstat formula (GVL4 Theorem 8.4.4, p. 469) for improved
+-- numerical stability.
+--
+-- Instead of the naive W[j,i] = z[j]/(d[j]-λ[i]) which suffers from
+-- catastrophic cancellation when d[j] ≈ λ[i], we first compute:
+--
+--   z_new[j]² = ∏_k (λ[k] - d[j]) / ∏_{k≠j} (d[k] - d[j])
+--
+-- This is an algebraic identity but computes z_new to full relative accuracy
+-- because all factors in numerator and denominator are well-separated.
+-- Then W[j,i] = z_new[j] / (d[j] - λ[i]) with column normalization.
 dcEigenvectors :: MutableByteArray s -> Int     -- ^ W (nn × nn output)
                -> MutableByteArray s -> Int     -- ^ d (sorted poles)
                -> MutableByteArray s -> Int     -- ^ z
@@ -1687,27 +1726,47 @@ dcEigenvectors :: MutableByteArray s -> Int     -- ^ W (nn × nn output)
                -> Double -> Int                 -- ^ rho, nn
                -> ST s ()
 dcEigenvectors mbaW offW mbaD offD mbaZ offZ mbaLam offLam _rho nn = do
+  -- Phase 1: Compute z_new via Gu-Eisenstat formula in log space
+  mbaZnew <- newByteArray (nn * 8)
+  forM_ [0..nn-1] $ \j -> do
+    zj <- readRawD mbaZ offZ j
+    dj <- readRawD mbaD offD j
+    -- log|z_new[j]²| = Σ_k log|λ[k] - d[j]| - Σ_{k≠j} log|d[k] - d[j]|
+    logNumer <- goLogSum mbaLam offLam 0 nn dj 0 (-1) -- sum all k
+    logDenom <- goLogSum mbaD offD 0 nn dj 0 j         -- sum all k ≠ j
+    let !logZ2 = logNumer - logDenom
+        !absZnew = exp (logZ2 * 0.5)
+        !znew = if zj >= 0 then absZnew else negate absZnew
+    writeRawD mbaZnew 0 j znew
+
+  -- Phase 2: Build W[j,i] = z_new[j] / (d[j] - λ[i]), normalise columns
   forM_ [0..nn-1] $ \i -> do
     lami <- readRawD mbaLam offLam i
-    -- Single pass: write unnormalised W[j,i] and accumulate norm²
-    norm2 <- writeAndNorm lami i 0 0
+    norm2 <- writeAndNorm mbaZnew lami i 0 0
     let !invNorm = if norm2 > 0 then 1 / sqrt norm2 else 1
-    -- SIMD normalisation: W[j,i] *= invNorm for all j
-    -- W is stored row-major W[j,i] at offset j*nn+i, so column i has stride nn.
-    -- Since column stride is nn (not 1), we use scalar normalisation.
     forM_ [0..nn-1] $ \j -> do
       wji <- readRawD mbaW offW (j * nn + i)
       writeRawD mbaW offW (j * nn + i) (wji * invNorm)
   where
-    writeAndNorm !lami !i !j !acc
+    -- Sum of log|arr[k] - val| for k in [lo..hi-1], skipping index 'skip' (-1 = skip none)
+    goLogSum !arr !off !lo !hi !val !acc !skip
+      | lo >= hi = pure acc
+      | lo == skip = goLogSum arr off (lo + 1) hi val acc skip
+      | otherwise = do
+          ak <- readRawD arr off lo
+          let !diff = abs (ak - val)
+              !logDiff = if diff < 1e-300 then -690.7755 else log diff  -- log(1e-300)
+          goLogSum arr off (lo + 1) hi val (acc + logDiff) skip
+
+    writeAndNorm !mbaZnew !lami !i !j !acc
       | j >= nn = pure acc
       | otherwise = do
-          zj <- readRawD mbaZ offZ j
+          znewj <- readRawD mbaZnew 0 j
           dj <- readRawD mbaD offD j
           let !diff = dj - lami
-              !w = if abs diff < 1e-300 then 0 else zj / diff
+              !w = if abs diff < 1e-300 then 0 else znewj / diff
           writeRawD mbaW offW (j * nn + i) w
-          writeAndNorm lami i (j + 1) (acc + w * w)
+          writeAndNorm mbaZnew lami i (j + 1) (acc + w * w)
 
 -- | Classical Jacobi eigenvalue method (GVL4 Section 8.5).
 jacobiEigen :: forall n r e. (KnownNat n, M.Manifest r e, Floating e, Ord e)
