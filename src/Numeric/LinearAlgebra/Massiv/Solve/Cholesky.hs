@@ -66,16 +66,20 @@ import qualified Data.Massiv.Array as M
 import Data.Massiv.Array (Ix1, Ix2(..), Sz(..), unwrapByteArray, unwrapByteArrayOffset,
                           unwrapMutableByteArray, unwrapMutableByteArrayOffset)
 import GHC.TypeNats (KnownNat)
+import Control.Monad (when)
 import GHC.Exts
+import GHC.Prim
 import GHC.ST (ST(..))
-import Data.Primitive.ByteArray (ByteArray(..), MutableByteArray(..))
+import Data.Primitive.ByteArray (ByteArray(..), MutableByteArray(..), newByteArray, unsafeFreezeByteArray)
 
 import Numeric.LinearAlgebra.Massiv.Types
 import Numeric.LinearAlgebra.Massiv.Internal
 import Numeric.LinearAlgebra.Massiv.Solve.Triangular (forwardSub, backSub)
 import Numeric.LinearAlgebra.Massiv.BLAS.Level3 (transpose)
 import Numeric.LinearAlgebra.Massiv.Internal.Kernel
-  (rawCholColumnSIMD, rawForwardSubCholPackedSIMD, rawBackSubCholTPackedSIMD)
+  (rawCholColumnSIMD, rawCholColumnSIMDFrom,
+   rawForwardSubCholPackedSIMD, rawBackSubCholTPackedSIMD,
+   rawGemmKernel, rawZeroDoubles)
 
 -- | Outer-product Cholesky factorization (GVL4 Algorithm 4.2.1, p. 164).
 --
@@ -234,6 +238,7 @@ choleskySolve a b =
 -- | Specialised Cholesky solve for @P Double@.
 -- Does Cholesky factorisation + solve entirely using raw ByteArray# primops,
 -- avoiding separate G/G^T matrix construction.
+-- For n >= 64, uses panel (blocked) Cholesky factorisation with GEMM trailing update.
 choleskySolveP :: forall n. KnownNat n
                => Matrix n n M.P Double -> Vector n M.P Double -> Vector n M.P Double
 choleskySolveP (MkMatrix a) (MkVector b) =
@@ -246,8 +251,10 @@ choleskySolveP (MkMatrix a) (MkVector b) =
     -- Copy lower triangle using raw primops
     copyLowerTriangle a mbaG offG nn
 
-    -- Phase 1: Cholesky factorisation column by column (SIMD dot-product kernel)
-    mapM_ (rawCholColumnSIMD mbaG offG nn) [0..nn-1]
+    -- Phase 1: Cholesky factorisation
+    if nn >= 64
+      then panelCholFactor mbaG offG nn 32
+      else mapM_ (rawCholColumnSIMD mbaG offG nn) [0..nn-1]
 
     -- Phase 2: Freeze G and prepare RHS
     frozenG <- M.freezeS mg
@@ -265,6 +272,150 @@ choleskySolveP (MkMatrix a) (MkVector b) =
     -- Phase 4: Back substitution (G^T x = y, SIMD SAXPY)
     rawBackSubCholTPackedSIMD baG offFG nn mbaX offX
 {-# NOINLINE choleskySolveP #-}
+
+-- | Panel (blocked) Cholesky factorisation with GEMM trailing update.
+-- For each panel of width @nb@:
+--   1. Apply GEMM from previous panels: G[j:n, j:j+jb] -= L_prev × L_prev_panel^T
+--   2. Factor the panel using within-panel Cholesky (dot from panel start)
+panelCholFactor :: MutableByteArray s -> Int -> Int -> Int -> ST s ()
+panelCholFactor mbaG offG nn nb = go 0
+  where
+    go !j
+      | j >= nn = pure ()
+      | otherwise = do
+          let !jb = min nb (nn - j)
+              !nBelow = nn - j  -- rows in [j..n-1]
+
+          -- Step 1: update current panel with contributions from previous panels
+          when (j > 0) $ do
+            -- L_below = G[j:n, 0:j], shape nBelow × j
+            -- L_panel = G[j:j+jb, 0:j], shape jb × j
+            -- Update: G[j:n, j:j+jb] -= L_below × L_panel^T
+            -- We compute this as: GEMM(L_below, L_panelT), where L_panelT = transpose(L_panel)
+
+            -- Copy L_below to dense buffer (nBelow × j)
+            bufA <- newByteArray (nBelow * j * 8)
+            rawCopyCholSubmatrix mbaG offG nn j 0 nBelow j bufA 0
+
+            -- Copy L_panel transposed to dense buffer (j × jb)
+            -- L_panel is jb × j at rows [j..j+jb-1], cols [0..j-1]
+            -- Transposed: j × jb
+            bufBT <- newByteArray (j * jb * 8)
+            rawCopyCholTranspose mbaG offG nn j 0 jb j bufBT 0
+
+            -- Freeze for GEMM
+            baA <- unsafeFreezeByteArray bufA
+            baBT <- unsafeFreezeByteArray bufBT
+
+            -- GEMM: C = L_below × L_panelT  (nBelow × jb)
+            bufC <- newByteArray (nBelow * jb * 8)
+            rawZeroDoubles bufC 0 (nBelow * jb)
+            rawGemmKernel baA 0 baBT 0 bufC 0 nBelow j jb
+
+            -- Subtract C from G[j:n, j:j+jb]
+            baC <- unsafeFreezeByteArray bufC
+            rawCholSubtractPanel baC 0 jb mbaG offG nn j j nBelow jb
+
+          -- Step 2: factor panel using within-panel dependencies only
+          mapM_ (\c -> rawCholColumnSIMDFrom mbaG offG nn c j) [j..j+jb-1]
+
+          go (j + jb)
+
+-- | Copy submatrix G[rowStart..rowStart+m-1, colStart..colStart+k-1] (stride n)
+-- into dense buffer (stride k).
+rawCopyCholSubmatrix :: MutableByteArray s -> Int -> Int
+                     -> Int -> Int -> Int -> Int
+                     -> MutableByteArray s -> Int
+                     -> ST s ()
+rawCopyCholSubmatrix (MutableByteArray mba_src) (I# off_src) (I# n)
+                     (I# rowStart) (I# colStart) (I# m) (I# k)
+                     (MutableByteArray mba_dst) (I# off_dst) = ST $ \s0 ->
+  let goI i s
+        | isTrue# (i >=# m) = s
+        | otherwise =
+            let srcRow = off_src +# (rowStart +# i) *# n +# colStart
+                dstRow = off_dst +# i *# k
+                span_ = k -# (k `remInt#` 4#)
+                goSimd j s_
+                  | isTrue# (j >=# span_) = s_
+                  | otherwise =
+                      case readDoubleArrayAsDoubleX4# mba_src (srcRow +# j) s_ of
+                        (# s1, v #) ->
+                          case writeDoubleArrayAsDoubleX4# mba_dst (dstRow +# j) v s1 of
+                            s2 -> goSimd (j +# 4#) s2
+                goScalar j s_
+                  | isTrue# (j >=# k) = s_
+                  | otherwise =
+                      case readDoubleArray# mba_src (srcRow +# j) s_ of
+                        (# s1, v #) ->
+                          case writeDoubleArray# mba_dst (dstRow +# j) v s1 of
+                            s2 -> goScalar (j +# 1#) s2
+            in goI (i +# 1#) (goScalar span_ (goSimd 0# s))
+  in (# goI 0# s0, () #)
+{-# INLINE rawCopyCholSubmatrix #-}
+
+-- | Copy and transpose: src[rowStart..rowStart+m-1, colStart..colStart+k-1] (stride n)
+-- into dense buffer of shape k × m (stride m).
+-- i.e., dst[j, i] = src[rowStart+i, colStart+j]
+rawCopyCholTranspose :: MutableByteArray s -> Int -> Int
+                     -> Int -> Int -> Int -> Int
+                     -> MutableByteArray s -> Int
+                     -> ST s ()
+rawCopyCholTranspose (MutableByteArray mba_src) (I# off_src) (I# n)
+                     (I# rowStart) (I# colStart) (I# m) (I# k)
+                     (MutableByteArray mba_dst) (I# off_dst) = ST $ \s0 ->
+  -- For each source row i, read k elements, write them as column i of dst
+  let goI i s
+        | isTrue# (i >=# m) = s
+        | otherwise =
+            let srcRow = off_src +# (rowStart +# i) *# n +# colStart
+                goJ j s_
+                  | isTrue# (j >=# k) = s_
+                  | otherwise =
+                      case readDoubleArray# mba_src (srcRow +# j) s_ of
+                        (# s1, v #) ->
+                          -- dst[j, i] at offset j * m + i
+                          case writeDoubleArray# mba_dst (off_dst +# j *# m +# i) v s1 of
+                            s2 -> goJ (j +# 1#) s2
+            in goI (i +# 1#) (goJ 0# s)
+  in (# goI 0# s0, () #)
+{-# INLINE rawCopyCholTranspose #-}
+
+-- | Subtract dense buffer C (m × k, stride srcStride) from
+-- G[rowStart..rowStart+m-1, colStart..colStart+k-1] (stride n).
+rawCholSubtractPanel :: ByteArray -> Int -> Int
+                     -> MutableByteArray s -> Int -> Int
+                     -> Int -> Int -> Int -> Int
+                     -> ST s ()
+rawCholSubtractPanel (ByteArray ba_src) (I# off_src) (I# srcStride)
+                     (MutableByteArray mba_dst) (I# off_dst) (I# n)
+                     (I# rowStart) (I# colStart) (I# m) (I# k) = ST $ \s0 ->
+  let goI i s
+        | isTrue# (i >=# m) = s
+        | otherwise =
+            let srcRow = off_src +# i *# srcStride
+                dstRow = off_dst +# (rowStart +# i) *# n +# colStart
+                span_ = k -# (k `remInt#` 4#)
+                goSimd j s_
+                  | isTrue# (j >=# span_) = s_
+                  | otherwise =
+                      case readDoubleArrayAsDoubleX4# mba_dst (dstRow +# j) s_ of
+                        (# s1, aij #) ->
+                          let cij = indexDoubleArrayAsDoubleX4# ba_src (srcRow +# j)
+                              aij' = plusDoubleX4# aij (negateDoubleX4# cij)
+                          in case writeDoubleArrayAsDoubleX4# mba_dst (dstRow +# j) aij' s1 of
+                               s2 -> goSimd (j +# 4#) s2
+                goScalar j s_
+                  | isTrue# (j >=# k) = s_
+                  | otherwise =
+                      case readDoubleArray# mba_dst (dstRow +# j) s_ of
+                        (# s1, aij #) ->
+                          let cij = indexDoubleArray# ba_src (srcRow +# j)
+                          in case writeDoubleArray# mba_dst (dstRow +# j) (aij -## cij) s1 of
+                               s2 -> goScalar (j +# 1#) s2
+            in goI (i +# 1#) (goScalar span_ (goSimd 0# s))
+  in (# goI 0# s0, () #)
+{-# INLINE rawCholSubtractPanel #-}
 
 -- | Copy lower triangle of an immutable 2D P array into a mutable byte array.
 copyLowerTriangle :: M.Array M.P Ix2 Double -> MutableByteArray s -> Int -> Int -> ST s ()

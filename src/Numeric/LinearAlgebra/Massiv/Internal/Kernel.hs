@@ -28,6 +28,7 @@ module Numeric.LinearAlgebra.Massiv.Internal.Kernel
   , rawSymRank2Update
     -- * LU kernels
   , rawLUEliminateColumn
+  , rawLUEliminateColumnTo
   , rawSwapRows
   , rawPivotSearch
   , rawForwardSubUnitPacked
@@ -37,6 +38,7 @@ module Numeric.LinearAlgebra.Massiv.Internal.Kernel
     -- * Cholesky kernels
   , rawCholColumn
   , rawCholColumnSIMD
+  , rawCholColumnSIMDFrom
   , rawForwardSubCholPacked
   , rawBackSubCholTPacked
   , rawForwardSubCholPackedSIMD
@@ -1034,6 +1036,51 @@ rawLUEliminateColumn (MutableByteArray mba) (I# off) (I# n) (I# k) = ST $ \s0 ->
       in (# goI (k +# 1#) s1, () #)
 {-# INLINE rawLUEliminateColumn #-}
 
+-- | @rawLUEliminateColumnTo mba off n k colEnd@ — like 'rawLUEliminateColumn'
+-- but the trailing update only touches columns @k+1 .. colEnd-1@ (not @k+1 .. n-1@).
+-- Multipliers are still computed for ALL rows @k+1 .. n-1@.
+-- Used by panel LU to restrict updates to within the current panel.
+rawLUEliminateColumnTo :: MutableByteArray s -> Int -> Int -> Int -> Int -> ST s ()
+rawLUEliminateColumnTo (MutableByteArray mba) (I# off) (I# n) (I# k) (I# colEnd) = ST $ \s0 ->
+  case readDoubleArray# mba (off +# k *# n +# k) s0 of
+    (# s1, akk #) ->
+      let goI i s
+            | isTrue# (i >=# n) = s
+            | otherwise =
+                case readDoubleArray# mba (off +# i *# n +# k) s of
+                  (# s', aik #) ->
+                    let mult = aik /## akk
+                        iRowOff = off +# i *# n
+                        kRowOff = off +# k *# n
+                        jSpan = colEnd -# k -# 1#
+                        jStart = k +# 1#
+                        j4End = jStart +# (jSpan -# (jSpan `remInt#` 4#))
+                        negMultV = broadcastDoubleX4# (negateDouble# mult)
+                    in case writeDoubleArray# mba (off +# i *# n +# k) mult s' of
+                         s'' ->
+                           let goJSimd j s_
+                                 | isTrue# (j >=# j4End) = s_
+                                 | otherwise =
+                                     case readDoubleArrayAsDoubleX4# mba (iRowOff +# j) s_ of
+                                       (# s1_, aij #) ->
+                                         case readDoubleArrayAsDoubleX4# mba (kRowOff +# j) s1_ of
+                                              (# s2_, akjV_ #) ->
+                                                let aij' = fmaddDoubleX4# negMultV akjV_ aij
+                                                in case writeDoubleArrayAsDoubleX4# mba (iRowOff +# j) aij' s2_ of
+                                                     s3_ -> goJSimd (j +# 4#) s3_
+                               goJScalar j s_
+                                 | isTrue# (j >=# colEnd) = s_
+                                 | otherwise =
+                                     case readDoubleArray# mba (iRowOff +# j) s_ of
+                                       (# s1_, aij #) ->
+                                         case readDoubleArray# mba (kRowOff +# j) s1_ of
+                                           (# s2_, akj #) ->
+                                             case writeDoubleArray# mba (iRowOff +# j) (aij -## mult *## akj) s2_ of
+                                               s3_ -> goJScalar (j +# 1#) s3_
+                           in goI (i +# 1#) (goJScalar j4End (goJSimd jStart s''))
+      in (# goI (k +# 1#) s1, () #)
+{-# INLINE rawLUEliminateColumnTo #-}
+
 -- | Swap elements in columns [fromCol..n-1] between two rows of an n-wide matrix.
 -- Uses DoubleX4# SIMD for the contiguous row data.
 rawSwapRows :: MutableByteArray s -> Int -> Int -> Int -> Int -> Int -> ST s ()
@@ -1661,6 +1708,70 @@ rawCholColumnSIMD (MutableByteArray mba) (I# off) (I# n) (I# j) = ST $ \s0 ->
                                     s5 -> goScale (i +# 1#) s5
                     in (# goScale (j +# 1#) s3, () #)
 {-# INLINE rawCholColumnSIMD #-}
+
+-- | Like 'rawCholColumnSIMD' but the dot-product starts from column @fromCol@
+-- instead of column 0.  Used by panel Cholesky: after applying the GEMM update
+-- from previous panels, the within-panel factorisation only needs contributions
+-- from columns @fromCol .. j-1@.
+rawCholColumnSIMDFrom :: MutableByteArray s -> Int -> Int -> Int -> Int -> ST s ()
+rawCholColumnSIMDFrom (MutableByteArray mba) (I# off) (I# n) (I# j) (I# fromCol) = ST $ \s0 ->
+  let jRowOff = off +# j *# n
+      dotLen  = j -# fromCol
+      dotLen4 = dotLen -# (dotLen `remInt#` 4#)
+      k4End   = fromCol +# dotLen4
+
+      goI i s
+        | isTrue# (i >=# n) = s
+        | otherwise =
+            let iRowOff = off +# i *# n
+            in case mutRowDot iRowOff jRowOff fromCol k4End j s of
+                 (# s', dot #) ->
+                   case readDoubleArray# mba (iRowOff +# j) s' of
+                     (# s'', gij #) ->
+                       case writeDoubleArray# mba (iRowOff +# j) (gij -## dot) s'' of
+                         s''' -> goI (i +# 1#) s'''
+
+      mutRowDot r1 r2 k kSimdEnd kEnd s
+        | isTrue# (k <# kSimdEnd) =
+            case goSimd r1 r2 k kSimdEnd (broadcastDoubleX4# 0.0##) s of
+              (# s', acc4 #) ->
+                let !(# a, b, c, d #) = unpackDoubleX4# acc4
+                    simdSum = a +## b +## c +## d
+                in mutRowDotScalar r1 r2 kSimdEnd kEnd simdSum s'
+        | otherwise = mutRowDotScalar r1 r2 k kEnd 0.0## s
+
+      goSimd r1 r2 k kEnd acc s
+        | isTrue# (k >=# kEnd) = (# s, acc #)
+        | otherwise =
+            case readDoubleArrayAsDoubleX4# mba (r1 +# k) s of
+              (# s1, v1 #) ->
+                case readDoubleArrayAsDoubleX4# mba (r2 +# k) s1 of
+                  (# s2, v2 #) -> goSimd r1 r2 (k +# 4#) kEnd (fmaddDoubleX4# v1 v2 acc) s2
+
+      mutRowDotScalar r1 r2 k kEnd acc s
+        | isTrue# (k >=# kEnd) = (# s, acc #)
+        | otherwise =
+            case readDoubleArray# mba (r1 +# k) s of
+              (# s1, v1 #) ->
+                case readDoubleArray# mba (r2 +# k) s1 of
+                  (# s2, v2 #) -> mutRowDotScalar r1 r2 (k +# 1#) kEnd (acc +## v1 *## v2) s2
+
+  in case goI j s0 of
+       s1 ->
+         case readDoubleArray# mba (jRowOff +# j) s1 of
+           (# s2, gjj #) ->
+             let sjj = sqrtDouble# gjj
+             in case writeDoubleArray# mba (jRowOff +# j) sjj s2 of
+                  s3 ->
+                    let goScale i s
+                          | isTrue# (i >=# n) = s
+                          | otherwise =
+                              case readDoubleArray# mba (off +# i *# n +# j) s of
+                                (# s4, gij #) ->
+                                  case writeDoubleArray# mba (off +# i *# n +# j) (gij /## sjj) s4 of
+                                    s5 -> goScale (i +# 1#) s5
+                    in (# goScale (j +# 1#) s3, () #)
+{-# INLINE rawCholColumnSIMDFrom #-}
 
 -- --------------------------------------------------------------------------
 -- SIMD forward/back substitution kernels (dot-product formulation)
