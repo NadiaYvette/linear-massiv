@@ -25,8 +25,8 @@ import Numeric.LinearAlgebra.Massiv.BLAS.Level3 (matMulP, matMulPPar)
 import Numeric.LinearAlgebra.Massiv.Solve.LU (luSolve, luSolveP)
 import Numeric.LinearAlgebra.Massiv.Solve.Cholesky (choleskySolve, choleskySolveP)
 import Numeric.LinearAlgebra.Massiv.Orthogonal.QR (qr, qrP)
-import Numeric.LinearAlgebra.Massiv.Eigen.Symmetric (symmetricEigen, symmetricEigenP, symmetricEigenPPar)
-import Numeric.LinearAlgebra.Massiv.Eigen.SVD (svd, svdP)
+import Numeric.LinearAlgebra.Massiv.Eigen.Symmetric (symmetricEigen, symmetricEigenP, symmetricEigenPPar, symmetricEigenPDC, tridiagonalizeP)
+import Numeric.LinearAlgebra.Massiv.Eigen.SVD (svd, svdP, svdGKP)
 
 -- hmatrix
 import qualified Numeric.LinearAlgebra as H
@@ -282,6 +282,34 @@ main = do
         , bench "linear-massiv" $ nf (\a -> symmetricEigenP a 5000 1e-12) (mkSPDLM @500)
         ]
       ]
+    , bgroup "eigenSH-breakdown"
+      [ bgroup "200x200"
+        [ bench "tridiagP-only" $ nf tridiagonalizeP (mkSPDLM @200)
+        , bench "full-eigenP"   $ nf (\a -> symmetricEigenP a 2000 1e-12) (mkSPDLM @200)
+        ]
+      , bgroup "500x500"
+        [ bench "tridiagP-only" $ nf tridiagonalizeP (mkSPDLM @500)
+        , bench "full-eigenP"   $ nf (\a -> symmetricEigenP a 5000 1e-12) (mkSPDLM @500)
+        ]
+      ]
+    , bgroup "eigenSH-DC"
+      [ bgroup "50x50"
+        [ bench "QR"  $ nf (\a -> symmetricEigenP a 500 1e-12) (mkSPDLM @50)
+        , bench "D&C" $ nf (\a -> symmetricEigenPDC a 1e-12) (mkSPDLM @50)
+        ]
+      , bgroup "100x100"
+        [ bench "QR"  $ nf (\a -> symmetricEigenP a 1000 1e-12) (mkSPDLM @100)
+        , bench "D&C" $ nf (\a -> symmetricEigenPDC a 1e-12) (mkSPDLM @100)
+        ]
+      , bgroup "200x200"
+        [ bench "QR"  $ nf (\a -> symmetricEigenP a 2000 1e-12) (mkSPDLM @200)
+        , bench "D&C" $ nf (\a -> symmetricEigenPDC a 1e-12) (mkSPDLM @200)
+        ]
+      , bgroup "500x500"
+        [ bench "QR"  $ nf (\a -> symmetricEigenP a 5000 1e-12) (mkSPDLM @500)
+        , bench "D&C" $ nf (\a -> symmetricEigenPDC a 1e-12) (mkSPDLM @500)
+        ]
+      ]
     , bgroup "SVD"
       [ bgroup "10x10"
         [ bench "hmatrix"       $ nf H.svd hm10
@@ -296,14 +324,17 @@ main = do
       , bgroup "100x100"
         [ bench "hmatrix"       $ nf H.svd hm100
         , bench "linear-massiv" $ nf svdP (mkMatLM @100 @100)
+        , bench "lm-gk"         $ nf svdGKP (mkMatLM @100 @100)
         ]
       , bgroup "200x200"
         [ bench "hmatrix"       $ nf H.svd hm200
         , bench "linear-massiv" $ nf svdP (mkMatLM @200 @200)
+        , bench "lm-gk"         $ nf svdGKP (mkMatLM @200 @200)
         ]
       , bgroup "500x500"
         [ bench "hmatrix"       $ nf H.svd hm500
         , bench "linear-massiv" $ nf svdP (mkMatLM @500 @500)
+        , bench "lm-gk"         $ nf svdGKP (mkMatLM @500 @500)
         ]
       ]
     ]

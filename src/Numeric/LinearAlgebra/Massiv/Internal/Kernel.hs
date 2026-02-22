@@ -50,6 +50,15 @@ module Numeric.LinearAlgebra.Massiv.Internal.Kernel
   , rawMutTridiagQAccum
     -- * Eigen mutable kernels
   , rawMutApplyGivensColumns
+  , rawMutApplyGivensColumnsCM
+    -- * Matrix transpose
+  , rawTransposeToColMajor
+  , rawTransposeFromColMajor
+    -- * Bulk memory operations
+  , rawZeroDoubles
+  , rawCopyDoubles
+  , rawNegateDoubles
+  , rawCopyColumn
     -- * SVD / bidiagonalisation kernels
   , rawMutHouseholderApplyRow
   , rawMutSumSqRow
@@ -409,20 +418,38 @@ rawMutSymMatvecSub (MutableByteArray mba_t) (I# off_t) (I# ncols)
                    (MutableByteArray mba_v) (I# off_v)
                    (MutableByteArray mba_p) (I# off_p)
                    (I# from_) (I# to) = ST $ \s0 ->
-  let goI i s
-        | isTrue# (i >=# to) = s
-        | otherwise = case goJ i from_ 0.0## s of
-            (# s', acc #) ->
-              case writeDoubleArray# mba_p (off_p +# (i -# from_)) acc s' of
-                s'' -> goI (i +# 1#) s''
+  let !len = to -# from_
+      !len4 = len -# (len `remInt#` 4#)
 
-      goJ i j acc s
-        | isTrue# (j >=# to) = (# s, acc #)
+      goI i s
+        | isTrue# (i >=# to) = s
         | otherwise =
-            case readDoubleArray# mba_t (off_t +# i *# ncols +# j) s of
+            let !rowBase = off_t +# i *# ncols +# from_
+            in case goJ4 rowBase 0# (broadcastDoubleX4# 0.0##) s of
+                (# s1, accV #) ->
+                  let !(# a0, a1, a2, a3 #) = unpackDoubleX4# accV
+                      !simdSum = a0 +## a1 +## a2 +## a3
+                  in case goJTail rowBase len4 simdSum s1 of
+                      (# s2, acc #) ->
+                        case writeDoubleArray# mba_p (off_p +# (i -# from_)) acc s2 of
+                          s3 -> goI (i +# 1#) s3
+
+      goJ4 rowBase j accV s
+        | isTrue# (j >=# len4) = (# s, accV #)
+        | otherwise =
+            case readDoubleArrayAsDoubleX4# mba_t (rowBase +# j) s of
+              (# s1, tv #) ->
+                case readDoubleArrayAsDoubleX4# mba_v (off_v +# j) s1 of
+                  (# s2, vv #) ->
+                    goJ4 rowBase (j +# 4#) (fmaddDoubleX4# tv vv accV) s2
+
+      goJTail rowBase j acc s
+        | isTrue# (j >=# len) = (# s, acc #)
+        | otherwise =
+            case readDoubleArray# mba_t (rowBase +# j) s of
               (# s1, tij #) ->
-                case readDoubleArray# mba_v (off_v +# (j -# from_)) s1 of
-                  (# s2, vj #) -> goJ i (j +# 1#) (acc +## tij *## vj) s2
+                case readDoubleArray# mba_v (off_v +# j) s1 of
+                  (# s2, vj #) -> goJTail rowBase (j +# 1#) (acc +## tij *## vj) s2
 
   in (# goI from_ s0, () #)
 {-# INLINE rawMutSymMatvecSub #-}
@@ -894,6 +921,172 @@ rawMutApplyGivensColumns (MutableByteArray mba) (I# off) (I# ncols)
                                     s4 -> go (row +# 1#) s4
   in (# go 0# s0, () #)
 {-# INLINE rawMutApplyGivensColumns #-}
+
+-- | Apply Givens rotation to two columns of a COLUMN-MAJOR mutable matrix.
+-- In column-major layout, Q[i,j] is at off + j*nrows + i.
+-- Column col_p occupies contiguous memory, enabling SIMD vectorisation.
+-- For each row in [0..nrows-1]:
+--   tmp = c * M[row,col_p] + s * M[row,col_q]
+--   M[row,col_q] = -s * M[row,col_p] + c * M[row,col_q]
+--   M[row,col_p] = tmp
+rawMutApplyGivensColumnsCM :: MutableByteArray s -> Int -> Int
+                           -> Double -> Double -> Int -> Int -> Int -> ST s ()
+rawMutApplyGivensColumnsCM (MutableByteArray mba) (I# off) (I# nrows)
+                           (D# c_) (D# s_) (I# col_p) (I# col_q) (I# _ncols) = ST $ \s0 ->
+  let pBase = off +# col_p *# nrows
+      qBase = off +# col_q *# nrows
+      nrows4 = nrows -# (nrows `remInt#` 4#)
+      cV = broadcastDoubleX4# c_
+      sV = broadcastDoubleX4# s_
+      nsV = negateDoubleX4# sV
+
+      goSimd i s
+        | isTrue# (i >=# nrows4) = s
+        | otherwise =
+            case readDoubleArrayAsDoubleX4# mba (pBase +# i) s of
+              (# s1, pv #) ->
+                case readDoubleArrayAsDoubleX4# mba (qBase +# i) s1 of
+                  (# s2, qv #) ->
+                    let tmp = fmaddDoubleX4# cV pv (timesDoubleX4# sV qv)
+                        q'  = fmaddDoubleX4# nsV pv (timesDoubleX4# cV qv)
+                    in case writeDoubleArrayAsDoubleX4# mba (pBase +# i) tmp s2 of
+                         s3 -> case writeDoubleArrayAsDoubleX4# mba (qBase +# i) q' s3 of
+                                 s4 -> goSimd (i +# 4#) s4
+
+      goScalar i s
+        | isTrue# (i >=# nrows) = s
+        | otherwise =
+            case readDoubleArray# mba (pBase +# i) s of
+              (# s1, mp #) ->
+                case readDoubleArray# mba (qBase +# i) s1 of
+                  (# s2, mq #) ->
+                    let tmp = c_ *## mp +## s_ *## mq
+                        qnew = negateDouble# s_ *## mp +## c_ *## mq
+                    in case writeDoubleArray# mba (pBase +# i) tmp s2 of
+                         s3 -> case writeDoubleArray# mba (qBase +# i) qnew s3 of
+                                 s4 -> goScalar (i +# 1#) s4
+
+  in (# goScalar nrows4 (goSimd 0# s0), () #)
+{-# INLINE rawMutApplyGivensColumnsCM #-}
+
+-- --------------------------------------------------------------------------
+-- Matrix transpose (row-major <-> column-major)
+-- --------------------------------------------------------------------------
+
+-- | Transpose an n×n row-major matrix to column-major layout.
+-- src[i,j] at offS + i*n + j  ->  dst[i,j] at offD + j*n + i
+rawTransposeToColMajor :: MutableByteArray s -> Int -> MutableByteArray s -> Int -> Int -> ST s ()
+rawTransposeToColMajor (MutableByteArray src) (I# offS)
+                       (MutableByteArray dst) (I# offD) (I# n) = ST $ \s0 ->
+  let goI i s
+        | isTrue# (i >=# n) = s
+        | otherwise =
+            let goJ j s'
+                  | isTrue# (j >=# n) = s'
+                  | otherwise =
+                      case readDoubleArray# src (offS +# i *# n +# j) s' of
+                        (# s1, v #) ->
+                          case writeDoubleArray# dst (offD +# j *# n +# i) v s1 of
+                            s2 -> goJ (j +# 1#) s2
+            in goI (i +# 1#) (goJ 0# s)
+  in (# goI 0# s0, () #)
+{-# INLINE rawTransposeToColMajor #-}
+
+-- | Transpose an n×n column-major matrix back to row-major layout.
+-- src[i,j] at offS + j*n + i  ->  dst[i,j] at offD + i*n + j
+rawTransposeFromColMajor :: MutableByteArray s -> Int -> MutableByteArray s -> Int -> Int -> ST s ()
+rawTransposeFromColMajor (MutableByteArray src) (I# offS)
+                         (MutableByteArray dst) (I# offD) (I# n) = ST $ \s0 ->
+  let goJ j s
+        | isTrue# (j >=# n) = s
+        | otherwise =
+            let goI i s'
+                  | isTrue# (i >=# n) = s'
+                  | otherwise =
+                      case readDoubleArray# src (offS +# j *# n +# i) s' of
+                        (# s1, v #) ->
+                          case writeDoubleArray# dst (offD +# i *# n +# j) v s1 of
+                            s2 -> goI (i +# 1#) s2
+            in goJ (j +# 1#) (goI 0# s)
+  in (# goJ 0# s0, () #)
+{-# INLINE rawTransposeFromColMajor #-}
+
+-- --------------------------------------------------------------------------
+-- Bulk memory operations
+-- --------------------------------------------------------------------------
+
+-- | Zero n consecutive doubles in a MutableByteArray starting at element offset.
+-- Uses SIMD (DoubleX4#) for the main loop with scalar cleanup.
+rawZeroDoubles :: MutableByteArray s -> Int -> Int -> ST s ()
+rawZeroDoubles (MutableByteArray mba) (I# off) (I# n) = ST $ \s0 ->
+  let n4 = n -# (n `remInt#` 4#)
+      zeroV = broadcastDoubleX4# 0.0##
+
+      goSimd i s
+        | isTrue# (i >=# n4) = s
+        | otherwise =
+            case writeDoubleArrayAsDoubleX4# mba (off +# i) zeroV s of
+              s1 -> goSimd (i +# 4#) s1
+
+      goScalar i s
+        | isTrue# (i >=# n) = s
+        | otherwise =
+            case writeDoubleArray# mba (off +# i) 0.0## s of
+              s1 -> goScalar (i +# 1#) s1
+
+  in (# goScalar n4 (goSimd 0# s0), () #)
+{-# INLINE rawZeroDoubles #-}
+
+-- | Copy n consecutive doubles from src to dst using memcpy (copyMutableByteArray#).
+-- @rawCopyDoubles dst dstOff src srcOff n@ copies src[srcOff..srcOff+n-1] to dst[dstOff..dstOff+n-1].
+-- All offsets are in element (Double) units.
+rawCopyDoubles :: MutableByteArray s -> Int -> MutableByteArray s -> Int -> Int -> ST s ()
+rawCopyDoubles (MutableByteArray dst) (I# dstOff) (MutableByteArray src) (I# srcOff) (I# n) = ST $ \s ->
+  case copyMutableByteArray# src (srcOff *# 8#) dst (dstOff *# 8#) (n *# 8#) s of
+    s' -> (# s', () #)
+{-# INLINE rawCopyDoubles #-}
+
+-- | Negate n consecutive doubles in-place using SIMD.
+rawNegateDoubles :: MutableByteArray s -> Int -> Int -> ST s ()
+rawNegateDoubles (MutableByteArray mba) (I# off) (I# n) = ST $ \s0 ->
+  let n4 = n -# (n `remInt#` 4#)
+      negOneV = broadcastDoubleX4# (negateDouble# 1.0##)
+
+      goSimd i s
+        | isTrue# (i >=# n4) = s
+        | otherwise =
+            case readDoubleArrayAsDoubleX4# mba (off +# i) s of
+              (# s1, v #) ->
+                case writeDoubleArrayAsDoubleX4# mba (off +# i) (timesDoubleX4# negOneV v) s1 of
+                  s2 -> goSimd (i +# 4#) s2
+
+      goScalar i s
+        | isTrue# (i >=# n) = s
+        | otherwise =
+            case readDoubleArray# mba (off +# i) s of
+              (# s1, v #) ->
+                case writeDoubleArray# mba (off +# i) (negateDouble# v) s1 of
+                  s2 -> goScalar (i +# 1#) s2
+
+  in (# goScalar n4 (goSimd 0# s0), () #)
+{-# INLINE rawNegateDoubles #-}
+
+-- | Copy a column from one matrix to another (both row-major).
+-- Copies src[row, srcCol] to dst[row, dstCol] for row in [0..nrows-1].
+-- Parameters: srcMBA srcOff srcStride srcCol -> dstMBA dstOff dstStride dstCol -> nrows
+rawCopyColumn :: MutableByteArray s -> Int -> Int -> Int
+              -> MutableByteArray s -> Int -> Int -> Int -> Int -> ST s ()
+rawCopyColumn (MutableByteArray src) (I# offS) (I# strideS) (I# colS)
+              (MutableByteArray dst) (I# offD) (I# strideD) (I# colD) (I# nrows) = ST $ \s0 ->
+  let go i s
+        | isTrue# (i >=# nrows) = s
+        | otherwise =
+            case readDoubleArray# src (offS +# i *# strideS +# colS) s of
+              (# s1, v #) ->
+                case writeDoubleArray# dst (offD +# i *# strideD +# colD) v s1 of
+                  s2 -> go (i +# 1#) s2
+  in (# go 0# s0, () #)
+{-# INLINE rawCopyColumn #-}
 
 -- --------------------------------------------------------------------------
 -- SVD / bidiagonalisation kernels

@@ -15,6 +15,7 @@
 -- pp. 449--512.
 module Numeric.LinearAlgebra.Massiv.Eigen.Symmetric
   ( tridiagonalize
+  , tridiagonalizeP
   , symmetricEigen
   , symmetricEigenP
   , symmetricEigenPPar
@@ -38,11 +39,18 @@ import Numeric.LinearAlgebra.Massiv.Internal
 import Numeric.LinearAlgebra.Massiv.Orthogonal.Givens (givensRotation)
 import Numeric.LinearAlgebra.Massiv.Internal.Kernel
   ( rawMutApplyGivensColumns
+  , rawMutApplyGivensColumnsCM
   , rawMutSumSqColumn
   , rawMutSymMatvecSub
   , rawMutSymRank2Update
   , rawMutTridiagQAccum
   , rawGemmKernel
+  , rawTransposeToColMajor
+  , rawTransposeFromColMajor
+  , rawZeroDoubles
+  , rawCopyDoubles
+  , rawNegateDoubles
+  , rawCopyColumn
   )
 
 -- | Reduce a symmetric matrix to tridiagonal form (GVL4 Algorithm 8.3.1).
@@ -171,12 +179,21 @@ tridiagonalizeP a =
             mbaWp <- newByteArray (nn * nb * 8)
             -- Temporary for GEMM-based trailing update
             mbaTemp <- newByteArray (nn * nb * 8)
+            -- Pre-allocate workspace for panelTridiagP (avoids per-panel allocation)
+            wsHvSave <- newByteArray (nb * nn * 8)
+            wsVr <- newByteArray (nn * nb * 8)
+            wsWr <- newByteArray (nn * nb * 8)
+            wsNWrT <- newByteArray (nb * nn * 8)
+            wsNVrT <- newByteArray (nb * nn * 8)
+            wsRem <- newByteArray (nn * nn * 8)
             let go !k0 !accBetas
                   | k0 > numRef - 1 = pure (reverse accBetas)
                   | otherwise = do
                       let !bs = min nb (numRef - k0)
                       panelBetas <- panelTridiagP mbaT offT nn mbaV mbaP mbaW
-                                                  mbaVp mbaWp mbaTemp k0 bs
+                                                  mbaVp mbaWp mbaTemp
+                                                  wsHvSave wsVr wsWr wsNWrT wsNVrT wsRem
+                                                  k0 bs
                       go (k0 + bs) (reverse panelBetas ++ accBetas)
             go 0 []
 
@@ -190,9 +207,9 @@ tridiagonalizeP a =
       qMat = createMatrix @n @n @M.P $ \mq -> do
         let !mbaQ = unwrapMutableByteArray mq
             !offQ = unwrapMutableByteArrayOffset mq
-        -- Set Q = I
-        forM_ [0..nn-1] $ \i -> forM_ [0..nn-1] $ \j ->
-          writeRawD mbaQ offQ (i*nn+j) (if i == j then 1 else 0)
+        -- Set Q = I (SIMD zero + diagonal ones)
+        rawZeroDoubles mbaQ offQ (nn * nn)
+        forM_ [0..nn-1] $ \i -> writeRawD mbaQ offQ (i*nn+i) 1
         if nn < 256
           then
             -- Per-row approach: Q <- Q · H_k for k = 0..n-3
@@ -211,33 +228,48 @@ tridiagonalizeP a =
             mbaW1 <- newByteArray (nn * nb * 8)
             mbaW2 <- newByteArray (nn * nb * 8)
             mbaYT <- newByteArray (nb * nn * 8)
+            mbaG  <- newByteArray (nb * nb * 8)  -- Gram matrix Y^T Y
 
             forM_ [0, nb .. numRef - 1] $ \k0 -> do
               let !bs = min nb (numRef - k0)
 
               -- Pack Y (n × bs) from stored Householder vectors
-              forM_ [0..nn * bs - 1] $ \idx -> writeRawD mbaY 0 idx 0
+              rawZeroDoubles mbaY 0 (nn * bs)
               forM_ [0..bs-1] $ \j -> do
                 let !k = k0 + j
                 writeRawD mbaY 0 ((k+1) * bs + j) 1.0
                 forM_ [k+2..nn-1] $ \l ->
                   writeRawD mbaY 0 (l * bs + j) (indexRawD tBA tOff (l * nn + k))
 
-              -- Build T factor (bs × bs upper-triangular)
-              forM_ [0..bs*bs-1] $ \idx -> writeRawD mbaTf 0 idx 0
+              -- Transpose Y → Y^T (bs × n) early: reused for T factor and final GEMM
+              forM_ [0..nn-1] $ \row ->
+                forM_ [0..bs-1] $ \col ->
+                  writeRawD mbaYT 0 (col * nn + row) 0
+              forM_ [0..bs-1] $ \j -> do
+                let !k = k0 + j
+                writeRawD mbaYT 0 (j * nn + (k+1)) 1.0
+                forM_ [k+2..nn-1] $ \l ->
+                  writeRawD mbaYT 0 (j * nn + l) (indexRawD tBA tOff (l * nn + k))
+
+              -- Freeze Y and Y^T for GEMM use
+              baY  <- unsafeFreezeByteArray mbaY
+              baYT <- unsafeFreezeByteArray mbaYT
+
+              -- Compute G = Y^T × Y (bs × bs) via GEMM for T factor dot products
+              rawZeroDoubles mbaG 0 (bs * bs)
+              rawGemmKernel baYT 0 baY 0 mbaG 0 bs nn bs
+
+              -- Build T factor (bs × bs upper-triangular) using precomputed G
+              rawZeroDoubles mbaTf 0 (bs * bs)
               forM_ [0..bs-1] $ \j -> do
                 betaj <- readRawD mbaBetas 0 (k0 + j)
                 writeRawD mbaTf 0 (j * bs + j) betaj
                 when (j > 0 && betaj /= 0) $ do
+                  -- Read G[i,j] = Y[:,i]^T Y[:,j] for all i < j
                   forM_ [0..j-1] $ \i -> do
-                    let dotLoop !l !acc
-                          | l >= nn = pure acc
-                          | otherwise = do
-                              yi <- readRawD mbaY 0 (l * bs + i)
-                              yj <- readRawD mbaY 0 (l * bs + j)
-                              dotLoop (l+1) (acc + yi * yj)
-                    dot <- dotLoop (k0 + j + 1) 0
-                    writeRawD mbaW1 0 i dot
+                    g_ij <- readRawD mbaG 0 (i * bs + j)
+                    writeRawD mbaW1 0 i g_ij
+                  -- Triangular solve: T[i,j] = -betaj * Σ_l T[i,l] * G[l,j]
                   forM_ [0..j-1] $ \i -> do
                     let triLoop !l !acc
                           | l >= j = pure acc
@@ -250,29 +282,20 @@ tridiagonalizeP a =
 
               -- W1 = Q · Y (GEMM n×n * n×bs → n×bs)
               baQ <- unsafeFreezeByteArray mbaQ
-              baY <- unsafeFreezeByteArray mbaY
-              forM_ [0..nn*bs-1] $ \idx -> writeRawD mbaW1 0 idx 0
+              rawZeroDoubles mbaW1 0 (nn * bs)
               rawGemmKernel baQ offQ baY 0 mbaW1 0 nn nn bs
 
               -- W2 = W1 · T (GEMM n×bs * bs×bs → n×bs)
               baW1 <- unsafeFreezeByteArray mbaW1
               baTf <- unsafeFreezeByteArray mbaTf
-              forM_ [0..nn*bs-1] $ \idx -> writeRawD mbaW2 0 idx 0
+              rawZeroDoubles mbaW2 0 (nn * bs)
               rawGemmKernel baW1 0 baTf 0 mbaW2 0 nn bs bs
 
-              -- Negate W2 in-place
-              forM_ [0..nn*bs-1] $ \idx -> do
-                v <- readRawD mbaW2 0 idx
-                writeRawD mbaW2 0 idx (negate v)
+              -- Negate W2 in-place (SIMD)
+              rawNegateDoubles mbaW2 0 (nn * bs)
 
-              -- Transpose Y → Y^T (bs × n)
-              forM_ [0..nn-1] $ \row ->
-                forM_ [0..bs-1] $ \col ->
-                  writeRawD mbaYT 0 (col * nn + row) (indexRawD baY 0 (row * bs + col))
-
-              -- Q += (-W2) · Y^T (GEMM n×bs * bs×n → n×n)
+              -- Q += (-W2) · Y^T (GEMM n×bs * bs×n → n×n) — reuses baYT
               baNW2 <- unsafeFreezeByteArray mbaW2
-              baYT <- unsafeFreezeByteArray mbaYT
               rawGemmKernel baNW2 0 baYT 0 mbaQ offQ nn bs nn
 
       -- Read diagonal and subdiagonal from frozen T
@@ -349,9 +372,12 @@ tridiagStepP mbaT offT nn mbaV mbaP mbaW k = do
 panelTridiagP :: MutableByteArray s -> Int -> Int  -- T matrix, offset, n
               -> MutableByteArray s -> MutableByteArray s -> MutableByteArray s  -- v, p, w temps
               -> MutableByteArray s -> MutableByteArray s -> MutableByteArray s  -- Vp, Wp, temp
+              -> MutableByteArray s -> MutableByteArray s -> MutableByteArray s  -- wsHvSave, wsVr, wsWr
+              -> MutableByteArray s -> MutableByteArray s -> MutableByteArray s  -- wsNWrT, wsNVrT, wsRem
               -> Int -> Int  -- k0, bs (panel start, panel size)
               -> ST s [Double]
-panelTridiagP mbaT offT nn mbaV mbaP mbaW mbaVp mbaWp _mbaTemp k0 bs = do
+panelTridiagP mbaT offT nn mbaV mbaP mbaW mbaVp mbaWp _mbaTemp
+              mbaHvSave mbaVr mbaWr mbaNWrT mbaNVrT mbaRem k0 bs = do
   -- DLATRD-style: NO rank-2 updates to T within the panel.
   -- All corrections computed from V_panel, W_panel.
   -- After the panel, apply SYR2K to the full remaining submatrix.
@@ -369,8 +395,6 @@ panelTridiagP mbaT offT nn mbaV mbaP mbaW mbaVp mbaWp _mbaTemp k0 bs = do
     -- Save Householder vectors from T columns k0..k0+bs-1
     -- These are T[i, k] for i > k+1, k in [k0..k0+bs-1]
     -- Also save subdiagonal entries T[k+1, k] = mu
-    let !hvSize = bs * nn  -- upper bound for storage
-    mbaHvSave <- newByteArray (hvSize * 8)
     forM_ [0..bs-1] $ \l -> do
       let !k = k0 + l
           !startRow = k + 1
@@ -383,27 +407,21 @@ panelTridiagP mbaT offT nn mbaV mbaP mbaW mbaVp mbaWp _mbaTemp k0 bs = do
         writeRawD mbaHvSave 0 (l * nn + k) val  -- reuse slot k < startRow
 
     -- Build contiguous V_rem (remSize × bs) and W_rem (remSize × bs)
-    mbaVr <- newByteArray (remSize * bs * 8)
-    mbaWr <- newByteArray (remSize * bs * 8)
+    -- V_panel and W_panel have stride bs, so V_rem is a contiguous subblock
+    rawCopyDoubles mbaVr 0 mbaVp (remStart * bs) (remSize * bs)
+    rawCopyDoubles mbaWr 0 mbaWp (remStart * bs) (remSize * bs)
+
+    -- Build -W_rem^T and -V_rem^T (bs × remSize) via transpose + negate
     forM_ [0..remSize-1] $ \i ->
       forM_ [0..bs-1] $ \j -> do
-        readRawD mbaVp 0 ((remStart + i) * bs + j) >>= writeRawD mbaVr 0 (i * bs + j)
-        readRawD mbaWp 0 ((remStart + i) * bs + j) >>= writeRawD mbaWr 0 (i * bs + j)
+        readRawD mbaWr 0 (i * bs + j) >>= writeRawD mbaNWrT 0 (j * remSize + i)
+        readRawD mbaVr 0 (i * bs + j) >>= writeRawD mbaNVrT 0 (j * remSize + i)
+    rawNegateDoubles mbaNWrT 0 (bs * remSize)
+    rawNegateDoubles mbaNVrT 0 (bs * remSize)
 
-    -- Build -W_rem^T and -V_rem^T (bs × remSize)
-    mbaNWrT <- newByteArray (bs * remSize * 8)
-    mbaNVrT <- newByteArray (bs * remSize * 8)
+    -- Copy T_rem to contiguous temp (row-by-row bulk copy)
     forM_ [0..remSize-1] $ \i ->
-      forM_ [0..bs-1] $ \j -> do
-        readRawD mbaWr 0 (i * bs + j) >>= \w -> writeRawD mbaNWrT 0 (j * remSize + i) (negate w)
-        readRawD mbaVr 0 (i * bs + j) >>= \v -> writeRawD mbaNVrT 0 (j * remSize + i) (negate v)
-
-    -- Copy T_rem to contiguous temp
-    mbaRem <- newByteArray (remSize * remSize * 8)
-    forM_ [0..remSize-1] $ \i ->
-      forM_ [0..remSize-1] $ \j ->
-        readRawD mbaT offT ((remStart + i) * nn + (remStart + j))
-          >>= writeRawD mbaRem 0 (i * remSize + j)
+      rawCopyDoubles mbaRem (i * remSize) mbaT (offT + (remStart + i) * nn + remStart) remSize
 
     -- GEMM: rem += V_rem * (-W_rem^T) + W_rem * (-V_rem^T)
     baVr <- unsafeFreezeByteArray mbaVr
@@ -413,11 +431,9 @@ panelTridiagP mbaT offT nn mbaV mbaP mbaW mbaVp mbaWp _mbaTemp k0 bs = do
     baNVrT <- unsafeFreezeByteArray mbaNVrT
     rawGemmKernel baWr 0 baNVrT 0 mbaRem 0 remSize bs remSize
 
-    -- Copy back to T
+    -- Copy back to T (row-by-row bulk copy)
     forM_ [0..remSize-1] $ \i ->
-      forM_ [0..remSize-1] $ \j ->
-        readRawD mbaRem 0 (i * remSize + j)
-          >>= writeRawD mbaT offT ((remStart + i) * nn + (remStart + j))
+      rawCopyDoubles mbaT (offT + (remStart + i) * nn + remStart) mbaRem (i * remSize) remSize
 
     -- Restore saved Householder vectors and subdiagonal entries
     forM_ [0..bs-1] $ \l -> do
@@ -674,7 +690,7 @@ applyGivensRightQ mq c s ci ck nn =
 symmetricEigenP :: forall n. KnownNat n
                 => Matrix n n M.P Double -> Int -> Double -> (Vector n M.P Double, Matrix n n M.P Double)
 symmetricEigenP a maxIter tol
-  | dimVal @n >= 100000 = symmetricEigenPDC a tol  -- disabled: D&C overhead too high
+  | dimVal @n >= dcCrossover = symmetricEigenPDC a tol
   | otherwise =
   let nn = dimVal @n
       (q0, diag_, subdiag) = tridiagonalizeP a
@@ -687,10 +703,15 @@ symmetricEigenP a maxIter tol
             !offSD = unwrapMutableByteArrayOffset msd
             !mbaQ  = unwrapMutableByteArray mq
             !offQ  = unwrapMutableByteArrayOffset mq
-        rawTridiagQRLoop mbaD offD mbaSD offSD mbaQ offQ nn maxIter tol
+        -- Column-major Q for SIMD Givens rotations
+        mbaQcm <- newByteArray (nn * nn * 8)
+        rawTransposeToColMajor mbaQ offQ mbaQcm 0 nn
+        rawTridiagQRLoopCM mbaD offD mbaSD offSD mbaQcm 0 nn maxIter tol
+        rawTransposeFromColMajor mbaQcm 0 mbaQ offQ nn
         dFrozen <- M.freezeS md
         pure (MkVector dFrozen)
   in (dArr, MkMatrix qArr)
+  where dcCrossover = 100000  -- Initial: only QR path; tune after D&C optimisation
 {-# NOINLINE symmetricEigenP #-}
 
 -- | Parallel specialised symmetric eigenvalue decomposition for @P Double@.
@@ -712,7 +733,11 @@ symmetricEigenPPar a maxIter tol = unsafePerformIO $ do
       !offSD = unwrapMutableByteArrayOffset msd
       !mbaQ  = unwrapMutableByteArray mq
       !offQ  = unwrapMutableByteArrayOffset mq
-  rawTridiagQRLoopPar mbaD offD mbaSD offSD mbaQ offQ nn maxIter tol
+  -- Transpose Q to column-major for SIMD Givens, run parallel QR, transpose back
+  mbaQcm <- stToIO $ newByteArray (nn * nn * 8)
+  stToIO $ rawTransposeToColMajor mbaQ offQ mbaQcm 0 nn
+  rawTridiagQRLoopParCM mbaD offD mbaSD offSD mbaQcm 0 nn maxIter tol
+  stToIO $ rawTransposeFromColMajor mbaQcm 0 mbaQ offQ nn
   dFrozen <- M.freezeS md
   qFrozen <- M.freezeS mq
   pure (MkVector dFrozen, MkMatrix qFrozen)
@@ -785,6 +810,50 @@ rawTridiagQRLoopPar mbaD offD mbaSD offSD mbaQ offQ nn maxIter tol = go 0 0 (nn 
                           sgn = if delta >= 0 then 1 else -1
                           shift = dhi - sp1*sp1 / (delta + sgn * sqrt (delta*delta + sp1*sp1))
                       stToIO $ rawImplicitQRStep mbaD offD mbaSD offSD mbaQ offQ nn shift lo hi
+                      go (iter + 1) lo hi
+
+-- | Parallel QR loop with column-major Q for SIMD Givens.
+rawTridiagQRLoopParCM :: MutableByteArray RealWorld -> Int
+                      -> MutableByteArray RealWorld -> Int
+                      -> MutableByteArray RealWorld -> Int
+                      -> Int -> Int -> Double -> IO ()
+rawTridiagQRLoopParCM mbaD offD mbaSD offSD mbaQ offQ nn maxIter tol = go 0 0 (nn - 1)
+  where
+    rd mba off i = stToIO (readRawD mba off i)
+    wr mba off i v = stToIO (writeRawD mba off i v)
+
+    go !iter !lo !hi
+      | iter >= maxIter = pure ()
+      | lo >= hi = pure ()
+      | otherwise = do
+          sdhi <- rd mbaSD offSD (hi - 1)
+          dhi1 <- rd mbaD offD (hi - 1)
+          dhi  <- rd mbaD offD hi
+          if abs sdhi <= tol * (abs dhi1 + abs dhi)
+            then do wr mbaSD offSD (hi - 1) 0; go iter lo (hi - 1)
+            else do
+              sdlo <- rd mbaSD offSD lo
+              dlo  <- rd mbaD offD lo
+              dlo1 <- rd mbaD offD (lo + 1)
+              if abs sdlo <= tol * (abs dlo + abs dlo1)
+                then do wr mbaSD offSD lo 0; go iter (lo + 1) hi
+                else do
+                  split <- stToIO $ rawFindSplit mbaD offD mbaSD offSD lo hi tol
+                  case split of
+                    Just q -> do
+                      wr mbaSD offSD q 0
+                      done <- newEmptyMVar
+                      _ <- forkIO $ do
+                        go iter lo q
+                        putMVar done ()
+                      go iter (q + 1) hi
+                      takeMVar done
+                    Nothing -> do
+                      let sp1 = sdhi
+                          delta = (dhi1 - dhi) / 2
+                          sgn = if delta >= 0 then 1 else -1
+                          shift = dhi - sp1*sp1 / (delta + sgn * sqrt (delta*delta + sp1*sp1))
+                      stToIO $ rawImplicitQRStepCM mbaD offD mbaSD offSD mbaQ offQ nn shift lo hi
                       go (iter + 1) lo hi
 
 -- | Read a Double from a raw MutableByteArray at element index.
@@ -907,6 +976,76 @@ rawImplicitQRStep mbaD offD mbaSD offSD mbaQ offQ nn shift lo hi = do
           chase (k+1) ek_new z'
         else pure ()
 
+-- | Column-major QR loop: same as rawTridiagQRLoop but Q is column-major.
+-- In column-major layout, Q[i,j] at off + j*nn + i. This enables SIMD
+-- Givens column updates (4 rows at a time via DoubleX4#).
+rawTridiagQRLoopCM :: MutableByteArray s -> Int   -- ^ diagonal array + offset
+                   -> MutableByteArray s -> Int   -- ^ subdiagonal array + offset
+                   -> MutableByteArray s -> Int   -- ^ Q matrix (COLUMN-MAJOR) + offset
+                   -> Int -> Int -> Double -> ST s ()
+rawTridiagQRLoopCM mbaD offD mbaSD offSD mbaQ offQ nn maxIter tol = go 0 0 (nn - 1)
+  where
+    go !iter !lo !hi
+      | iter >= maxIter = pure ()
+      | lo >= hi = pure ()
+      | otherwise = do
+          sdhi <- readRawD mbaSD offSD (hi - 1)
+          dhi1 <- readRawD mbaD offD (hi - 1)
+          dhi  <- readRawD mbaD offD hi
+          if abs sdhi <= tol * (abs dhi1 + abs dhi)
+            then do writeRawD mbaSD offSD (hi - 1) 0; go iter lo (hi - 1)
+            else do
+              sdlo <- readRawD mbaSD offSD lo
+              dlo  <- readRawD mbaD offD lo
+              dlo1 <- readRawD mbaD offD (lo + 1)
+              if abs sdlo <= tol * (abs dlo + abs dlo1)
+                then do writeRawD mbaSD offSD lo 0; go iter (lo + 1) hi
+                else do
+                  split <- rawFindSplit mbaD offD mbaSD offSD lo hi tol
+                  case split of
+                    Just q -> do
+                      writeRawD mbaSD offSD q 0
+                      go iter lo q
+                      go iter (q + 1) hi
+                    Nothing -> do
+                      let sp1 = sdhi
+                          delta = (dhi1 - dhi) / 2
+                          sgn = if delta >= 0 then 1 else -1
+                          shift = dhi - sp1*sp1 / (delta + sgn * sqrt (delta*delta + sp1*sp1))
+                      rawImplicitQRStepCM mbaD offD mbaSD offSD mbaQ offQ nn shift lo hi
+                      go (iter + 1) lo hi
+
+-- | Column-major implicit QR step: same as rawImplicitQRStep but uses
+-- SIMD Givens on column-major Q layout.
+rawImplicitQRStepCM :: MutableByteArray s -> Int -> MutableByteArray s -> Int
+                    -> MutableByteArray s -> Int
+                    -> Int -> Double -> Int -> Int -> ST s ()
+rawImplicitQRStepCM mbaD offD mbaSD offSD mbaQ offQ nn shift lo hi = do
+  dlo <- readRawD mbaD offD lo
+  sdlo <- readRawD mbaSD offSD lo
+  chase lo (dlo - shift) sdlo
+  where
+    chase k x z = do
+      let (c, s) = givensRotation x z
+      when (k > lo) $
+        writeRawD mbaSD offSD (k-1) (c * x - s * z)
+      dk  <- readRawD mbaD offD k
+      ek  <- readRawD mbaSD offSD k
+      dk1 <- readRawD mbaD offD (k+1)
+      writeRawD mbaD offD k     (c*c*dk - 2*c*s*ek + s*s*dk1)
+      writeRawD mbaD offD (k+1) (s*s*dk + 2*c*s*ek + c*c*dk1)
+      writeRawD mbaSD offSD k   (c*s*(dk - dk1) + (c*c - s*s)*ek)
+      -- SIMD Givens rotation on column-major Q
+      rawMutApplyGivensColumnsCM mbaQ offQ nn c (negate s) k (k+1) nn
+      if k + 1 < hi
+        then do
+          ek1 <- readRawD mbaSD offSD (k+1)
+          let z' = -s * ek1
+          writeRawD mbaSD offSD (k+1) (c * ek1)
+          ek_new <- readRawD mbaSD offSD k
+          chase (k+1) ek_new z'
+        else pure ()
+
 -- --------------------------------------------------------------------------
 -- Divide-and-conquer tridiagonal eigensolver (GVL4 Section 8.4)
 -- Optimised: pre-allocated workspace, QR fallback for small subproblems,
@@ -949,7 +1088,7 @@ dcEigenTridiagOpt mbaD offD mbaE offE mbaQ offQ fullN lo0 hi0 tol
       -- Indexed with LOCAL coordinates: row/col in [0..maxN-1].
       -- Local index i corresponds to global index (lo0 + i).
       wsQlocal <- newByteArray (maxN * maxN * 8)
-      forM_ [0..maxN*maxN-1] $ \i -> writeRawD wsQlocal 0 i 0
+      rawZeroDoubles wsQlocal 0 (maxN * maxN)
       forM_ [0..maxN-1] $ \i -> writeRawD wsQlocal 0 (i * maxN + i) 1
 
       let !dcThreshold = 25
@@ -989,7 +1128,7 @@ dcEigenTridiagOpt mbaD offD mbaE offE mbaQ offQ fullN lo0 hi0 tol
                 -- QR fallback for small subproblems
                 let !k = hi - lo + 1
                 -- Initialise wsQtemp as k×k identity
-                forM_ [0..k*k-1] $ \i -> writeRawD wsQtemp 0 i 0
+                rawZeroDoubles wsQtemp 0 (k * k)
                 forM_ [0..k-1] $ \i -> writeRawD wsQtemp 0 (i * k + i) 1
                 -- Run QR iteration on d[lo..hi], e[lo..hi-1]
                 rawTridiagQRLoop mbaD (offD + lo) mbaE (offE + lo) wsQtemp 0 k (30 * k) tol
@@ -1082,17 +1221,13 @@ dcEigenTridiagOpt mbaD offD mbaE offE mbaQ offQ fullN lo0 hi0 tol
                   origIdx <- readRawD wsIdx 0 sortedJ
                   let !origJ = round origIdx :: Int
                       !srcCol = loL + origJ
-                  forM_ [0..maxN-1] $ \row -> do
-                    qv <- readRawD wsQlocal 0 (row * maxN + srcCol)
-                    writeRawD wsQsub 0 (row * nn + sortedJ) qv
+                  rawCopyColumn wsQlocal 0 maxN srcCol wsQsub 0 nn sortedJ maxN
 
                 if kND == 0
                   then do
                     -- All deflated: eigenvalues = sorted d, eigenvectors = sorted Qlocal cols
                     forM_ [0..nn-1] $ \i ->
-                      forM_ [0..maxN-1] $ \row -> do
-                        qv <- readRawD wsQsub 0 (row * nn + i)
-                        writeRawD wsQlocal 0 (row * maxN + (loL + i)) qv
+                      rawCopyColumn wsQsub 0 nn i wsQlocal 0 maxN (loL + i) maxN
                     forM_ [0..nn-1] $ \i -> do
                       di <- readRawD wsDSort 0 i
                       writeRawD mbaD offD (lo + i) di
@@ -1104,12 +1239,10 @@ dcEigenTridiagOpt mbaD offD mbaE offE mbaQ offQ fullN lo0 hi0 tol
                       dcEigenvectors wsW 0 wsDSort 0 wsZSort 0 wsLam 0 rho nn
                       baQsub <- unsafeFreezeByteArray wsQsub
                       baW    <- unsafeFreezeByteArray wsW
-                      forM_ [0..maxN * nn - 1] $ \i -> writeRawD wsResult 0 i 0
+                      rawZeroDoubles wsResult 0 (maxN * nn)
                       rawGemmKernel baQsub 0 baW 0 wsResult 0 maxN nn nn
                       forM_ [0..nn-1] $ \i ->
-                        forM_ [0..maxN-1] $ \row -> do
-                          rv <- readRawD wsResult 0 (row * nn + i)
-                          writeRawD wsQlocal 0 (row * maxN + (loL + i)) rv
+                        rawCopyColumn wsResult 0 nn i wsQlocal 0 maxN (loL + i) maxN
                       forM_ [0..nn-1] $ \i -> do
                         lam <- readRawD wsLam 0 i
                         writeRawD mbaD offD (lo + i) lam
@@ -1134,28 +1267,22 @@ dcEigenTridiagOpt mbaD offD mbaE offE mbaQ offQ fullN lo0 hi0 tol
                       -- Copy deflated columns from wsQsub to wsQlocal
                       forM_ [kND..nn-1] $ \j -> do
                         pi_ <- readRawI wsPerm 0 j
-                        forM_ [0..maxN-1] $ \row -> do
-                          qv <- readRawD wsQsub 0 (row * nn + pi_)
-                          writeRawD wsQlocal 0 (row * maxN + (loL + j)) qv
+                        rawCopyColumn wsQsub 0 nn pi_ wsQlocal 0 maxN (loL + j) maxN
 
                       -- Extract Q_nd (maxN×kND) from non-deflated columns
                       forM_ [0..kND-1] $ \j -> do
                         pi_ <- readRawI wsPerm 0 j
-                        forM_ [0..maxN-1] $ \row -> do
-                          qv <- readRawD wsQsub 0 (row * nn + pi_)
-                          writeRawD wsResult 0 (row * kND + j) qv
+                        rawCopyColumn wsQsub 0 nn pi_ wsResult 0 kND j maxN
 
                       -- GEMM: wsQsub(maxN×kND) = Q_nd(maxN×kND) × W_nd(kND×kND)
                       baQnd <- unsafeFreezeByteArray wsResult
                       baW   <- unsafeFreezeByteArray wsW
-                      forM_ [0..maxN * kND - 1] $ \i -> writeRawD wsQsub 0 i 0
+                      rawZeroDoubles wsQsub 0 (maxN * kND)
                       rawGemmKernel baQnd 0 baW 0 wsQsub 0 maxN kND kND
 
                       -- Copy GEMM result (non-deflated columns) to wsQlocal
                       forM_ [0..kND-1] $ \j ->
-                        forM_ [0..maxN-1] $ \row -> do
-                          rv <- readRawD wsQsub 0 (row * kND + j)
-                          writeRawD wsQlocal 0 (row * maxN + (loL + j)) rv
+                        rawCopyColumn wsQsub 0 kND j wsQlocal 0 maxN (loL + j) maxN
 
                       -- Write eigenvalues: non-deflated from wsLam, deflated from wsDSort
                       forM_ [0..kND-1] $ \i -> do
@@ -1171,21 +1298,17 @@ dcEigenTridiagOpt mbaD offD mbaE offE mbaQ offQ fullN lo0 hi0 tol
           applyRotToQlocal !colOff !k rotMat = do
             -- Extract wsQlocal[:, colOff..colOff+k-1] into wsQsub (maxN × k)
             forM_ [0..k-1] $ \j ->
-              forM_ [0..maxN-1] $ \row -> do
-                qv <- readRawD wsQlocal 0 (row * maxN + (colOff + j))
-                writeRawD wsQsub 0 (row * k + j) qv
+              rawCopyColumn wsQlocal 0 maxN (colOff + j) wsQsub 0 k j maxN
             -- O(1) freeze for GEMM inputs
             baQsub <- unsafeFreezeByteArray wsQsub
             baRot  <- unsafeFreezeByteArray rotMat
             -- Zero result
-            forM_ [0..maxN * k - 1] $ \i -> writeRawD wsResult 0 i 0
+            rawZeroDoubles wsResult 0 (maxN * k)
             -- GEMM: result(maxN×k) = Qsub(maxN×k) * Rot(k×k)
             rawGemmKernel baQsub 0 baRot 0 wsResult 0 maxN k k
             -- Copy result back to wsQlocal
             forM_ [0..k-1] $ \j ->
-              forM_ [0..maxN-1] $ \row -> do
-                rv <- readRawD wsResult 0 (row * k + j)
-                writeRawD wsQlocal 0 (row * maxN + (colOff + j)) rv
+              rawCopyColumn wsResult 0 k j wsQlocal 0 maxN (colOff + j) maxN
 
       -- Run the D&C recursion (operates on wsQlocal and mbaD/mbaE)
       dcGo lo0 hi0
@@ -1199,21 +1322,17 @@ dcEigenTridiagOpt mbaD offD mbaE offE mbaQ offQ fullN lo0 hi0 tol
       --
       -- Extract Q[:, lo0..hi0] into wsQsub (fullN × maxN)
       forM_ [0..maxN-1] $ \j ->
-        forM_ [0..fullN-1] $ \row -> do
-          qv <- readRawD mbaQ 0 (offQ + row * fullN + (lo0 + j))
-          writeRawD wsQsub 0 (row * maxN + j) qv
+        rawCopyColumn mbaQ offQ fullN (lo0 + j) wsQsub 0 maxN j fullN
       -- Freeze both for GEMM
       baQsub   <- unsafeFreezeByteArray wsQsub
       baQlocal <- unsafeFreezeByteArray wsQlocal
       -- Zero result
-      forM_ [0..fullN * maxN - 1] $ \i -> writeRawD wsResult 0 i 0
+      rawZeroDoubles wsResult 0 (fullN * maxN)
       -- GEMM: result(fullN × maxN) = Qsub(fullN × maxN) * Qlocal(maxN × maxN)
       rawGemmKernel baQsub 0 baQlocal 0 wsResult 0 fullN maxN maxN
       -- Copy result back to global Q
       forM_ [0..maxN-1] $ \j ->
-        forM_ [0..fullN-1] $ \row -> do
-          rv <- readRawD wsResult 0 (row * maxN + j)
-          writeRawD mbaQ 0 (offQ + row * fullN + (lo0 + j)) rv
+        rawCopyColumn wsResult 0 maxN j mbaQ offQ fullN (lo0 + j) fullN
 
 -- | Solve the secular equation: f(λ) = 1 + ρ * Σ z[i]² / (d[i] - λ) = 0
 -- for all nn roots. Roots are stored in mbaLam.
