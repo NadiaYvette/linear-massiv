@@ -5083,9 +5083,8 @@ implementation complexity.
 \subsection{1.\ GEMM Micro-Panel Packing}
 \label{sec:future-gemm-packing}
 
-%% ------------------------------------------------------------------
-\subsection{1.\ GEMM Micro-Panel Packing}
-\label{sec:future-gemm-packing}
+\paragraph{Status: implementable now.}  No external blockers; deferred
+because the benefit is negligible at $n \leq 500$.
 
 \paragraph{Current state.}
 The GEMM kernel (\texttt{rawGemmKernel}, Kernel.hs) reads $A$ and $B$
@@ -5114,6 +5113,10 @@ problem sizes.
 \subsection{2.\ 2D Parallel GEMM Tiling}
 \label{sec:future-2d-gemm}
 
+\paragraph{Status: implementable now.}  No external blockers; deferred
+because single-threaded benchmarks are the primary comparison target
+and this only affects parallel performance.
+
 \paragraph{Current state.}
 \texttt{matMulPPar} (Level3.hs) partitions by rows only: each of $p$
 threads computes $\lfloor m/p \rfloor$ rows of $C$, reading the
@@ -5135,6 +5138,12 @@ impact on single-threaded benchmarks.
 %% ------------------------------------------------------------------
 \subsection{3.\ Cache Tile and Panel Size Auto-Tuning}
 \label{sec:future-autotune}
+
+\paragraph{Status: implementable now.}  No external blockers; deferred
+because the development machine's cache hierarchy is the only one
+benchmarked, so the current hard-coded sizes are already optimal for
+the measured results.  Would only improve performance on different
+hardware (Apple M-series, Intel Golden Cove, etc.).
 
 \paragraph{Current state.}
 GEMM tile size $\mathtt{bs} = 64$ (Kernel.hs) and tridiagonalisation
@@ -5162,6 +5171,13 @@ on the development machine.
 %% ------------------------------------------------------------------
 \subsection{4.\ AVX-512 Support via \texttt{DoubleX8\#}}
 \label{sec:future-avx512}
+
+\paragraph{Status: blocked by GHC.}  GHC~9.14 does not expose
+\texttt{DoubleX8\#} primops.  The LLVM~17 backend can generate
+AVX-512 instructions when passed \texttt{-mavx512f}, but without
+corresponding Haskell-level primops there is no way to express 8-wide
+SIMD operations in source code.  This is a hard dependency on a future
+GHC version adding 512-bit SIMD primitive types.
 
 \paragraph{Current state.}
 All SIMD kernels use GHC's \texttt{DoubleX4\#} primops (AVX2,
@@ -5194,47 +5210,76 @@ The current register pressure limit (${\sim}14$ simultaneous
 \subsection{Summary of Remaining Opportunities}
 
 \begin{center}
-\small
-\begin{tabular}{clcccc}
+\footnotesize
+\begin{tabular}{cl@{\;\;}c@{\;\;}c@{\;\;}c@{\;\;}c}
 \toprule
-\textbf{\#} & \textbf{Optimisation} & \textbf{Priority} & \textbf{Difficulty} & \textbf{Expected gain} & \textbf{Primary beneficiary} \\
+\textbf{\#} & \textbf{Optimisation} & \textbf{Status} & \textbf{Expected gain} & \textbf{Primary beneficiary} & \textbf{Blocker} \\
 \midrule
-\multicolumn{6}{l}{\textit{Medium priority --- scaling beyond benchmarked sizes}} \\
-1 & GEMM micro-panel packing       & Medium & Medium & $1.1\text{--}1.3\times$   & GEMM ($n > 1000$) \\
+\multicolumn{6}{l}{\textit{Implementable now --- deferred for low impact at benchmarked sizes}} \\
+1 & GEMM micro-panel packing      & Ready   & $1.1\text{--}1.3\times$   & GEMM ($n > 1000$)             & None \\
+2 & 2D parallel GEMM tiling       & Ready   & $1.2\text{--}1.4\times$   & Parallel GEMM ($16{+}$ thr.)  & None \\
+3 & Cache/panel auto-tuning       & Ready   & $1.05\text{--}1.20\times$ & All (other hardware)           & None \\
 \midrule
-\multicolumn{6}{l}{\textit{Lower priority --- infrastructure and scaling}} \\
-2 & 2D parallel GEMM tiling        & Low    & Medium & $1.2\text{--}1.4\times$   & Parallel GEMM ($16{+}$ threads) \\
-3 & Cache/panel auto-tuning        & Low    & Low    & $1.05\text{--}1.20\times$ & All (non-default hardware) \\
-4 & AVX-512 / \texttt{DoubleX8\#}  & Low    & Medium & $1.5\text{--}1.8\times$   & All SIMD kernels \\
+\multicolumn{6}{l}{\textit{Blocked --- awaiting external support}} \\
+4 & AVX-512 / \texttt{DoubleX8\#} & Blocked & $1.5\text{--}1.8\times$   & All SIMD kernels               & GHC primops \\
 \bottomrule
 \end{tabular}
 \end{center}
 
+Items~1--3 have no external blockers and could be implemented at any
+time; they are deferred because their benefit is negligible at the
+benchmarked sizes ($n \leq 500$, single-threaded, AMD Zen~4 cache
+hierarchy).  Item~4 is blocked by a hard GHC dependency:
+\texttt{DoubleX8\#} primops do not exist in GHC~9.14, and there is no
+source-level workaround to express 512-bit SIMD operations.
+
 Of the original nine proposed optimisations, six have been implemented
 in Round~20 (items~1--3 and~5, plus the fused DSYRK kernel and
 column-major SIMD Givens).  Multi-shift QR (item~4) was evaluated and
-deferred due to insufficient benefit relative to complexity.  Three
-empirically eliminated targets remain excluded: GEMM $k$-loop unrolling
-(GHC's LLVM~17 backend spills registers beyond ${\sim}14$ simultaneous
-\texttt{DoubleX4\#} values), raw \texttt{svdGKP} as drop-in replacement
-(now superseded by the blocked bidiagonalisation path), and D\&C
-crossover tuning below $n = 1000$ (merge-step GEMM overhead does not
-amortise at smaller sizes).
+deferred due to insufficient benefit relative to complexity.
+
+Three empirically eliminated targets remain excluded:
+\begin{itemize}
+\item \textbf{GEMM $k$-loop unrolling} --- \textit{blocked by GHC
+  register allocator.}  The LLVM~17 backend spills to the stack beyond
+  ${\sim}14$ simultaneous \texttt{DoubleX4\#} values, causing a
+  $20\text{--}30\%$ regression.  This is a GHC/LLVM code generator
+  limitation, not an algorithmic one.
+\item \textbf{Raw \texttt{svdGKP} as drop-in default} ---
+  \textit{blocked by bidiagonal QR performance.}  The bidiagonal QR
+  Givens chase is inherently scalar and strided; even with column-major
+  SIMD Givens (Round~20b), \texttt{svdGKP} remains
+  $3\text{--}4\times$ slower than \texttt{svdAtAP}.  Closing this gap
+  would require either a divide-and-conquer bidiagonal SVD (analogous
+  to LAPACK's DBDSDC) or a fundamentally different bidiagonal QR
+  iteration structure.
+\item \textbf{D\&C eigensolver crossover below $n = 1000$} ---
+  \textit{blocked by merge-step GEMM overhead.}  The D\&C merge step
+  requires a full $n \times n$ GEMM to rotate the eigenvector matrix,
+  which does not amortise against QR's tight Givens loop at
+  $n \leq 500$.  Reducing the crossover requires either (a)~a more
+  efficient merge-step eigenvector accumulation (avoiding the full GEMM),
+  or (b)~a multi-section D\&C variant that reduces the number of merge
+  levels.
+\end{itemize}
 
 The remaining SVD deficit ($1.59\times$ at $100{\times}100$) is
 primarily attributable to the $A^\top A$ eigendecomposition pathway's
 two extra GEMMs and condition-number squaring.  Further improvement
 would require either (a)~making the bidiagonal QR phase of
-\texttt{svdGKP} competitive with LAPACK's DBDSQR (currently limited by
-the scalar Givens chase), or (b)~lowering the D\&C eigensolver
-crossover below $n = 1000$ once the merge-step GEMM overhead is reduced.
+\texttt{svdGKP} competitive with LAPACK's DBDSQR (blocked by the
+scalar Givens chase, as noted above), or (b)~lowering the D\&C
+eigensolver crossover below $n = 1000$ (blocked by merge-step overhead,
+as noted above).
 
 \paragraph{Not recommended at current benchmark sizes.}
-Strassen/Winograd multiplication (breakeven at $n > 2000$; benchmarks
-cap at $n = 500$), GPU offloading (breaks the pure-Haskell premise),
-cache-oblivious algorithms (GHC recursion overhead negates the
-theoretical benefit), and mixed-precision iterative refinement
-(${\sim}10^{-12}$ tolerance already achieved by direct methods) are
+Strassen/Winograd multiplication (not blocked, but breakeven at
+$n > 2000$; benchmarks cap at $n = 500$), GPU offloading (blocked by
+design---breaks the pure-Haskell, zero-FFI premise), cache-oblivious
+algorithms (blocked by GHC---recursion overhead from thunk allocation
+and garbage collection negates the theoretical cache benefit), and
+mixed-precision iterative refinement (not blocked, but unnecessary---
+${\sim}10^{-12}$ tolerance is already achieved by direct methods) are
 not expected to yield gains at the sizes benchmarked here.
 
 %% ====================================================================
