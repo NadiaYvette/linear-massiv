@@ -937,11 +937,22 @@ rawTridiagQRLoop mbaD offD mbaSD offSD mbaQ offQ nn maxIter tol = go 0 0 (nn - 1
                       if newHi < hi
                         then go iter lo newHi hi 0  -- deflated without QR sweep
                         else do
-                          let sp1 = sdhi
-                              delta = (dhi1 - dhi) / 2
-                              sgn = if delta >= 0 then 1 else -1
-                              shift = dhi - sp1*sp1 / (delta + sgn * sqrt (delta*delta + sp1*sp1))
-                          rawImplicitQRStep mbaD offD mbaSD offSD mbaQ offQ nn shift lo hi
+                          -- Compute Wilkinson shift from bottom 2×2 block
+                          let !sp1 = sdhi
+                              !delta = (dhi1 - dhi) / 2
+                              !sgn = if delta >= 0 then 1 else -1
+                              !shift1 = dhi - sp1*sp1 / (delta + sgn * sqrt (delta*delta + sp1*sp1))
+                          rawImplicitQRStep mbaD offD mbaSD offSD mbaQ offQ nn shift1 lo hi
+                          -- Double-shift: apply second shift if active range is large enough
+                          when (hi - lo >= 4) $ do
+                            sdhi' <- readRawD mbaSD offSD (hi - 1)
+                            dhi1' <- readRawD mbaD offD (hi - 1)
+                            dhi'  <- readRawD mbaD offD hi
+                            when (abs sdhi' > tol * (abs dhi1' + abs dhi')) $ do
+                              let !delta' = (dhi1' - dhi') / 2
+                                  !sgn' = if delta' >= 0 then 1 else -1
+                                  !shift2 = dhi' - sdhi'*sdhi' / (delta' + sgn' * sqrt (delta'*delta' + sdhi'*sdhi'))
+                              rawImplicitQRStep mbaD offD mbaSD offSD mbaQ offQ nn shift2 lo hi
                           let !newStall = if hi == lastHi then stall + 1 else 0
                           go (iter + 1) lo hi hi newStall
 
@@ -1053,11 +1064,24 @@ rawTridiagQRLoopCM mbaD offD mbaSD offSD mbaQ offQ nn maxIter tol = go 0 0 (nn -
                       if newHi < hi
                         then go iter lo newHi hi 0  -- deflated without QR sweep
                         else do
-                          let sp1 = sdhi
-                              delta = (dhi1 - dhi) / 2
-                              sgn = if delta >= 0 then 1 else -1
-                              shift = dhi - sp1*sp1 / (delta + sgn * sqrt (delta*delta + sp1*sp1))
-                          rawImplicitQRStepCM mbaD offD mbaSD offSD mbaQ offQ nn shift lo hi
+                          -- Compute both eigenvalues of bottom 2×2 block
+                          let !sp1 = sdhi
+                              !delta = (dhi1 - dhi) / 2
+                              !sgn = if delta >= 0 then 1 else -1
+                              !shift1 = dhi - sp1*sp1 / (delta + sgn * sqrt (delta*delta + sp1*sp1))
+                          rawImplicitQRStepCM mbaD offD mbaSD offSD mbaQ offQ nn shift1 lo hi
+                          -- Double-shift: apply second shift if active range is large enough
+                          when (hi - lo >= 4) $ do
+                            -- Check if first shift already deflated the bottom
+                            sdhi' <- readRawD mbaSD offSD (hi - 1)
+                            dhi1' <- readRawD mbaD offD (hi - 1)
+                            dhi'  <- readRawD mbaD offD hi
+                            when (abs sdhi' > tol * (abs dhi1' + abs dhi')) $ do
+                              -- Compute the other eigenvalue of the (updated) bottom 2×2
+                              let !delta' = (dhi1' - dhi') / 2
+                                  !sgn' = if delta' >= 0 then 1 else -1
+                                  !shift2 = dhi' - sdhi'*sdhi' / (delta' + sgn' * sqrt (delta'*delta' + sdhi'*sdhi'))
+                              rawImplicitQRStepCM mbaD offD mbaSD offSD mbaQ offQ nn shift2 lo hi
                       let !newStall = if hi == lastHi then stall + 1 else 0
                       go (iter + 1) lo hi hi newStall
 

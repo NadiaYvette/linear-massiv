@@ -80,7 +80,7 @@ import Numeric.LinearAlgebra.Massiv.Internal
 import Control.Concurrent (forkOn, newEmptyMVar, putMVar, takeMVar, getNumCapabilities)
 import System.IO.Unsafe (unsafePerformIO)
 import GHC.IO (stToIO)
-import Numeric.LinearAlgebra.Massiv.Internal.Kernel (rawGemmKernel, rawGemmBISlice, rawSyrkLowerKernel)
+import Numeric.LinearAlgebra.Massiv.Internal.Kernel (rawGemmKernel, rawGemmBISlice, rawGemmBIBJSlice, rawSyrkLowerKernel)
 
 -- | Block size for cache-tiled GEMM (generic fallback path).
 gemmBlockSize :: Int
@@ -207,8 +207,9 @@ matMulP (MkMatrix arrA) (MkMatrix arrB) =
 {-# NOINLINE matMulP #-}
 
 -- | Parallel specialised GEMM for @P Double@.
--- Partitions the row range across OS threads, each calling 'rawGemmBISlice'
--- on non-overlapping row ranges.  Uses @forkIO@ + @MVar@ barrier.
+-- Uses 2D grid partitioning when numThreads >= 4 and both dimensions are large
+-- enough (min(m,n) >= 128), otherwise falls back to 1D row partitioning.
+-- 2D partitioning reduces per-thread B cache traffic by a factor of sqrt(p).
 -- Falls back to single-threaded 'matMulP' when @getNumCapabilities == 1@.
 matMulPPar :: forall m k n. (KnownNat m, KnownNat k, KnownNat n)
            => Matrix m k M.P Double -> Matrix k n M.P Double -> Matrix m n M.P Double
@@ -233,23 +234,64 @@ matMulPPar a b = unsafePerformIO $ do
       mc <- stToIO $ M.newMArray (Sz (mm :. nn)) (0 :: Double)
       let !mbaC = unwrapMutableByteArray mc
           !offC = unwrapMutableByteArrayOffset mc
-          !chunkSize = (mm + numThreads - 1) `div` numThreads
-      -- Fork threads pinned to capabilities (avoids OS migration)
-      mvars <- mapM (\t -> do
-        let !biStart = t * chunkSize
-            !biEnd = min (biStart + chunkSize) mm
-        mv <- newEmptyMVar
-        _ <- forkOn t $ do
-          stToIO $ rawGemmBISlice baA offA baB offB mbaC offC biStart biEnd mm kk nn
-          putMVar mv ()
-        pure mv
-        ) [0..numThreads-1]
-      -- Wait for all threads
-      mapM_ takeMVar mvars
+      -- Choose 1D or 2D decomposition
+      let !use2D = numThreads >= 4 && mm >= 128 && nn >= 128
+      if use2D
+        then do
+          -- 2D grid: pr rows × pc columns, pr * pc = numThreads
+          -- Choose pr, pc to balance aspect ratio: pr/pc ≈ mm/nn
+          let (pr, pc) = gridDims numThreads mm nn
+              !rChunk = (mm + pr - 1) `div` pr
+              !cChunk = (nn + pc - 1) `div` pc
+          mvars <- sequence
+            [ do let !biStart = tr * rChunk
+                     !biEnd = min (biStart + rChunk) mm
+                     !bjStart = tc * cChunk
+                     !bjEnd = min (bjStart + cChunk) nn
+                 mv <- newEmptyMVar
+                 _ <- forkOn (tr * pc + tc) $ do
+                   stToIO $ rawGemmBIBJSlice baA offA baB offB mbaC offC
+                              biStart biEnd bjStart bjEnd mm kk nn
+                   putMVar mv ()
+                 pure mv
+            | tr <- [0..pr-1], tc <- [0..pc-1]
+            ]
+          mapM_ takeMVar mvars
+        else do
+          -- 1D row partitioning (original path)
+          let !chunkSize = (mm + numThreads - 1) `div` numThreads
+          mvars <- mapM (\t -> do
+            let !biStart = t * chunkSize
+                !biEnd = min (biStart + chunkSize) mm
+            mv <- newEmptyMVar
+            _ <- forkOn t $ do
+              stToIO $ rawGemmBISlice baA offA baB offB mbaC offC biStart biEnd mm kk nn
+              putMVar mv ()
+            pure mv
+            ) [0..numThreads-1]
+          mapM_ takeMVar mvars
       -- Freeze and wrap
       arr <- stToIO $ M.freezeS mc
       pure (MkMatrix arr)
 {-# NOINLINE matMulPPar #-}
+
+-- | Compute 2D grid dimensions (pr × pc) for p threads such that
+-- pr * pc = p and the aspect ratio pr/pc approximates m/n.
+gridDims :: Int -> Int -> Int -> (Int, Int)
+gridDims p m n =
+  let sqrtP = floor (sqrt (fromIntegral p :: Double)) :: Int
+      -- Try all factorizations of p and pick the one with best aspect match
+      factors = [(i, p `div` i) | i <- [1..sqrtP], p `mod` i == 0]
+      targetRatio = fromIntegral m / fromIntegral (max 1 n) :: Double
+      score (pr, pc) = abs (fromIntegral pr / fromIntegral (max 1 pc) - targetRatio)
+      best = minimumBy (\a' b' -> compare (score a') (score b')) factors
+      -- Also consider the transpose (pc, pr)
+      bestT = let (pr, pc) = best in if score (pc, pr) < score best then (pc, pr) else best
+  in bestT
+  where
+    minimumBy _ [x] = x
+    minimumBy f (x:xs) = foldl' (\a' b' -> if f a' b' == GT then b' else a') x xs
+    minimumBy _ [] = (1, p)  -- fallback
 
 {-# RULES
 "matMul/P/Double" forall (a :: Matrix m k M.P Double)

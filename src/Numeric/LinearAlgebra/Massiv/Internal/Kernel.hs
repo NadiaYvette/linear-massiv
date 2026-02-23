@@ -16,6 +16,8 @@ module Numeric.LinearAlgebra.Massiv.Internal.Kernel
     -- * BLAS-3: matrix multiply (GEMM)
   , rawGemmKernel
   , rawGemmBISlice
+  , rawGemmBIBJSlice
+  , rawGemmBISlicePackedBK
     -- * BLAS-3: symmetric rank-k update (SYRK)
   , rawSyrkLowerKernel
     -- * QR helpers (immutable)
@@ -139,24 +141,45 @@ rawGemv (ByteArray ba_a) (I# off_a) (I# ncols)
 -- | @rawGemmKernel ba_a off_a ba_b off_b mba_c off_c m k n@ computes
 -- C += A * B where A is m×k, B is k×n, C is m×n (all row-major).
 -- C must be pre-initialised (e.g. to zero, or to β*C for gemm).
+-- Uses packed-B variant (BK-outer with panel packing) for large matrices
+-- where cache/TLB effects dominate, unpacked variant for smaller matrices.
 rawGemmKernel :: ByteArray -> Int -> ByteArray -> Int
               -> MutableByteArray s -> Int
               -> Int -> Int -> Int -> ST s ()
-rawGemmKernel ba offA bb offB mc offC m k n =
-  rawGemmBISlice ba offA bb offB mc offC 0 m m k n
+rawGemmKernel ba offA bb offB mc offC m k n
+  | min m (min k n) >= gemmPackCrossover =
+      rawGemmBISlicePackedBK ba offA bb offB mc offC 0 m m k n
+  | otherwise =
+      rawGemmBISlice ba offA bb offB mc offC 0 m m k n
 {-# INLINE rawGemmKernel #-}
 
--- | @rawGemmBISlice ba_a off_a ba_b off_b mba_c off_c biStart biEnd m k n@
--- computes C[biStart..biEnd-1, :] += A[biStart..biEnd-1, :] * B
--- where A is m×k, B is k×n, C is m×n (all row-major).
--- Only the rows [biStart, biEnd) of C are written; all of B is read.
--- This enables parallel GEMM by partitioning the row range across threads.
+-- | Crossover threshold for GEMM packing.  Below this, the unpacked
+-- BI-outer kernel is used; above it, the packed-B BK-outer kernel.
+gemmPackCrossover :: Int
+gemmPackCrossover = 256
+{-# INLINE gemmPackCrossover #-}
+
+-- | @rawGemmBISlice@ computes C[biStart..biEnd-1, :] += A[biStart..biEnd-1, :] * B.
+-- Delegates to 'rawGemmBIBJSlice' with full column range.
 rawGemmBISlice :: ByteArray -> Int -> ByteArray -> Int
                -> MutableByteArray s -> Int
                -> Int -> Int -> Int -> Int -> Int -> ST s ()
-rawGemmBISlice (ByteArray ba_a) (I# off_a) (ByteArray ba_b) (I# off_b)
-               (MutableByteArray mba_c) (I# off_c)
-               (I# biStart) (I# biEnd) (I# _m) (I# k) (I# n) = ST $ \s0 ->
+rawGemmBISlice ba offA bb offB mc offC biStart biEnd m k n =
+  rawGemmBIBJSlice ba offA bb offB mc offC biStart biEnd 0 n m k n
+{-# INLINE rawGemmBISlice #-}
+
+-- | @rawGemmBIBJSlice ba_a off_a ba_b off_b mba_c off_c biStart biEnd bjStart bjEnd m k n@
+-- computes C[biStart..biEnd-1, bjStart..bjEnd-1] += A[biStart..biEnd-1, :] * B[:, bjStart..bjEnd-1]
+-- where A is m×k, B is k×n, C is m×n (all row-major).
+-- Only the rows [biStart, biEnd) and columns [bjStart, bjEnd) of C are written.
+-- This enables 2D parallel GEMM by partitioning both row and column ranges.
+rawGemmBIBJSlice :: ByteArray -> Int -> ByteArray -> Int
+                 -> MutableByteArray s -> Int
+                 -> Int -> Int -> Int -> Int -> Int -> Int -> Int -> ST s ()
+rawGemmBIBJSlice (ByteArray ba_a) (I# off_a) (ByteArray ba_b) (I# off_b)
+                 (MutableByteArray mba_c) (I# off_c)
+                 (I# biStart) (I# biEnd) (I# bjStart) (I# bjEnd)
+                 (I# _m) (I# k) (I# n) = ST $ \s0 ->
   let bs = 64#
 
       goBI bi s
@@ -169,12 +192,12 @@ rawGemmBISlice (ByteArray ba_a) (I# off_a) (ByteArray ba_b) (I# off_b)
         | isTrue# (bk >=# k) = s
         | otherwise =
             let kEnd = minI (bk +# bs) k
-            in goBK bi iEnd (bk +# bs) (goBJ bi iEnd bk kEnd 0# s)
+            in goBK bi iEnd (bk +# bs) (goBJ bi iEnd bk kEnd bjStart s)
 
       goBJ bi iEnd bk kEnd bj s
-        | isTrue# (bj >=# n) = s
+        | isTrue# (bj >=# bjEnd) = s
         | otherwise =
-            let jEnd = minI (bj +# bs) n
+            let jEnd = minI (bj +# bs) bjEnd
             in goBJ bi iEnd bk kEnd (bj +# bs) (innerBlock bi iEnd bk kEnd bj jEnd s)
 
       -- Register-blocked micro-kernel: process 4 rows × 8 columns of C
@@ -381,7 +404,407 @@ rawGemmBISlice (ByteArray ba_a) (I# off_a) (ByteArray ba_b) (I# off_b)
                    s'' -> goJScalar1 i bk kEnd (j +# 1#) jEnd_ s''
 
   in (# goBI biStart s0, () #)
-{-# INLINE rawGemmBISlice #-}
+{-# INLINE rawGemmBIBJSlice #-}
+
+-- | Packed-B GEMM with BK-outer loop ordering.
+-- Packs B into 8-column panels for sequential cache access (stride 8 instead
+-- of stride n).  Only the rows [biStart, biEnd) of C are written.
+-- Beneficial for large matrices where stride-n B access causes cache/TLB misses.
+rawGemmBISlicePackedBK :: ByteArray -> Int -> ByteArray -> Int
+                       -> MutableByteArray s -> Int
+                       -> Int -> Int -> Int -> Int -> Int -> ST s ()
+rawGemmBISlicePackedBK (ByteArray ba_a) (I# off_a) (ByteArray ba_b) (I# off_b)
+                       (MutableByteArray mba_c) (I# off_c)
+                       (I# biStart) (I# biEnd) (I# _m) (I# k) (I# n) = ST $ \s0 ->
+  let bs = 64#
+      !nPanels = n `quotInt#` 8#
+      !j8End = nPanels *# 8#
+      !j4End = n -# (n `remInt#` 4#)
+      -- Packed buffer: nPanels * bs * 8 doubles (each panel: kc × 8)
+      !packDoubles = nPanels *# bs *# 8#
+
+      -- Fallback unpacked path (when j8End == 0, i.e. n < 8)
+      goBI_unpacked bi s
+        | isTrue# (bi >=# biEnd) = s
+        | otherwise =
+            let iEnd = minI (bi +# bs) biEnd
+            in goBI_unpacked (bi +# bs) (goBK_u bi iEnd 0# s)
+
+      goBK_u bi iEnd bk s
+        | isTrue# (bk >=# k) = s
+        | otherwise =
+            let kEnd = minI (bk +# bs) k
+                iSpan = iEnd -# bi
+                i4End_ = bi +# (iSpan -# (iSpan `remInt#` 4#))
+            in goBK_u bi iEnd (bk +# bs)
+                 (goI4U_fb bi i4End_ iEnd bk kEnd
+                   (goI1U_fb i4End_ iEnd bk kEnd s))
+
+      goI4U_fb i i4End _iEnd bk kEnd s
+        | isTrue# (i >=# i4End) = s
+        | otherwise =
+            goI4U_fb (i +# 4#) i4End _iEnd bk kEnd
+              (goJ4Ufb4 i bk kEnd 0# j4End
+                (goJSUfb4 i bk kEnd j4End n s))
+
+      goI1U_fb i iEnd bk kEnd s
+        | isTrue# (i >=# iEnd) = s
+        | otherwise =
+            goI1U_fb (i +# 1#) iEnd bk kEnd
+              (goJ4Ufb1 i bk kEnd 0# j4End
+                (goJSUfb1 i bk kEnd j4End n s))
+
+      -- Unpacked 4×4 and scalar for fallback
+      goJ4Ufb4 i bk kEnd j j4EndV s
+        | isTrue# (j >=# j4EndV) = s
+        | otherwise =
+          let !cOff0 = off_c +# i *# n +# j
+              !cOff1 = off_c +# (i +# 1#) *# n +# j
+              !cOff2 = off_c +# (i +# 2#) *# n +# j
+              !cOff3 = off_c +# (i +# 3#) *# n +# j
+          in case readDoubleArrayAsDoubleX4# mba_c cOff0 s of { (# s0, c0 #) ->
+             case readDoubleArrayAsDoubleX4# mba_c cOff1 s0 of { (# s1, c1 #) ->
+             case readDoubleArrayAsDoubleX4# mba_c cOff2 s1 of { (# s2, c2 #) ->
+             case readDoubleArrayAsDoubleX4# mba_c cOff3 s2 of { (# s3, c3 #) ->
+             case goKUfb4x4 i j bk kEnd c0 c1 c2 c3 of
+               (# r0, r1, r2, r3 #) ->
+                 case writeDoubleArrayAsDoubleX4# mba_c cOff0 r0 s3 of { sw0 ->
+                 case writeDoubleArrayAsDoubleX4# mba_c cOff1 r1 sw0 of { sw1 ->
+                 case writeDoubleArrayAsDoubleX4# mba_c cOff2 r2 sw1 of { sw2 ->
+                 case writeDoubleArrayAsDoubleX4# mba_c cOff3 r3 sw2 of { sw3 ->
+                 goJ4Ufb4 i bk kEnd (j +# 4#) j4EndV sw3
+                 }}}}
+             }}}}
+
+      goKUfb4x4 i j kk kEnd c0 c1 c2 c3
+        | isTrue# (kk >=# kEnd) = (# c0, c1, c2, c3 #)
+        | otherwise =
+            let !bv = indexDoubleArrayAsDoubleX4# ba_b (off_b +# kk *# n +# j)
+                !a0 = broadcastDoubleX4# (indexDoubleArray# ba_a (off_a +# i *# k +# kk))
+                !a1 = broadcastDoubleX4# (indexDoubleArray# ba_a (off_a +# (i +# 1#) *# k +# kk))
+                !a2 = broadcastDoubleX4# (indexDoubleArray# ba_a (off_a +# (i +# 2#) *# k +# kk))
+                !a3 = broadcastDoubleX4# (indexDoubleArray# ba_a (off_a +# (i +# 3#) *# k +# kk))
+            in goKUfb4x4 i j (kk +# 1#) kEnd
+                 (fmaddDoubleX4# a0 bv c0) (fmaddDoubleX4# a1 bv c1)
+                 (fmaddDoubleX4# a2 bv c2) (fmaddDoubleX4# a3 bv c3)
+
+      goJSUfb4 i bk kEnd j jEndV s
+        | isTrue# (j >=# jEndV) = s
+        | otherwise =
+          let goKSfb4 kk acc0 acc1 acc2 acc3
+                | isTrue# (kk >=# kEnd) = (# acc0, acc1, acc2, acc3 #)
+                | otherwise =
+                    let !bkj = indexDoubleArray# ba_b (off_b +# kk *# n +# j)
+                        !a0_ = indexDoubleArray# ba_a (off_a +# i *# k +# kk)
+                        !a1_ = indexDoubleArray# ba_a (off_a +# (i +# 1#) *# k +# kk)
+                        !a2_ = indexDoubleArray# ba_a (off_a +# (i +# 2#) *# k +# kk)
+                        !a3_ = indexDoubleArray# ba_a (off_a +# (i +# 3#) *# k +# kk)
+                    in goKSfb4 (kk +# 1#)
+                         (acc0 +## a0_ *## bkj) (acc1 +## a1_ *## bkj)
+                         (acc2 +## a2_ *## bkj) (acc3 +## a3_ *## bkj)
+              !cOff0 = off_c +# i *# n +# j
+              !cOff1 = off_c +# (i +# 1#) *# n +# j
+              !cOff2 = off_c +# (i +# 2#) *# n +# j
+              !cOff3 = off_c +# (i +# 3#) *# n +# j
+          in case (# goKSfb4 bk 0.0## 0.0## 0.0## 0.0## #) of
+               (# (# d0, d1, d2, d3 #) #) ->
+                 case readDoubleArray# mba_c cOff0 s of { (# s0, v0 #) ->
+                 case writeDoubleArray# mba_c cOff0 (v0 +## d0) s0 of { s1 ->
+                 case readDoubleArray# mba_c cOff1 s1 of { (# s2, v1 #) ->
+                 case writeDoubleArray# mba_c cOff1 (v1 +## d1) s2 of { s3 ->
+                 case readDoubleArray# mba_c cOff2 s3 of { (# s4, v2 #) ->
+                 case writeDoubleArray# mba_c cOff2 (v2 +## d2) s4 of { s5 ->
+                 case readDoubleArray# mba_c cOff3 s5 of { (# s6, v3 #) ->
+                 case writeDoubleArray# mba_c cOff3 (v3 +## d3) s6 of { s7 ->
+                 goJSUfb4 i bk kEnd (j +# 1#) jEndV s7
+                 }}}}}}}}
+
+      goJ4Ufb1 i bk kEnd j j4EndV s
+        | isTrue# (j >=# j4EndV) = s
+        | otherwise =
+          let !cOff = off_c +# i *# n +# j
+          in case readDoubleArrayAsDoubleX4# mba_c cOff s of { (# s0, c0 #) ->
+             case goKUfb1x4 i j bk kEnd c0 of { r0 ->
+             case writeDoubleArrayAsDoubleX4# mba_c cOff r0 s0 of { s1 ->
+             goJ4Ufb1 i bk kEnd (j +# 4#) j4EndV s1
+             }}}
+
+      goKUfb1x4 i j kk kEnd c0
+        | isTrue# (kk >=# kEnd) = c0
+        | otherwise =
+            let !bv = indexDoubleArrayAsDoubleX4# ba_b (off_b +# kk *# n +# j)
+                !av = broadcastDoubleX4# (indexDoubleArray# ba_a (off_a +# i *# k +# kk))
+            in goKUfb1x4 i j (kk +# 1#) kEnd (fmaddDoubleX4# av bv c0)
+
+      goJSUfb1 i bk kEnd j jEndV s
+        | isTrue# (j >=# jEndV) = s
+        | otherwise =
+          let goKSfb1 kk acc
+                | isTrue# (kk >=# kEnd) = acc
+                | otherwise =
+                    let !bkj = indexDoubleArray# ba_b (off_b +# kk *# n +# j)
+                        !aik = indexDoubleArray# ba_a (off_a +# i *# k +# kk)
+                    in goKSfb1 (kk +# 1#) (acc +## aik *## bkj)
+          in case readDoubleArray# mba_c (off_c +# i *# n +# j) s of
+               (# s', cij #) ->
+                 case writeDoubleArray# mba_c (off_c +# i *# n +# j) (cij +## goKSfb1 bk 0.0##) s' of
+                   s'' -> goJSUfb1 i bk kEnd (j +# 1#) jEndV s''
+
+  in if isTrue# (j8End ==# 0#)
+     -- No full 8-column panels: fall back to unpacked scalar path
+     then (# goBI_unpacked biStart s0, () #)
+     else
+
+     -- BK outer loop: allocate pack buffer, pack B, freeze, then run BI/BJ loops
+     -- with pure k-loop reads (indexDoubleArrayAsDoubleX4# on immutable ByteArray#).
+     let goBKO bk s
+           | isTrue# (bk >=# k) = s
+           | otherwise =
+               let !kEnd = minI (bk +# bs) k
+                   !kc = kEnd -# bk
+                   !packBufBytes = nPanels *# kc *# 8# *# 8#
+               in case newByteArray# packBufBytes s of { (# s1, mba_bp #) ->
+                  -- Pack B[bk:bk+kc, 0:j8End] into panel-major layout
+                  let s2 = packB mba_bp bk kc s1
+                  in case unsafeFreezeByteArray# mba_bp s2 of { (# s3, ba_bp #) ->
+                     goBKO (bk +# bs) (goBIO bk kEnd kc ba_bp biStart s3)
+                  }}
+
+         -- Pack B into mba_bp: panel p (cols 8p..8p+7):
+         --   bp[p * kc * 8 + kLocal * 8 + jLocal] = B[bk+kLocal, 8p+jLocal]
+         packB mba_bp bk kc sp =
+           let goPnl p sp0
+                 | isTrue# (p >=# nPanels) = sp0
+                 | otherwise =
+                     let !jBase = p *# 8#
+                         !pOff = p *# kc *# 8#
+                         goKP kl sk
+                           | isTrue# (kl >=# kc) = sk
+                           | otherwise =
+                               let !srcOff = off_b +# (bk +# kl) *# n +# jBase
+                                   !dstOff = pOff +# kl *# 8#
+                                   !v0 = indexDoubleArrayAsDoubleX4# ba_b srcOff
+                                   !v1 = indexDoubleArrayAsDoubleX4# ba_b (srcOff +# 4#)
+                               in case writeDoubleArrayAsDoubleX4# mba_bp dstOff v0 sk of
+                                    sk' -> case writeDoubleArrayAsDoubleX4# mba_bp (dstOff +# 4#) v1 sk' of
+                                             sk'' -> goKP (kl +# 1#) sk''
+                     in goPnl (p +# 1#) (goKP 0# sp0)
+           in goPnl 0# sp
+
+         -- BI middle loop (ba_bp is frozen ByteArray# for this BK tile)
+         goBIO bk kEnd kc ba_bp bi s
+           | isTrue# (bi >=# biEnd) = s
+           | otherwise =
+               let !iEnd = minI (bi +# bs) biEnd
+                   !iSpan = iEnd -# bi
+                   !i4End_ = bi +# (iSpan -# (iSpan `remInt#` 4#))
+               in goBIO bk kEnd kc ba_bp (bi +# bs)
+                    (goI4P bi i4End_ iEnd bk kEnd kc ba_bp
+                      (goI1P i4End_ iEnd bk kEnd kc ba_bp s))
+
+         -- 4 rows: packed panels then unpacked tail
+         goI4P i i4End _iEnd bk kEnd kc ba_bp s
+           | isTrue# (i >=# i4End) = s
+           | otherwise =
+               goI4P (i +# 4#) i4End _iEnd bk kEnd kc ba_bp
+                 (goJ8P4 i bk kc ba_bp 0# j8End
+                   (goJ4U4 i bk kEnd j8End j4End
+                     (goJSU4 i bk kEnd j4End n s)))
+
+         -- 1 row: packed panels then unpacked tail
+         goI1P i iEnd bk kEnd kc ba_bp s
+           | isTrue# (i >=# iEnd) = s
+           | otherwise =
+               goI1P (i +# 1#) iEnd bk kEnd kc ba_bp
+                 (goJ8P1 i bk kc ba_bp 0# j8End
+                   (goJ4U1 i bk kEnd j8End j4End
+                     (goJSU1 i bk kEnd j4End n s)))
+
+         -- ----------------------------------------------------------------
+         -- Packed 4×8 j-loop: step by 8, pure reads from frozen ByteArray#
+         -- ----------------------------------------------------------------
+         goJ8P4 i bk kc ba_bp j jEnd s
+           | isTrue# (j >=# jEnd) = s
+           | otherwise =
+             let !cOff0 = off_c +# i *# n +# j
+                 !cOff1 = off_c +# (i +# 1#) *# n +# j
+                 !cOff2 = off_c +# (i +# 2#) *# n +# j
+                 !cOff3 = off_c +# (i +# 3#) *# n +# j
+                 !panOff = (j `quotInt#` 8#) *# kc *# 8#
+             in case readDoubleArrayAsDoubleX4# mba_c cOff0 s of { (# s0a, c00 #) ->
+                case readDoubleArrayAsDoubleX4# mba_c (cOff0 +# 4#) s0a of { (# s0b, c01 #) ->
+                case readDoubleArrayAsDoubleX4# mba_c cOff1 s0b of { (# s1a, c10 #) ->
+                case readDoubleArrayAsDoubleX4# mba_c (cOff1 +# 4#) s1a of { (# s1b, c11 #) ->
+                case readDoubleArrayAsDoubleX4# mba_c cOff2 s1b of { (# s2a, c20 #) ->
+                case readDoubleArrayAsDoubleX4# mba_c (cOff2 +# 4#) s2a of { (# s2b, c21 #) ->
+                case readDoubleArrayAsDoubleX4# mba_c cOff3 s2b of { (# s3a, c30 #) ->
+                case readDoubleArrayAsDoubleX4# mba_c (cOff3 +# 4#) s3a of { (# s3b, c31 #) ->
+                case goKP4x8 i panOff bk 0# kc ba_bp c00 c01 c10 c11 c20 c21 c30 c31 of
+                  (# r00, r01, r10, r11, r20, r21, r30, r31 #) ->
+                    case writeDoubleArrayAsDoubleX4# mba_c cOff0 r00 s3b of { sw0 ->
+                    case writeDoubleArrayAsDoubleX4# mba_c (cOff0 +# 4#) r01 sw0 of { sw1 ->
+                    case writeDoubleArrayAsDoubleX4# mba_c cOff1 r10 sw1 of { sw2 ->
+                    case writeDoubleArrayAsDoubleX4# mba_c (cOff1 +# 4#) r11 sw2 of { sw3 ->
+                    case writeDoubleArrayAsDoubleX4# mba_c cOff2 r20 sw3 of { sw4 ->
+                    case writeDoubleArrayAsDoubleX4# mba_c (cOff2 +# 4#) r21 sw4 of { sw5 ->
+                    case writeDoubleArrayAsDoubleX4# mba_c cOff3 r30 sw5 of { sw6 ->
+                    case writeDoubleArrayAsDoubleX4# mba_c (cOff3 +# 4#) r31 sw6 of { sw7 ->
+                    goJ8P4 i bk kc ba_bp (j +# 8#) jEnd sw7
+                    }}}}}}}}
+                }}}}}}}}
+
+         -- Pure k-loop for packed 4×8: reads from frozen ByteArray# (no State#)
+         goKP4x8 i panOff bk kl kc ba_bp c00 c01 c10 c11 c20 c21 c30 c31
+           | isTrue# (kl >=# kc) =
+               (# c00, c01, c10, c11, c20, c21, c30, c31 #)
+           | otherwise =
+               let !bOff = panOff +# kl *# 8#
+                   !bv0 = indexDoubleArrayAsDoubleX4# ba_bp bOff
+                   !bv1 = indexDoubleArrayAsDoubleX4# ba_bp (bOff +# 4#)
+                   !kk = bk +# kl
+                   !a0 = broadcastDoubleX4# (indexDoubleArray# ba_a (off_a +# i *# k +# kk))
+                   !a1 = broadcastDoubleX4# (indexDoubleArray# ba_a (off_a +# (i +# 1#) *# k +# kk))
+                   !a2 = broadcastDoubleX4# (indexDoubleArray# ba_a (off_a +# (i +# 2#) *# k +# kk))
+                   !a3 = broadcastDoubleX4# (indexDoubleArray# ba_a (off_a +# (i +# 3#) *# k +# kk))
+               in goKP4x8 i panOff bk (kl +# 1#) kc ba_bp
+                    (fmaddDoubleX4# a0 bv0 c00) (fmaddDoubleX4# a0 bv1 c01)
+                    (fmaddDoubleX4# a1 bv0 c10) (fmaddDoubleX4# a1 bv1 c11)
+                    (fmaddDoubleX4# a2 bv0 c20) (fmaddDoubleX4# a2 bv1 c21)
+                    (fmaddDoubleX4# a3 bv0 c30) (fmaddDoubleX4# a3 bv1 c31)
+
+         -- ----------------------------------------------------------------
+         -- Packed 1×8 j-loop
+         -- ----------------------------------------------------------------
+         goJ8P1 i bk kc ba_bp j jEnd s
+           | isTrue# (j >=# jEnd) = s
+           | otherwise =
+             let !cOff = off_c +# i *# n +# j
+                 !panOff = (j `quotInt#` 8#) *# kc *# 8#
+             in case readDoubleArrayAsDoubleX4# mba_c cOff s of { (# s0, c0 #) ->
+                case readDoubleArrayAsDoubleX4# mba_c (cOff +# 4#) s0 of { (# s1, c1 #) ->
+                case goKP1x8 i panOff bk 0# kc ba_bp c0 c1 of
+                  (# r0, r1 #) ->
+                    case writeDoubleArrayAsDoubleX4# mba_c cOff r0 s1 of { sw0 ->
+                    case writeDoubleArrayAsDoubleX4# mba_c (cOff +# 4#) r1 sw0 of { sw1 ->
+                    goJ8P1 i bk kc ba_bp (j +# 8#) jEnd sw1
+                    }}
+                }}
+
+         -- Pure k-loop for packed 1×8
+         goKP1x8 i panOff bk kl kc ba_bp c0 c1
+           | isTrue# (kl >=# kc) = (# c0, c1 #)
+           | otherwise =
+               let !bOff = panOff +# kl *# 8#
+                   !bv0 = indexDoubleArrayAsDoubleX4# ba_bp bOff
+                   !bv1 = indexDoubleArrayAsDoubleX4# ba_bp (bOff +# 4#)
+                   !kk = bk +# kl
+                   !av = broadcastDoubleX4# (indexDoubleArray# ba_a (off_a +# i *# k +# kk))
+               in goKP1x8 i panOff bk (kl +# 1#) kc ba_bp
+                    (fmaddDoubleX4# av bv0 c0) (fmaddDoubleX4# av bv1 c1)
+
+         -- ----------------------------------------------------------------
+         -- Unpacked j-tail: 4×4 cleanup (columns j8End..j4End)
+         -- ----------------------------------------------------------------
+         goJ4U4 i bk kEnd j j4EndV s
+           | isTrue# (j >=# j4EndV) = s
+           | otherwise =
+             let !cOff0 = off_c +# i *# n +# j
+                 !cOff1 = off_c +# (i +# 1#) *# n +# j
+                 !cOff2 = off_c +# (i +# 2#) *# n +# j
+                 !cOff3 = off_c +# (i +# 3#) *# n +# j
+             in case readDoubleArrayAsDoubleX4# mba_c cOff0 s of { (# s0, c0 #) ->
+                case readDoubleArrayAsDoubleX4# mba_c cOff1 s0 of { (# s1, c1 #) ->
+                case readDoubleArrayAsDoubleX4# mba_c cOff2 s1 of { (# s2, c2 #) ->
+                case readDoubleArrayAsDoubleX4# mba_c cOff3 s2 of { (# s3, c3 #) ->
+                case goKU4x4 i j bk kEnd c0 c1 c2 c3 of
+                  (# r0, r1, r2, r3 #) ->
+                    case writeDoubleArrayAsDoubleX4# mba_c cOff0 r0 s3 of { sw0 ->
+                    case writeDoubleArrayAsDoubleX4# mba_c cOff1 r1 sw0 of { sw1 ->
+                    case writeDoubleArrayAsDoubleX4# mba_c cOff2 r2 sw1 of { sw2 ->
+                    case writeDoubleArrayAsDoubleX4# mba_c cOff3 r3 sw2 of { sw3 ->
+                    goJ4U4 i bk kEnd (j +# 4#) j4EndV sw3
+                    }}}}
+                }}}}
+
+         goKU4x4 i j kk kEnd c0 c1 c2 c3
+           | isTrue# (kk >=# kEnd) = (# c0, c1, c2, c3 #)
+           | otherwise =
+               let !bv = indexDoubleArrayAsDoubleX4# ba_b (off_b +# kk *# n +# j)
+                   !a0 = broadcastDoubleX4# (indexDoubleArray# ba_a (off_a +# i *# k +# kk))
+                   !a1 = broadcastDoubleX4# (indexDoubleArray# ba_a (off_a +# (i +# 1#) *# k +# kk))
+                   !a2 = broadcastDoubleX4# (indexDoubleArray# ba_a (off_a +# (i +# 2#) *# k +# kk))
+                   !a3 = broadcastDoubleX4# (indexDoubleArray# ba_a (off_a +# (i +# 3#) *# k +# kk))
+               in goKU4x4 i j (kk +# 1#) kEnd
+                    (fmaddDoubleX4# a0 bv c0) (fmaddDoubleX4# a1 bv c1)
+                    (fmaddDoubleX4# a2 bv c2) (fmaddDoubleX4# a3 bv c3)
+
+         -- Unpacked scalar cleanup for 4 rows (columns j4End..n)
+         goJSU4 i bk kEnd j jEndV s
+           | isTrue# (j >=# jEndV) = s
+           | otherwise =
+             let goKS4 kk acc0 acc1 acc2 acc3
+                   | isTrue# (kk >=# kEnd) = (# acc0, acc1, acc2, acc3 #)
+                   | otherwise =
+                       let !bkj = indexDoubleArray# ba_b (off_b +# kk *# n +# j)
+                           !a0_ = indexDoubleArray# ba_a (off_a +# i *# k +# kk)
+                           !a1_ = indexDoubleArray# ba_a (off_a +# (i +# 1#) *# k +# kk)
+                           !a2_ = indexDoubleArray# ba_a (off_a +# (i +# 2#) *# k +# kk)
+                           !a3_ = indexDoubleArray# ba_a (off_a +# (i +# 3#) *# k +# kk)
+                       in goKS4 (kk +# 1#)
+                            (acc0 +## a0_ *## bkj) (acc1 +## a1_ *## bkj)
+                            (acc2 +## a2_ *## bkj) (acc3 +## a3_ *## bkj)
+                 !cOff0 = off_c +# i *# n +# j
+                 !cOff1 = off_c +# (i +# 1#) *# n +# j
+                 !cOff2 = off_c +# (i +# 2#) *# n +# j
+                 !cOff3 = off_c +# (i +# 3#) *# n +# j
+             in case (# goKS4 bk 0.0## 0.0## 0.0## 0.0## #) of
+                  (# (# d0, d1, d2, d3 #) #) ->
+                    case readDoubleArray# mba_c cOff0 s of { (# s0, v0 #) ->
+                    case writeDoubleArray# mba_c cOff0 (v0 +## d0) s0 of { s1 ->
+                    case readDoubleArray# mba_c cOff1 s1 of { (# s2, v1 #) ->
+                    case writeDoubleArray# mba_c cOff1 (v1 +## d1) s2 of { s3 ->
+                    case readDoubleArray# mba_c cOff2 s3 of { (# s4, v2 #) ->
+                    case writeDoubleArray# mba_c cOff2 (v2 +## d2) s4 of { s5 ->
+                    case readDoubleArray# mba_c cOff3 s5 of { (# s6, v3 #) ->
+                    case writeDoubleArray# mba_c cOff3 (v3 +## d3) s6 of { s7 ->
+                    goJSU4 i bk kEnd (j +# 1#) jEndV s7
+                    }}}}}}}}
+
+         -- Unpacked 1×4 cleanup
+         goJ4U1 i bk kEnd j j4EndV s
+           | isTrue# (j >=# j4EndV) = s
+           | otherwise =
+             let !cOff = off_c +# i *# n +# j
+             in case readDoubleArrayAsDoubleX4# mba_c cOff s of { (# s0, c0 #) ->
+                case goKU1x4 i j bk kEnd c0 of { r0 ->
+                case writeDoubleArrayAsDoubleX4# mba_c cOff r0 s0 of { s1 ->
+                goJ4U1 i bk kEnd (j +# 4#) j4EndV s1
+                }}}
+
+         goKU1x4 i j kk kEnd c0
+           | isTrue# (kk >=# kEnd) = c0
+           | otherwise =
+               let !bv = indexDoubleArrayAsDoubleX4# ba_b (off_b +# kk *# n +# j)
+                   !av = broadcastDoubleX4# (indexDoubleArray# ba_a (off_a +# i *# k +# kk))
+               in goKU1x4 i j (kk +# 1#) kEnd (fmaddDoubleX4# av bv c0)
+
+         -- Unpacked scalar cleanup for 1 row
+         goJSU1 i bk kEnd j jEndV s
+           | isTrue# (j >=# jEndV) = s
+           | otherwise =
+             let goKS1 kk acc
+                   | isTrue# (kk >=# kEnd) = acc
+                   | otherwise =
+                       let !bkj = indexDoubleArray# ba_b (off_b +# kk *# n +# j)
+                           !aik = indexDoubleArray# ba_a (off_a +# i *# k +# kk)
+                       in goKS1 (kk +# 1#) (acc +## aik *## bkj)
+             in case readDoubleArray# mba_c (off_c +# i *# n +# j) s of
+                  (# s', cij #) ->
+                    case writeDoubleArray# mba_c (off_c +# i *# n +# j) (cij +## goKS1 bk 0.0##) s' of
+                      s'' -> goJSU1 i bk kEnd (j +# 1#) jEndV s''
+
+     in (# goBKO 0# s0, () #)
+{-# INLINE rawGemmBISlicePackedBK #-}
 
 -- | @rawSyrkLowerKernel ba_a off_a mba_c off_c m n@
 -- computes C = A^T * A where A is m×n (row-major).

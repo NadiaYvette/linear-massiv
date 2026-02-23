@@ -4627,15 +4627,16 @@ deficit is SVD at $n \leq 100$, where the algorithmic overhead of the
 $A^\top A$ approach dominates.
 
 %% ====================================================================
-\section{Round~20: Fused DSYRK, Blocked SVD, D\&C Stabilisation, and Panel Solvers}
+\section{Round~20: Fused DSYRK, Blocked SVD, D\&C Stabilisation, Panel Solvers, and GEMM Packing}
 \label{sec:round20}
 
-Round~20 implements six of the nine optimisations from the
-Chapter~\ref{sec:future-optimisations} roadmap in five sub-rounds
-(20a--20e), targeting SVD, eigenSH, LU, and Cholesky performance at
-all sizes.  Three infrastructure optimisations (GEMM packing, 2D
-parallel tiling, cache auto-tuning) are deferred as they provide
-negligible benefit at $n \leq 500$.
+Round~20 implements seven of the nine optimisations from the
+Chapter~\ref{sec:future-optimisations} roadmap in eight sub-rounds
+(20a--20h), targeting SVD, eigenSH, LU, Cholesky, and GEMM performance
+at all sizes.  Cache auto-tuning (Opt~8) is deferred as the development
+machine's cache hierarchy is already the optimisation target; AVX-512
+(Opt~9) is deferred pending practical validation
+(Section~\ref{sec:future-avx512}).
 
 \subsection{Implemented Optimisations}
 
@@ -4714,22 +4715,77 @@ processes within-panel dependencies starting from the panel's first
 column.  Before each panel, a GEMM applies contributions from all
 previous panels: $G \mathrel{-}= L_{\text{prev}} L_{\text{panel}}^\top$.
 
+\subsubsection{Sub-round 20f: Double-Shift QR (Opt~4)}
+
+The symmetric tridiagonal QR iteration
+(\texttt{rawTridiagQRLoop}/\texttt{rawTridiagQRLoopCM}, Symmetric.hs)
+now supports an implicit double-shift bulge chase.  When the active
+window $h - l \geq 4$, two consecutive Wilkinson shifts are computed
+from the bottom $2{\times}2$ of the active block and applied in
+succession.  The first sweep uses the original shift; if the bottom
+element does not deflate, a second sweep with a recomputed shift is
+applied immediately, halving the number of convergence-check overheads.
+
+\paragraph{Result:} Negligible measurable impact.  The QR iteration
+phase accounts for only $2\text{--}4\%$ of total eigenSH time
+(tridiagonalisation dominates at $96\text{--}98\%$); even a $2\times$
+speedup in QR iteration yields $< 4\%$ overall improvement, well
+within benchmark noise.  The implementation is retained as it adds
+no overhead to the non-double-shift path.
+
+\subsubsection{Sub-round 20g: GEMM Micro-Panel Packing (Opt~6)}
+
+For $\min(m, k, n) \geq 256$, the GEMM kernel now packs $B$ into
+contiguous micro-panels before the micro-kernel loop.  The packed
+variant (\texttt{rawGemmBISlicePackedBK}, Kernel.hs) uses a
+$bk$-outer loop ordering: for each $k$-tile of width
+$kc = \min(64, k{-}bk)$, the $B$ submatrix is packed into 8-column
+panels in panel-major layout (stride~8 instead of stride~$n$), then
+frozen via \texttt{unsafeFreezeByteArray\#} to enable pure
+\texttt{indexDoubleArrayAsDoubleX4\#} reads.  This avoids State\#
+threading through the $k$-loop, which was found to prevent GHC's
+optimiser from fully unboxing the accumulator chain (a stateful
+variant showed a $6.5\%$ regression).
+
+\paragraph{Result:} GEMM $500{\times}500$ improved from
+$0.092\times$ to $0.084\times$ ($8.7\%$ improvement).  Below the
+crossover ($n < 256$), the unpacked path is used with no change.
+The improvement cascades to all operations that call GEMM internally
+(eigenSH, SVD, LU, Cholesky).
+
+\subsubsection{Sub-round 20h: 2D Parallel GEMM Tiling (Opt~7)}
+
+The parallel GEMM (\texttt{matMulPPar}, Level3.hs) now uses 2D grid
+partitioning when $\mathtt{numThreads} \geq 4$ and both dimensions
+$m, n \geq 128$.  A new column-restricted kernel
+(\texttt{rawGemmBIBJSlice}, Kernel.hs) accepts $bjStart$/$bjEnd$
+parameters, enabling each thread $(t_i, t_j)$ to compute only its
+assigned row and column tile of $C$.  Grid dimensions are chosen
+to minimise aspect ratio: $\lfloor\sqrt{p}\rfloor \times
+\lceil p / \lfloor\sqrt{p}\rfloor \rceil$.  This reduces per-thread
+$B$ cache working set by $\sqrt{p}$, improving L3 utilisation on
+chiplet architectures.
+
+\paragraph{Result:} No impact on single-threaded benchmarks (the
+primary comparison target).  Parallel GEMM scaling is improved for
+$\geq 4$ threads on matrices $\geq 128{\times}128$.
+
 \subsection{Deferred Optimisations}
 
-\textbf{Multi-shift QR (Opt~4):} Double-shift bulge chase for
-symmetric tridiagonal matrices.  Deferred because the Wilkinson single
-shift already provides cubic convergence; the expected
-$1.10\text{--}1.15\times$ improvement was not justified by the
-implementation complexity.
+\textbf{Cache auto-tuning (Opt~8):} Detection of cache sizes at
+runtime (\texttt{/sys/devices/system/cpu/} on Linux) to select
+optimal tile/panel sizes.  Deferred because the development machine's
+cache hierarchy is the only one benchmarked, so hard-coded sizes
+($\mathtt{bs} = 64$) are already optimal for the measured results.
+Would improve performance on different hardware (Apple M-series, Intel
+Golden Cove).
 
-\textbf{GEMM packing (Opt~6), 2D parallel GEMM (Opt~7), cache
-auto-tuning (Opt~8):} All provide negligible benefit at $n \leq 500$
-(the benchmarked range).  GEMM packing benefits only at $n \geq 512$;
-2D tiling only affects parallel benchmarks; cache auto-tuning provides
-at most $1.05\text{--}1.20\times$ on non-default hardware.
-
-\textbf{AVX-512 (Opt~9):} GHC~9.14 does not expose
-\texttt{DoubleX8\#} primops.  Pending GHC support.
+\textbf{AVX-512 (Opt~9):} GHC has defined \texttt{DoubleX8\#} primops
+since GHC~7.8, usable via the LLVM backend with \texttt{-mavx512f}.
+Deferred due to practical obstacles: register pressure with 512-bit
+types (untested with LLVM's allocator), limited AVX-512 hardware
+availability, and thermal throttling on some Intel processors.  See
+Section~\ref{sec:future-avx512}.
 
 \subsection{Results}
 
@@ -4740,13 +4796,13 @@ at most $1.05\text{--}1.20\times$ on non-default hardware.
 \midrule
 GEMM $100{\times}100$       & 1.06\,ms  & 183\,\textmu s & $0.17\times$ & $=$ \\
 GEMM $200{\times}200$       & 10.9\,ms  & 1.30\,ms       & $0.12\times$ & $=$ \\
-GEMM $500{\times}500$       & 220\,ms   & 20.3\,ms       & $0.092\times$ & $=$ \\
+GEMM $500{\times}500$       & 220\,ms   & 18.5\,ms       & $\mathbf{0.084\times}$ & $\downarrow$ 0.092 \\
 eigenSH $100{\times}100$    & 2.63\,ms  & 2.54\,ms       & $\mathbf{0.96\times}$ & $\downarrow$ 1.00 \\
 eigenSH $200{\times}200$    & 16.1\,ms  & 10.1\,ms       & $\mathbf{0.63\times}$ & $\downarrow$ 0.69 \\
-eigenSH $500{\times}500$    & 240\,ms   & 129\,ms        & $0.54\times$ & $=$ \\
+eigenSH $500{\times}500$    & 240\,ms   & 118\,ms        & $\mathbf{0.49\times}$ & $\downarrow$ 0.54 \\
 SVD $100{\times}100$        & 3.74\,ms  & 5.96\,ms       & $\mathbf{1.59\times}$ & $\downarrow$ 1.86 \\
 SVD $200{\times}200$        & 25.1\,ms  & 29.4\,ms       & $1.17\times$ & $\uparrow$ 0.98 \\
-SVD $500{\times}500$        & 416\,ms   & 336\,ms        & $0.81\times$ & $=$ \\
+SVD $500{\times}500$        & 416\,ms   & 320\,ms        & $\mathbf{0.77\times}$ & $\downarrow$ 0.81 \\
 LU solve $100{\times}100$   & 455\,\textmu s & 215\,\textmu s & $\mathbf{0.47\times}$ & $\downarrow$ 0.68 \\
 Cholesky $100{\times}100$   & 307\,\textmu s & 158\,\textmu s & $0.51\times$ & $=$ \\
 QR $100{\times}100$         & 140\,ms   & 2.75\,ms       & $0.020\times$ & $=$ \\
@@ -4758,31 +4814,49 @@ QR $100{\times}100$         & 140\,ms   & 2.75\,ms       & $0.020\times$ & $=$ \
 
 The principal achievements of Round~20 are:
 
-\textbf{LU solve:} Panel factorisation reduces the ratio at
-$100{\times}100$ from $0.68\times$ to $0.47\times$, a 31\% improvement.
-The Level-3 GEMM trailing update converts the cache-unfriendly
-column-by-column elimination into a single cache-friendly tiled
-operation.  The benefit will be larger at $n \geq 200$ where the
-GEMM update dominates.
+\textbf{GEMM packing (Sub-round 20g):} Micro-panel packing with
+$bk$-outer loop ordering and \texttt{unsafeFreezeByteArray\#} for pure
+$k$-loop reads reduces GEMM $500{\times}500$ from $0.092\times$ to
+$0.084\times$ ($8.7\%$ improvement, now $11.9\times$ faster than
+hmatrix/OpenBLAS).  The key insight is that State\# threading through
+the packed $k$-loop prevents GHC from optimising the accumulator chain;
+freezing each packed tile into an immutable \texttt{ByteArray\#} enables
+\texttt{indexDoubleArrayAsDoubleX4\#} reads in a pure loop, recovering
+the full optimisation benefit.  This improvement cascades: eigenSH
+$500{\times}500$ improved from $0.54\times$ to $0.49\times$ and SVD
+$500{\times}500$ from $0.81\times$ to $0.77\times$ via their internal
+GEMM calls.
 
-\textbf{D\&C eigensolver stability:} The perturbation-based deflation
-criterion eliminates the catastrophic orthogonality loss that disabled
-the D\&C path.  When $\rho z_i^2 < \varepsilon |d_i|$, the secular
-solver returned $\lambda_i = d_i$ exactly, causing the Gu--Eisenstat
-eigenvector formula to produce $z_i^{(\text{new})} = 0$---zeroing the
-dominant component.  The fix deflates these entries proactively,
-achieving reconstruction errors $< 5 \times 10^{-7}$ at $n = 128$.
-The D\&C path is now stable but remains slower than QR at $n \leq 500$
+\textbf{LU solve (Sub-round 20e):} Panel factorisation reduces the
+ratio at $100{\times}100$ from $0.68\times$ to $0.47\times$, a 31\%
+improvement.  The Level-3 GEMM trailing update converts the
+cache-unfriendly column-by-column elimination into a single
+cache-friendly tiled operation.
+
+\textbf{D\&C eigensolver stability (Sub-round 20d):} The
+perturbation-based deflation criterion eliminates the catastrophic
+orthogonality loss that disabled the D\&C path.  When
+$\rho z_i^2 < \varepsilon |d_i|$, the secular solver returned
+$\lambda_i = d_i$ exactly, causing the Gu--Eisenstat eigenvector
+formula to produce $z_i^{(\text{new})} = 0$---zeroing the dominant
+component.  The fix deflates these entries proactively, achieving
+reconstruction errors $< 5 \times 10^{-7}$ at $n = 128$.  The D\&C
+path is now stable but remains slower than QR at $n \leq 500$
 ($\texttt{dcCrossover} = 1000$) due to merge-step GEMM overhead.
 
-\textbf{SVD $100{\times}100$:} The fused DSYRK kernel, column-major
-SIMD Givens in bidiagonal QR, and blocked bidiagonalisation combine to
-reduce the SVD deficit from $1.86\times$ to $1.59\times$.  The
-remaining gap is primarily due to the $A^\top A$ eigendecomposition
-overhead (two extra GEMMs); the direct Golub--Kahan path
-(\texttt{svdGKP}) with blocked bidiagonalisation remains
-${\sim}2\times$ slower at $100{\times}100$ due to the scalar
-bidiagonal QR phase.
+\textbf{SVD $100{\times}100$ (Sub-rounds 20a--20c):} The fused DSYRK
+kernel, column-major SIMD Givens in bidiagonal QR, and blocked
+bidiagonalisation combine to reduce the SVD deficit from $1.86\times$
+to $1.59\times$.  The remaining gap is primarily due to the $A^\top A$
+eigendecomposition overhead (two extra GEMMs); the direct Golub--Kahan
+path (\texttt{svdGKP}) with blocked bidiagonalisation remains
+${\sim}2\times$ slower at $100{\times}100$ due to the scalar bidiagonal
+QR phase.
+
+\textbf{Double-shift QR (Sub-round 20f):} Implemented but with
+negligible measurable impact.  QR iteration accounts for only
+$2\text{--}4\%$ of eigenSH time; the dominant cost is
+tridiagonalisation ($96\text{--}98\%$).
 
 \textbf{SVD $200{\times}200$:} A regression from $0.98\times$ to
 $1.17\times$ is observed.  This is attributed to benchmark run-to-run
@@ -4793,7 +4867,7 @@ After Round~20, \texttt{linear-massiv} achieves parity or better in
 \textbf{all nine operation categories at $500{\times}500$} and in
 \textbf{eight of nine at $200{\times}200$ and above}.  The remaining
 deficits are SVD at $n \leq 200$ (inherent to the $A^\top A$ pathway)
-and eigenSH at $n = 10$ (baseline overhead).
+and eigenSH at $n = 100$ (within noise of parity).
 
 %% ####################################################################
 \part{Synthesis and Future Directions}
@@ -4820,7 +4894,7 @@ is faster.}
 \midrule
 GEMM $100{\times}100$       & 1.06\,ms  & 183\,\textmu s & $0.17\times$ & $5.8\times$ \\
 GEMM $200{\times}200$       & 10.9\,ms  & 1.30\,ms       & $0.12\times$ & $8.4\times$ \\
-GEMM $500{\times}500$       & 220\,ms   & 20.3\,ms       & $0.092\times$ & $10.8\times$ \\
+GEMM $500{\times}500$       & 220\,ms   & 18.5\,ms       & $0.084\times$ & $11.9\times$ \\
 Dot product $n{=}1000$      & 4.33\,\textmu s & 1.07\,\textmu s & $0.25\times$ & $4.0\times$ \\
 Matvec $100{\times}100$     & 21.8\,\textmu s & 9.69\,\textmu s & $0.44\times$ & $2.3\times$ \\
 LU solve $100{\times}100$   & 455\,\textmu s & 215\,\textmu s & $0.47\times$ & $2.1\times$ \\
@@ -4828,23 +4902,25 @@ Cholesky $100{\times}100$   & 307\,\textmu s & 158\,\textmu s & $0.51\times$ & $
 QR $100{\times}100$         & 140\,ms   & 2.75\,ms       & $0.020\times$ & $50.9\times$ \\
 eigenSH $100{\times}100$    & 2.63\,ms  & 2.54\,ms       & $0.96\times$ & $1.04\times$ \\
 eigenSH $200{\times}200$    & 16.1\,ms  & 10.1\,ms       & $0.63\times$ & $1.6\times$ \\
-eigenSH $500{\times}500$    & 240\,ms   & 129\,ms        & $0.54\times$ & $1.9\times$ \\
+eigenSH $500{\times}500$    & 240\,ms   & 118\,ms        & $0.49\times$ & $2.0\times$ \\
 SVD $100{\times}100$        & 3.74\,ms  & 5.96\,ms       & $1.59\times$ & --- \\
 SVD $200{\times}200$        & 25.1\,ms  & 29.4\,ms       & $1.17\times$ & --- \\
-SVD $500{\times}500$        & 416\,ms   & 336\,ms        & $0.81\times$ & $1.2\times$ \\
+SVD $500{\times}500$        & 416\,ms   & 320\,ms        & $0.77\times$ & $1.3\times$ \\
 \bottomrule
 \end{tabular}
 \end{table}
 
 At $500{\times}500$---the largest benchmarked size---\texttt{linear-massiv}
 outperforms \texttt{hmatrix} (OpenBLAS/LAPACK) in \textbf{all nine
-operation categories}.  After Round~20, eigenSH is $1.04\times$ faster
-at $100{\times}100$ and $1.6\times$ faster at $200{\times}200$; LU solve
-has improved from $1.5\times$ to $2.1\times$ faster via panel factorisation.
-The remaining deficits are SVD at $100{\times}100$ ($1.59\times$) and
-$200{\times}200$ ($1.17\times$), inherent to the $A^\top A$
-eigendecomposition approach despite fused DSYRK, blocked
-bidiagonalisation, and SIMD Givens optimisations applied in Round~20.
+operation categories}.  After Round~20, GEMM is $11.9\times$ faster at
+$500{\times}500$ (up from $10.8\times$ via micro-panel packing);
+eigenSH is $1.04\times$ faster at $100{\times}100$ and $2.0\times$
+faster at $500{\times}500$; LU solve has improved from $1.5\times$ to
+$2.1\times$ faster via panel factorisation.  The remaining deficits are
+SVD at $100{\times}100$ ($1.59\times$) and $200{\times}200$
+($1.17\times$), inherent to the $A^\top A$ eigendecomposition approach
+despite fused DSYRK, blocked bidiagonalisation, and SIMD Givens
+optimisations applied in Round~20.
 
 \subsection{Performance Trajectory}
 
@@ -4870,8 +4946,8 @@ eigenSH $100{\times}100$  & $897\times$    & ---          & $0.93\times$ & $0.97
 eigenSH $200{\times}200$  & ---            & ---          & ---          & ---          & ---          & $1.19\times$ & $0.69\times$ & $\mathbf{0.63\times}$ \\
 SVD $100{\times}100$      & $887\times$    & ---          & $3.28\times$ & $2.38\times$ & $1.80\times$ & $1.78\times$ & $1.86\times$ & $\mathbf{1.59\times}$ \\
 SVD $200{\times}200$      & ---            & ---          & ---          & ---          & ---          & $1.53\times$ & $0.98\times$ & $1.17\times$ \\
-eigenSH $500{\times}500$  & ---            & ---          & ---          & ---          & $0.51\times$ & $0.47\times$ & $0.48\times$ & $0.54\times$ \\
-SVD $500{\times}500$      & ---            & ---          & ---          & ---          & $0.90\times$ & $0.76\times$ & $0.82\times$ & $0.81\times$ \\
+eigenSH $500{\times}500$  & ---            & ---          & ---          & ---          & $0.51\times$ & $0.47\times$ & $0.48\times$ & $\mathbf{0.49\times}$ \\
+SVD $500{\times}500$      & ---            & ---          & ---          & ---          & $0.90\times$ & $0.76\times$ & $0.82\times$ & $\mathbf{0.77\times}$ \\
 \bottomrule
 \end{tabular}
 \end{table}
@@ -4893,11 +4969,14 @@ The trajectory reveals five distinct phases:
   $n = 100\text{--}200$, bringing eigenSH to parity at~100 and
   $1.4\times$ faster at~200, and SVD to parity at~200.
 \item \textbf{Round~20 (algorithmic deepening):} Fused DSYRK, blocked
-  bidiagonalisation, D\&C eigensolver stabilisation, and panel
-  LU/Cholesky factorisation.  LU improved from $0.68\times$ to
-  $0.47\times$ ($2.1\times$ faster than hmatrix/LAPACK); SVD deficit
-  reduced from $1.86\times$ to $1.59\times$ at~100; eigenSH passed
-  parity at~100 ($0.96\times$).
+  bidiagonalisation, D\&C eigensolver stabilisation, panel
+  LU/Cholesky factorisation, double-shift QR, GEMM micro-panel packing,
+  and 2D parallel GEMM tiling.  LU improved from $0.68\times$ to
+  $0.47\times$ ($2.1\times$ faster than hmatrix/LAPACK); GEMM at~500
+  from $0.092\times$ to $0.084\times$ ($11.9\times$ faster) via
+  packing; SVD deficit reduced from $1.86\times$ to $1.59\times$
+  at~100; eigenSH passed parity at~100 ($0.96\times$) and reached
+  $0.49\times$ at~500.
 \end{enumerate}
 
 %% ====================================================================
@@ -4931,7 +5010,7 @@ backend with \texttt{-mavx2 -mfma}, generate native \texttt{vfmadd231pd}
 instructions---the same fused multiply-add operations that OpenBLAS uses.
 The $4{\times}8$ GEMM micro-kernel (Round~17) holds 8
 \texttt{DoubleX4\#} accumulators (32 doubles) across the full $k$-loop,
-achieving $10\times$ faster-than-OpenBLAS GEMM at $500{\times}500$.
+achieving ${\sim}12\times$ faster-than-OpenBLAS GEMM at $500{\times}500$.
 
 However, GHC's register allocator imposes a hard limit: attempting to
 hold more than ${\sim}14$ simultaneous \texttt{DoubleX4\#} values
@@ -5034,22 +5113,19 @@ Round~20 state.
 After twenty rounds of optimisation, \texttt{linear-massiv}
 outperforms hmatrix (OpenBLAS/LAPACK) in all nine categories at
 $500{\times}500$ and eight of nine at $200{\times}200$.  Round~20
-implemented six of the nine optimisations proposed after Round~19:
+implemented seven of the nine optimisations proposed after Round~19:
 fused DSYRK (item~3), blocked Golub--Kahan SVD with SIMD Givens
-(item~1), D\&C eigensolver stabilisation (item~2), panel LU/Cholesky
-(item~5), while deferring multi-shift QR (item~4, insufficient
-benefit vs.\ complexity) and three infrastructure items (6--8).
+(item~1), D\&C eigensolver stabilisation (item~2), double-shift QR
+(item~4), panel LU/Cholesky (item~5), GEMM micro-panel packing
+(item~6), and 2D parallel GEMM tiling (item~7).
 The remaining deficits are SVD at $n \leq 200$ ($1.59\times$ at~100,
 $1.17\times$ at~200), inherent to the $A^\top A$ eigendecomposition
 pathway.
 
 The roadmap below is revised to reflect the post-Round~20 state.
-Items~1--3 and~5 from the previous roadmap are now implemented
-(Section~\ref{sec:round20}).  Item~4 (multi-shift QR) was evaluated
-and deferred (Wilkinson single-shift already provides cubic
-convergence; expected gain $1.10\text{--}1.15\times$ did not justify
-complexity).  Remaining opportunities focus on infrastructure scaling
-and future GHC capabilities.
+Items~1--7 from the previous roadmap are now implemented
+(Section~\ref{sec:round20}).  Remaining opportunities focus on
+infrastructure scaling and future GHC capabilities.
 
 %% ------------------------------------------------------------------
 \subsection{Implemented in Round~20}
@@ -5071,69 +5147,69 @@ The following items from the previous roadmap have been completed:
 \item \textbf{Panel LU and Cholesky} (Sub-round 20e): Panel
   factorisation with $\mathtt{nb} = 32$ and GEMM trailing updates.
   LU improved from $0.68\times$ to $0.47\times$.
+\item \textbf{Double-shift QR} (Sub-round 20f): Implicit double-shift
+  bulge chase for symmetric tridiagonal QR iteration.  Implemented but
+  with negligible measurable impact (QR iteration is only
+  $2\text{--}4\%$ of eigenSH time).
+\item \textbf{GEMM micro-panel packing} (Sub-round 20g):
+  $bk$-outer loop with packed $B$ micro-panels for
+  $\min(m,k,n) \geq 256$.  GEMM $500{\times}500$ improved from
+  $0.092\times$ to $0.084\times$ ($8.7\%$).
+\item \textbf{2D parallel GEMM tiling} (Sub-round 20h): Column-restricted
+  kernel with 2D grid partitioning for $\geq 4$ threads.  Reduces
+  per-thread $B$ working set by $\sqrt{p}$.  No impact on
+  single-threaded benchmarks.
 \end{enumerate}
-
-\textbf{Deferred:} Multi-shift QR (double-shift bulge chase) was
-evaluated and deferred because the Wilkinson single-shift already
-provides cubic convergence for symmetric tridiagonal matrices, and the
-expected $1.10\text{--}1.15\times$ improvement does not justify the
-implementation complexity.
 
 %% ------------------------------------------------------------------
 \subsection{1.\ GEMM Micro-Panel Packing}
 \label{sec:future-gemm-packing}
 
-\paragraph{Status: implementable now.}  No external blockers; deferred
-because the benefit is negligible at $n \leq 500$.
+\paragraph{Status: implemented in Round~20 (Sub-round 20g).}
+The packed variant \texttt{rawGemmBISlicePackedBK} (Kernel.hs) is
+dispatched for $\min(m,k,n) \geq 256$ via \texttt{gemmPackCrossover}.
 
-\paragraph{Current state.}
-The GEMM kernel (\texttt{rawGemmKernel}, Kernel.hs) reads $A$ and $B$
-directly from their original row-major layout.  The $4{\times}8$
-micro-kernel broadcasts $A[i,k]$ and loads contiguous $B[k, j..j{+}7]$,
-achieving $10\times$-faster-than-OpenBLAS at $500{\times}500$.
-However, at very large sizes ($n > 1000$), TLB misses from
-non-contiguous access to $A$ panels can degrade throughput.
+\paragraph{Implementation.}
+The $bk$-outer loop packs the current $B$ tile (up to $64 \times n$)
+into 8-column micro-panels in panel-major layout (stride~8), then
+freezes via \texttt{unsafeFreezeByteArray\#} to enable pure
+\texttt{indexDoubleArrayAsDoubleX4\#} reads in the $k$-loop.  A
+critical finding: State\# threading through a mutable-read $k$-loop
+prevents GHC from fully unboxing accumulator chains, causing a $6.5\%$
+regression.  The freeze-then-pure-read approach avoids this, yielding
+an $8.7\%$ improvement over the unpacked path at $500{\times}500$.
 
-\paragraph{Proposed optimisation.}
-Adopt the BLIS/GotoBLAS packing strategy: before entering the
-micro-kernel loop, copy the current $A$~tile and $B$~tile into
-contiguous micro-panel buffers with strides matched to the
-micro-kernel's access pattern ($A$: column-contiguous for broadcast;
-$B$: row-contiguous for vector loads).  This eliminates TLB misses and
-cache associativity conflicts at the cost of $O(n^2)$ packing overhead
-per tile.
+\paragraph{Measured impact.}
+GEMM $500{\times}500$: $0.092\times \to 0.084\times$ ($11.9\times$
+faster than OpenBLAS).  Below the crossover ($n < 256$), no change.
+The improvement cascades to eigenSH ($0.54\times \to 0.49\times$
+at~500) and SVD ($0.81\times \to 0.77\times$ at~500) via internal
+GEMM calls.
 
-\paragraph{Expected impact.}
-Negligible at $n \leq 500$ (current benchmarks), but
-$1.1\text{--}1.3\times$ at $n = 1000\text{--}5000$ where TLB pressure
-becomes the bottleneck.  This is a prerequisite for scaling to larger
-problem sizes.
+\paragraph{Remaining opportunity.}
+$A$-panel packing (column-contiguous for broadcast) is not yet
+implemented.  This would further reduce TLB pressure at $n > 1000$.
 
 %% ------------------------------------------------------------------
 \subsection{2.\ 2D Parallel GEMM Tiling}
 \label{sec:future-2d-gemm}
 
-\paragraph{Status: implementable now.}  No external blockers; deferred
-because single-threaded benchmarks are the primary comparison target
-and this only affects parallel performance.
+\paragraph{Status: implemented in Round~20 (Sub-round 20h).}
+The column-restricted kernel \texttt{rawGemmBIBJSlice} (Kernel.hs)
+and 2D grid dispatch in \texttt{matMulPPar} (Level3.hs) are active
+for $\mathtt{numThreads} \geq 4$ and $m, n \geq 128$.
 
-\paragraph{Current state.}
-\texttt{matMulPPar} (Level3.hs) partitions by rows only: each of $p$
-threads computes $\lfloor m/p \rfloor$ rows of $C$, reading the
-entire $B$ matrix.  On a multi-socket system with $500{\times}500$
-matrices, all threads contend for the same ${\sim}2$\,MB $B$ in L3.
+\paragraph{Implementation.}
+A new \texttt{rawGemmBIBJSlice} kernel accepts $bjStart$/$bjEnd$
+parameters, enabling each thread $(t_i, t_j)$ to compute only its
+assigned row and column tile of $C$.  Grid dimensions are
+$\lfloor\sqrt{p}\rfloor \times \lceil p/\lfloor\sqrt{p}\rfloor\rceil$,
+reducing per-thread $B$ working set by $\sqrt{p}$.
 
-\paragraph{Proposed optimisation.}
-Partition both rows and columns in a 2D grid: thread $(t_i, t_j)$
-computes rows $[i_0, i_1)$ and columns $[j_0, j_1)$ of $C$, reading
-only $B[*, j_0..j_1)$.  This reduces per-thread $B$ working set by
-$\sqrt{p}$, improving L3 utilisation on chiplet architectures (AMD
-EPYC, Intel Xeon).
-
-\paragraph{Expected impact.}
-$1.2\text{--}1.4\times$ parallel GEMM improvement at $16{+}$ threads,
-cascading to eigenSH and SVD via their internal GEMM calls.  No
-impact on single-threaded benchmarks.
+\paragraph{Measured impact.}
+No impact on single-threaded benchmarks (the primary comparison
+target).  Parallel GEMM scaling is improved for $\geq 4$ threads on
+matrices $\geq 128{\times}128$.
 
 %% ------------------------------------------------------------------
 \subsection{3.\ Cache Tile and Panel Size Auto-Tuning}
@@ -5172,12 +5248,38 @@ on the development machine.
 \subsection{4.\ AVX-512 Support via \texttt{DoubleX8\#}}
 \label{sec:future-avx512}
 
-\paragraph{Status: blocked by GHC.}  GHC~9.14 does not expose
-\texttt{DoubleX8\#} primops.  The LLVM~17 backend can generate
-AVX-512 instructions when passed \texttt{-mavx512f}, but without
-corresponding Haskell-level primops there is no way to express 8-wide
-SIMD operations in source code.  This is a hard dependency on a future
-GHC version adding 512-bit SIMD primitive types.
+\paragraph{Status: implementable with caveats.}  Contrary to earlier
+assumptions, GHC has defined \texttt{DoubleX8\#} as a primitive SIMD
+type since GHC~7.8, alongside the full complement of 512-bit vector
+types (\texttt{FloatX16\#}, \texttt{Int64X8\#}, etc.).  These primops
+are \emph{usable today} when compiling with the LLVM backend
+(\texttt{-fllvm}) and the \texttt{-mavx512f} flag, which instructs
+LLVM to generate AVX-512 instructions using ZMM registers.
+The \textbf{native code generator} (NCG), however, does \textbf{not}
+support 512-bit vectors: GHC~9.12 added initial 128-bit NCG SIMD
+support (MR~!12860), with 256-bit and 512-bit NCG support explicitly
+listed as future work.  Since \texttt{linear-massiv} already uses the
+LLVM backend (\texttt{-fllvm -mavx2 -mfma}), switching to
+\texttt{-mavx512f} and using \texttt{DoubleX8\#} is technically
+feasible.
+
+The remaining obstacles are practical rather than fundamental:
+\begin{enumerate}
+\item \textbf{Register pressure.}  The current $4{\times}8$
+  GEMM micro-kernel holds ${\sim}14$ simultaneous \texttt{DoubleX4\#}
+  values, near the LLVM register allocator's spill threshold.  With
+  ZMM registers, an $8{\times}8$ micro-kernel would require ${\sim}14$
+  simultaneous \texttt{DoubleX8\#} values (8 accumulators +
+  $B$-vectors + $A$-broadcasts).  Whether LLVM's register allocator
+  handles this without spilling is untested.
+\item \textbf{AVX-512 availability.}  Not all target CPUs support
+  AVX-512 (absent on consumer AMD Zen~2/3, Apple Silicon, many
+  laptops).  A build-time or runtime dispatch mechanism would be
+  needed to provide both AVX2 and AVX-512 code paths.
+\item \textbf{Thermal throttling.}  Some Intel processors reduce clock
+  frequency when executing AVX-512 instructions, partially or fully
+  negating the wider vector benefit.
+\end{enumerate}
 
 \paragraph{Current state.}
 All SIMD kernels use GHC's \texttt{DoubleX4\#} primops (AVX2,
@@ -5187,24 +5289,27 @@ with AVX-512 support (Intel Xeon Scalable, AMD Zen~4+), 512-bit
 instead of~4.
 
 \paragraph{Proposed optimisation.}
-When GHC exposes \texttt{DoubleX8\#} primops (or via the LLVM backend's
-native AVX-512 code generation with \texttt{-mavx512f}), provide
-alternative 8-wide micro-kernels:
+Provide alternative 8-wide micro-kernels using \texttt{DoubleX8\#}
+primops, compiled with \texttt{-fllvm -mavx512f}:
 \begin{itemize}
 \item $8{\times}8$ GEMM micro-kernel (8 \texttt{DoubleX8\#}
   accumulators = 64 doubles, matching the register file of AVX-512
   targets).
 \item 8-wide Givens rotation, Householder application, triangular
   solve, and column elimination kernels.
-\item Compile-time selection via CPP based on target architecture.
+\item Compile-time selection via CPP based on target architecture,
+  or build-time flag (\texttt{-favx512}) to select the 512-bit
+  code path.
 \end{itemize}
 
 \paragraph{Expected impact.}
 ${\sim}1.5\text{--}1.8\times$ throughput improvement for all
 SIMD-dominated operations (GEMM, QR, eigenSH Givens accumulation),
-contingent on GHC SIMD support and register allocator improvements.
-The current register pressure limit (${\sim}14$ simultaneous
-\texttt{DoubleX4\#} values) may be relaxed with wider registers.
+contingent on LLVM register allocator behaviour with 512-bit types
+and absence of thermal throttling on the target CPU.  The current
+register pressure limit (${\sim}14$ simultaneous \texttt{DoubleX4\#}
+values) may or may not be relaxed with wider registers---empirical
+testing is required.
 
 %% ------------------------------------------------------------------
 \subsection{Summary of Remaining Opportunities}
@@ -5215,28 +5320,31 @@ The current register pressure limit (${\sim}14$ simultaneous
 \toprule
 \textbf{\#} & \textbf{Optimisation} & \textbf{Status} & \textbf{Expected gain} & \textbf{Primary beneficiary} & \textbf{Blocker} \\
 \midrule
-\multicolumn{6}{l}{\textit{Implementable now --- deferred for low impact at benchmarked sizes}} \\
-1 & GEMM micro-panel packing      & Ready   & $1.1\text{--}1.3\times$   & GEMM ($n > 1000$)             & None \\
-2 & 2D parallel GEMM tiling       & Ready   & $1.2\text{--}1.4\times$   & Parallel GEMM ($16{+}$ thr.)  & None \\
+\multicolumn{6}{l}{\textit{Implemented in Round~20}} \\
+1 & GEMM micro-panel packing      & Done (20g)  & $0.092 \to 0.084\times$   & GEMM ($n \geq 256$)           & --- \\
+2 & 2D parallel GEMM tiling       & Done (20h)  & Parallel scaling           & Parallel GEMM ($\geq 4$ thr.) & --- \\
+\midrule
+\multicolumn{6}{l}{\textit{Remaining --- deferred for low impact at benchmarked sizes}} \\
 3 & Cache/panel auto-tuning       & Ready   & $1.05\text{--}1.20\times$ & All (other hardware)           & None \\
 \midrule
-\multicolumn{6}{l}{\textit{Blocked --- awaiting external support}} \\
-4 & AVX-512 / \texttt{DoubleX8\#} & Blocked & $1.5\text{--}1.8\times$   & All SIMD kernels               & GHC primops \\
+\multicolumn{6}{l}{\textit{Remaining --- requires AVX-512 hardware and LLVM backend testing}} \\
+4 & AVX-512 / \texttt{DoubleX8\#} & Ready$^*$ & $1.5\text{--}1.8\times$   & All SIMD kernels              & See \S\ref{sec:future-avx512} \\
 \bottomrule
 \end{tabular}
 \end{center}
 
-Items~1--3 have no external blockers and could be implemented at any
-time; they are deferred because their benefit is negligible at the
-benchmarked sizes ($n \leq 500$, single-threaded, AMD Zen~4 cache
-hierarchy).  Item~4 is blocked by a hard GHC dependency:
-\texttt{DoubleX8\#} primops do not exist in GHC~9.14, and there is no
-source-level workaround to express 512-bit SIMD operations.
+Items~1--2 were implemented in Round~20 Sub-rounds 20g--20h.  Item~3
+has no external blockers but is deferred because the development
+machine's cache hierarchy is the only one benchmarked.  Item~4 is
+technically feasible today via the LLVM backend with \texttt{-mavx512f}
+(the \texttt{DoubleX8\#} primops already exist in GHC), but requires
+AVX-512 hardware and empirical testing of LLVM's register allocator
+behaviour with 512-bit types (Section~\ref{sec:future-avx512}).
 
-Of the original nine proposed optimisations, six have been implemented
-in Round~20 (items~1--3 and~5, plus the fused DSYRK kernel and
-column-major SIMD Givens).  Multi-shift QR (item~4) was evaluated and
-deferred due to insufficient benefit relative to complexity.
+Of the original nine proposed optimisations, seven have been
+implemented in Round~20 (Sub-rounds 20a--20h).  The two remaining
+items (cache auto-tuning and AVX-512) are deferred for practical
+reasons, not technical blockers.
 
 Three empirically eliminated targets remain excluded:
 \begin{itemize}
@@ -5471,14 +5579,14 @@ eigenSH $500{\times}500$ tightened to $0.47\times$ (from $0.51\times$).
 \paragraph{Summary.}
 Of the nine benchmarked operation categories, \texttt{linear-massiv}
 now \textbf{outperforms \texttt{hmatrix} (OpenBLAS/LAPACK) in all
-nine at $500{\times}500$}: GEMM ($0.092\text{--}0.17\times$,
+nine at $500{\times}500$}: GEMM ($0.084\text{--}0.17\times$,
 single-threaded and parallel), dot product ($0.25\times$),
 matrix--vector multiply ($0.44\times$), LU solve ($0.47\times$),
 Cholesky solve ($0.51\times$), QR factorisation ($0.020\times$),
-eigenvalue decomposition ($0.54\text{--}0.96\times$), and SVD
-($0.81\text{--}1.59\times$).  At $500{\times}500$---the largest
+eigenvalue decomposition ($0.49\text{--}0.96\times$), and SVD
+($0.77\text{--}1.59\times$).  At $500{\times}500$---the largest
 benchmark size---every category is faster than hmatrix/LAPACK, with
-SVD $1.2\times$ faster ($0.81\times$).
+SVD $1.3\times$ faster ($0.77\times$).
 
 \texttt{linear-massiv} demonstrates that \textbf{pure Haskell with
 GHC's native SIMD primops, raw \texttt{ByteArray\#} primops, and
@@ -5493,10 +5601,10 @@ As discussed in Section~\ref{sec:lessons}, the dominant lesson is that
 Haskell's high-level abstractions need not preclude low-level performance:
 the key is to push the abstraction boundary below the hot loop via raw
 primops, while retaining type-safe APIs at the library boundary.
-Section~\ref{sec:future-optimisations} identifies four remaining
-optimisation opportunities (GEMM packing, 2D parallel tiling, cache
-auto-tuning, and AVX-512) that target scaling beyond the benchmarked
-sizes and future GHC capabilities.
+Section~\ref{sec:future-optimisations} identifies two remaining
+optimisation opportunities (cache auto-tuning and AVX-512) that target
+scaling to other hardware and future GHC capabilities; GEMM packing
+and 2D parallel tiling were implemented in Sub-rounds 20g--20h.
 
 %% ====================================================================
 \begin{thebibliography}{9}
