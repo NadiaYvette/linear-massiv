@@ -5911,34 +5911,256 @@ but has not yet reached LAPACK's level of bidiagonalisation
 micro-optimisation, remaining $2\text{--}3\times$ slower than
 \texttt{svdAtAP}.
 
-Closing the remaining gap therefore has two avenues:
+To understand the remaining gap, consider the approximate FLOP
+breakdown for each path at $n = m = 100$:
+
+\begin{center}
+\small
+\begin{tabular}{lrrr}
+\toprule
+\textbf{Phase} & \textbf{svdAtAP} & \textbf{svdGKP} & \textbf{LAPACK \texttt{dgesdd}} \\
+\midrule
+$A^\top A$ formation          & 2\,M   & ---     & ---     \\
+Bidiagonalisation             & ---     & 27\,M  & 13\,M  \\
+$U_0$/$V_0$ accumulation      & ---     & 7\,M   & 4\,M   \\
+Tridiagonalisation            & 4\,M   & ---     & ---     \\
+Eigensolve / bidiag SVD       & 15\,M  & 25\,M  & 12\,M  \\
+$U$-recovery GEMM             & 20\,M  & ---     & ---     \\
+Sort + sign fix               & 0.2\,M & 0.1\,M & 0.1\,M \\
+\midrule
+\textbf{Total}                & \textbf{41\,M} & \textbf{59\,M} & \textbf{29\,M} \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+LAPACK's advantage over \texttt{svdGKP} comes from two sources:
+(i)~BLAS-3 panel bidiagonalisation (\texttt{DGEBRD}) with $n_b = 64$
+at $n = 100$---the panel path fires because LAPACK has no crossover
+guard---halving the bidiagonalisation cost; and (ii)~\texttt{DBDSDC}'s
+highly-tuned Fortran D\&C merge step with deflation bookkeeping that
+minimises secular equation evaluations.
+
+\texttt{svdAtAP}'s advantage over \texttt{svdGKP} comes from bypassing
+bidiagonalisation entirely: forming $A^\top A$ costs only $2n^3$ FLOPs
+(vs.\ $\tfrac{8}{3}n^3$ for Level-2 bidiagonalisation), and the
+tridiagonalisation of the resulting $n{\times}n$ symmetric matrix costs
+only $\tfrac{4}{3}n^3$ FLOPs.  However, the $20$\,M-FLOP $U$-recovery
+GEMM ($U = A \cdot V_{\text{scaled}}$) is the single most expensive
+phase in \texttt{svdAtAP} at $n = 100$, and there is no obvious way to
+reduce it below $2n^3$.
+
+Closing the remaining gap has two avenues:
+
+\paragraph{Avenue~(a): make \texttt{svdGKP} competitive with LAPACK's
+\texttt{dgesdd}.}
+
+Rounds~21a and 22a implemented the two major algorithmic building
+blocks---D\&C bidiagonal SVD and BLAS-3 panel bidiagonalisation---but
+several constant-factor gaps remain between \texttt{svdGKP} and LAPACK:
+
 \begin{enumerate}
-\item[(a)] \textbf{Make \texttt{svdGKP} competitive with LAPACK's
-  \texttt{dgesdd}:} Round~22a implemented BLAS-3 panel
-  bidiagonalisation (DLABRD-style), and Round~21a implemented D\&C
-  bidiagonal SVD.  The remaining bottleneck is the constant factor of
-  the D\&C merge step (secular equation solve + Gu--Eisenstat
-  eigenvector construction per merge level) and the bidiagonal QR base
-  case for $n \leq 25$.  Further micro-optimisation of the merge step
-  (e.g.\ SIMD secular equation evaluation, batched deflation) could
-  close the remaining $2\text{--}3\times$ gap between \texttt{svdGKP}
-  and \texttt{svdAtAP}.  This is the path that preserves numerical
-  quality.
-\item[(b)] \textbf{Reduce the constant factor of \texttt{svdAtAP}:}
-  Rounds~22b--22d implemented the most accessible wins: tridiagonalisation
-  parameter tuning, GEMM packing at smaller sizes, and pre-scaled V
-  U-recovery.  Remaining opportunities include packing the $A$-panel
-  in GEMM (reducing TLB pressure at $n > 256$), and further tuning the
-  panel tridiagonalisation for the specific $n = 100$ working set.
-  These improve benchmark numbers but do not address the
-  condition-number squaring limitation.
+\item \textbf{Bidiagonalisation at $n = 100$ is still Level-2.}
+  The panel bidiagonalisation crossover (\texttt{panelBidiagCrossover})
+  is set to $n = 128$, so at $n = 100$ the column-by-column Level-2
+  path fires, costing $\tfrac{8}{3}n^3 \approx 27$\,M~FLOPs.  LAPACK's
+  \texttt{DGEBRD} uses panel bidiagonalisation unconditionally (the
+  panel overhead is negligible even at small $n$ because the Fortran
+  implementation uses optimised DGEMM for the trailing update).
+  Lowering the crossover to $n = 64$ would enable the BLAS-3 path at
+  $n = 100$, reducing the cost toward $\tfrac{4}{3}n^3 + O(n_b \cdot
+  n^2) \approx 15$\,M~FLOPs.
+
+  \textit{Risk:} At $n = 100$ with $n_b = \min(32, \max(8, 100/6))
+  = 16$, each trailing GEMM operates on a $(100{-}k_0) \times (100{-}k_0)$
+  submatrix.  Early panels' trailing GEMMs are on near-full-size
+  submatrices and amortise well; later panels' trailing GEMMs operate
+  on small submatrices where the $4{\times}8$ micro-kernel cannot fill
+  its register block, limiting the benefit.  Empirical testing is
+  required to determine whether the crossover reduction helps or hurts
+  at $n = 100$.
+
+\item \textbf{$U_0$/$V_0$ accumulation uses small WY blocks.}
+  The blocked WY accumulation of left and right Householder products
+  uses $n_b = \min(32, n) = 32$ at $n = 100$.  This produces
+  3~blocks of GEMM calls per accumulation.  LAPACK's \texttt{DORGBR}
+  uses $n_b = 64$ (the optimal ILAENV query), halving the number of
+  GEMM calls and improving trailing-update amortisation.  Increasing
+  the WY block size to 48 or 64 would reduce the per-block overhead,
+  though the total FLOP count is unchanged.
+
+\item \textbf{D\&C bidiagonal merge step overhead.}
+  At each of the ${\sim}\log_2(100) \approx 7$ merge levels, the D\&C
+  bidiagonal SVD performs: (i)~insertion sort of squared singular values
+  ($O(n^2)$ comparisons); (ii)~secular equation solve via
+  \texttt{secularSolve} ($O(n)$ Newton iterations per eigenvalue,
+  $O(n^2)$ total); (iii)~Gu--Eisenstat eigenvector construction for
+  both $W_V$ and $W_U$ ($O(n^2)$ per level); and (iv)~two $n{\times}n$
+  GEMMs to update $V_{\text{local}}$ and $U_{\text{local}}$
+  ($4n^3$ FLOPs per level).  The GEMMs are fast (they exercise the
+  $4{\times}8$ micro-kernel), but the secular and eigenvector phases
+  are scalar-dominated.
+
+  Specific opportunities:
+  \begin{itemize}
+  \item \textbf{SIMD secular evaluation.}  The secular function
+    $f(\mu) = 1 + \rho \sum z_i^2 / (d_i^2 - \mu)$ and its derivative
+    involve independent per-element divisions that could be vectorised
+    with \texttt{DoubleX4\#}.  Currently these are scalar loops.
+    Expected gain: ${\sim}2\times$ for the secular phase, which
+    accounts for ${\sim}10\%$ of total D\&C time.
+  \item \textbf{Batched deflation.}  Close-$d$ Givens deflation
+    currently processes one pair at a time, applying a $2{\times}2$
+    Givens to the full $U_{\text{local}}$ and $V_{\text{local}}$
+    accumulators.  Batching multiple deflation rotations into a
+    single blocked WY update would convert these scalar Givens
+    applications into GEMM calls.
+  \item \textbf{Merge-level pruning.}  When all singular values at a
+    merge level are well-separated and no deflation occurs, the merge
+    step does full $O(n^2)$ work for the eigenvector construction.
+    A fast-path that detects the no-deflation case and skips the
+    sorting/deflation overhead could save ${\sim}5\%$ at large $n$.
+  \end{itemize}
+
+\item \textbf{Base case size.}
+  The D\&C base case fires at $n \leq 25$, falling back to bidiagonal
+  QR iteration (\texttt{bidiagQRIterP}).  At this size, the QR iteration
+  typically converges in ${\sim}30n$ Givens sweeps, each applying
+  rotations to the local $25{\times}25$ $U$ and $V$ accumulator
+  matrices.  The base case is a small fraction of total time
+  (${\sim}600$\,K~FLOPs out of $25$\,M), so tuning the threshold
+  between 15 and 40 is unlikely to yield more than ${\sim}5\%$.
 \end{enumerate}
 
-A hybrid dispatch---selecting \texttt{svdGKP} for ill-conditioned
-matrices (detected via a cheap condition-number estimate from the
-diagonal of $R$ in a preliminary QR factorisation) and
-\texttt{svdAtAP} for well-conditioned ones---would provide both
-numerical robustness and performance.
+\textit{Overall assessment.}  The largest single win for
+\texttt{svdGKP} at $n = 100$ is lowering the panel bidiagonalisation
+crossover (item~1), which could save ${\sim}12$\,M~FLOPs
+(${\sim}20\%$ of total).  Combined with WY block size tuning (item~2)
+and SIMD secular evaluation (item~3), a $30\text{--}40\%$ reduction
+in \texttt{svdGKP} time is plausible, which would bring it to
+${\sim}1.5\text{--}2\times$ of \texttt{svdAtAP}---still slower, but
+competitive with LAPACK's \texttt{dgesdd}.  This is the path that
+preserves full numerical quality ($\kappa$ preserved throughout).
+
+\paragraph{Avenue~(b): reduce the constant factor of \texttt{svdAtAP}.}
+
+Rounds~22b--22d implemented the most accessible wins.  The remaining
+FLOP breakdown for \texttt{svdAtAP} at $n = m = 100$ is:
+
+\begin{center}
+\small
+\begin{tabular}{lrl}
+\toprule
+\textbf{Phase} & \textbf{Cost} & \textbf{Status} \\
+\midrule
+$A^\top A$ (SIMD GEMM)       & 2\,M   & Near-optimal (fused DSYRK) \\
+Tridiagonalisation (panel)    & 4\,M   & Panel $n_b = 25$ at $n = 100$ (R22b) \\
+D\&C eigensolve               & 15\,M  & QR iteration ($n < \texttt{dcCrossover}$) \\
+$U$-recovery (pre-scaled GEMM)& 20\,M  & Single GEMM (R22d) \\
+Sort + permute                & 0.2\,M & O(1)-indexed permutation \\
+\midrule
+\textbf{Total}                & \textbf{41\,M} & \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+Specific remaining opportunities:
+
+\begin{enumerate}
+\item \textbf{Eigenvector accumulation: D\&C vs.\ QR at $n = 100$.}
+  The \texttt{svdAtAP} dispatch calls \texttt{symmetricEigenPDC} for
+  $n \geq 50$, but \texttt{symmetricEigenPDC} internally defers to
+  QR iteration because the D\&C tridiagonal eigensolver has
+  $\texttt{dcCrossover} = 1000$.  Thus for $50 \leq n < 1000$,
+  the intended D\&C benefit is \emph{not realised}: the code path
+  is tridiagonalisation $\to$ QR iteration, identical to
+  \texttt{symmetricEigenP}.
+
+  Lowering \texttt{dcCrossover} from 1000 to ${\sim}200$ would
+  activate the D\&C tridiagonal eigensolver at $n = 100$, converting
+  the $15$\,M-FLOP QR eigenvector accumulation into $O(\log n)$
+  merge-level GEMMs.  Given that the GEMM micro-kernel is
+  $6\text{--}12\times$ faster than the scalar Givens sweeps, this
+  should reduce the eigensolve phase to ${\sim}8\text{--}10$\,M~FLOPs,
+  saving ${\sim}5\text{--}7$\,M~FLOPs ($12\text{--}17\%$ of total).
+
+  \textit{Risk:} The standalone eigenSH benchmark at $100{\times}100$
+  currently achieves $0.96\times$ with QR iteration.  If the D\&C
+  crossover is lowered globally, the eigenSH benchmark may regress
+  because the D\&C merge-step overhead is not amortised at $n = 100$
+  for standalone use (the SVD context is special because the
+  $6\text{--}12\times$ GEMM advantage is more pronounced when the
+  eigensolve is embedded within a larger pipeline).  A per-callsite
+  threshold---lower for \texttt{svdAtAP}, higher for standalone
+  eigenSH---would avoid this regression.
+
+\item \textbf{$A$-panel packing in GEMM.}
+  The $U$-recovery GEMM ($U = A \cdot V_{\text{scaled}}$, $100
+  {\times}100 \times 100{\times}100$) uses the unpacked BI-outer
+  kernel because $\min(m,k,n) = 100 < \texttt{gemmPackCrossover}
+  = 128$.  Lowering the packing crossover to $96$ or $64$ would
+  enable the packed-$B$ variant, reducing TLB pressure for the
+  $V_{\text{scaled}}$ reads.  Additionally, $A$-panel packing
+  (column-contiguous broadcast) is not yet implemented; adding it
+  would reduce L2 misses for the $A$ reads during the micro-kernel's
+  $k$-loop.
+
+  \textit{Expected gain:} ${\sim}5\text{--}8\%$ for the $U$-recovery
+  GEMM (${\sim}2\text{--}3\%$ of total SVD time).
+
+\item \textbf{Tridiagonalisation panel size at $n = 100$.}
+  With $\texttt{panelCrossover} = 64$ and
+  $n_b = \min(64, \max(16, n/4)) = 25$, the tridiagonalisation at
+  $n = 100$ uses 4~panels of size~25.  Each trailing SYR2K update
+  operates on a $(100 - k_0){\times}(100 - k_0)$ matrix---the
+  first panel's update is $75{\times}75$, the last is
+  $25{\times}25$.  Increasing $n_b$ to 32 or 40 (by changing the
+  formula to $n/3$ instead of $n/4$) would reduce the number of
+  panels to 3, saving one trailing-update GEMM overhead.
+
+  \textit{Expected gain:} ${\sim}3\text{--}5\%$ of the
+  tridiagonalisation phase (${\sim}0.5\%$ of total SVD time).
+  Marginal.
+
+\item \textbf{Fused sort and column rearrangement.}
+  Currently, eigenvalue sorting builds a permutation array
+  ($O(n \log n)$ sort), then column rearrangement reads $V$ via
+  indexed indirection.  Fusing the sort with column extraction
+  into a single cache-friendly pass would eliminate one traversal
+  of the $n{\times}n$ matrix.
+
+  \textit{Expected gain:} ${\sim}1\text{--}2\%$ of total.  Negligible.
+\end{enumerate}
+
+\textit{Overall assessment.}  The largest remaining win for
+\texttt{svdAtAP} is item~1 (D\&C eigensolver activation), which
+could reduce total time by $12\text{--}17\%$---bringing the
+$100{\times}100$ ratio from $1.38\times$ to ${\sim}1.15\text{--}1.21
+\times$.  Items~2--4 contribute at most ${\sim}5\%$ additional.
+These improve benchmark numbers but do \emph{not} address the
+condition-number squaring limitation inherent to the $A^\top A$
+approach.
+
+\paragraph{Avenue~(c): hybrid dispatch.}
+
+A third avenue combines the strengths of both paths: select
+\texttt{svdGKP} for ill-conditioned matrices and \texttt{svdAtAP}
+for well-conditioned ones.  A cheap condition-number estimate
+can be obtained from the diagonal of $R$ in a preliminary thin QR
+factorisation of $A$ (cost: $\tfrac{2}{3}n^3$ FLOPs for $m = n$,
+or ${\sim}30\%$ overhead):
+\[
+  \hat{\kappa}(A) = \frac{\max_i |R_{ii}|}{\min_i |R_{ii}|}
+\]
+If $\hat{\kappa} > 10^6$, dispatch to \texttt{svdGKP}; otherwise
+use \texttt{svdAtAP}.  This ensures numerical robustness where it
+matters while maintaining peak throughput for the common case of
+well-conditioned matrices.
+
+Alternatively, the condition-number estimate could be extracted
+from the bidiagonalisation itself (the ratio of the largest to
+smallest diagonal entry of $B$ approximates $\kappa(A)$), which
+would allow a ``try \texttt{svdAtAP}, verify, fall back'' strategy
+with no upfront overhead for well-conditioned inputs.
 
 \paragraph{Not recommended at current benchmark sizes.}
 Strassen/Winograd multiplication (not blocked, but breakeven at
