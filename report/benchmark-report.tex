@@ -5078,6 +5078,68 @@ The largest improvement is at $200{\times}200$: $0.89\times \to 0.73\times$
 $50{\times}50$ deficit improved from $1.82\times$ to $1.73\times$.
 SVD~$100{\times}100$ and $500{\times}500$ held steady.
 
+\subsection{Analysis}
+
+\paragraph{Why the improvement concentrates at $200{\times}200$.}
+The DLABRD panel bidiagonalisation (Sub-round 22a) has crossover
+$n = 128$: at $200{\times}200$, the bidiagonalisation is dominated by
+Level-3 trailing GEMMs ($A_{\text{trail}} \mathrel{{-}{=}} V_L Y^\top
++ X V_R^\top$), each of which exercises the fast $4{\times}8$
+micro-kernel.  At $100{\times}100$, the matrix is too small to trigger
+the panel path, so the bidiagonalisation remains Level-2.  The
+tridiagonalisation parameter tuning (22b) is the primary contributor at
+$100{\times}100$: lowering the panel crossover from $128$ to $64$ means
+that the eigendecomposition inside \texttt{svdAtAP} now uses the
+DLATRD-style panel tridiagonalisation rather than the column-by-column
+Level-2 path.  However, at $n = 100$ the trailing update GEMM after each
+panel of $\mathtt{nb} \leq 25$ columns operates on a small trailing
+submatrix, limiting the GEMM amortisation benefit.
+
+At $500{\times}500$, the bidiagonalisation was already efficient
+(dominated by large trailing GEMMs even in the column-by-column path),
+so the panel approach gives diminishing returns---the improvement is
+absorbed within measurement noise.
+
+\paragraph{The Level-2 to Level-3 conversion theme.}
+Round~22a completes the systematic conversion of all major
+factorisations from column-by-column Level-2 operations to blocked
+Level-3 (GEMM-dominated) trailing updates.  Panel bidiagonalisation
+joins panel tridiagonalisation (Round~15), blocked WY Q-accumulation
+(Round~17), and panel LU/Cholesky (Round~20e) as the fourth such
+conversion.  Section~\ref{sec:lessons} analyses this recurring pattern
+in detail.  The remaining unconverted operation is the bidiagonal QR
+iteration phase (scalar Givens sweeps), which resists blocking because
+each rotation depends on the previous one's result.
+
+\paragraph{Implementation subtleties.}
+Two bugs were encountered during panel bidiagonalisation development,
+both related to Householder vector storage conventions:
+\begin{enumerate}
+\item \textbf{Row correction at the panel boundary.}
+  When processing the last column of a panel ($k = n{-}2$), no right
+  Householder reflector is needed (there is no trailing row to
+  eliminate).  However, the \emph{row correction} step---applying the
+  accumulated $V_L Y^\top + X V_R^\top$ correction to the current row
+  to obtain the correct superdiagonal entry $e[k]$---must still execute.
+  The initial implementation gated both the row correction and the right
+  Householder behind a single \texttt{k < n - 2} condition, producing
+  incorrect bidiagonal entries.
+
+\item \textbf{Implicit Householder leading entries.}
+  Right Householder vectors $v_R$ are stored in rows of $A$ to the right
+  of the superdiagonal, with an implicit $1$ at position $k{+}1$.
+  During the trailing GEMM update, the $V_R^{\top}$ submatrix was read
+  directly from $A$, but position $(k, k{+}1)$ contains the
+  superdiagonal value $\mu_R$ (from the Householder reduction), not the
+  implicit $1$.  This required an explicit conditional in the
+  $V_R^{\top}$ construction: entries at the leading position of each
+  Householder vector are replaced with $1.0$, entries below are read from
+  $A$, and entries above are zero.
+\end{enumerate}
+Both bugs were caught by running the full test suite with the panel
+crossover temporarily set to $n = 4$, forcing the panel path on all
+test matrices including $5{\times}5$ and $10{\times}10$ cases.
+
 %% ####################################################################
 \part{Synthesis and Future Directions}
 %% ####################################################################
@@ -5158,7 +5220,7 @@ SVD $500{\times}500$      & ---            & ---          & ---          & ---  
 \end{tabular}
 \end{table}
 
-The trajectory reveals five distinct phases:
+The trajectory reveals seven distinct phases:
 \begin{enumerate}
 \item \textbf{Rounds~2--3 (ByteArray\# breakthrough):} Raw primop kernels
   with AVX2 SIMD eliminated the $240\text{--}330\times$ BLAS gap in a
@@ -5281,6 +5343,59 @@ at $500{\times}500$, making it the most impactful SVD optimisation
 since Round~6.  The lesson: algorithmic choice depends not just on
 asymptotic complexity but on the \emph{relative efficiency} of the
 sub-operations on the target platform.
+
+\subsection{The Level-2 to Level-3 Conversion}
+
+A systematic optimisation pattern that emerged across Rounds~15--22
+is the conversion of column-by-column Level-2 BLAS operations into
+blocked Level-3 (GEMM-dominated) operations.  This is the same
+strategy that underlies LAPACK's high performance---routines like
+\texttt{DGEBRD} (bidiagonalisation), \texttt{DGETRF} (LU), and
+\texttt{DLATRD} (tridiagonalisation) all use panel factorisation
+with deferred trailing updates---but implementing it in pure Haskell
+required solving each case's Householder storage conventions and
+implicit-entry bookkeeping individually.
+
+The pattern is always the same:
+\begin{enumerate}
+\item Process $n_b$ columns (a \emph{panel}) using Level-2 operations
+  within the panel, recording the deferred effect on the trailing
+  submatrix in accumulator matrices (X, Y, or T-factor).
+\item After the panel, apply the cumulative correction to the trailing
+  submatrix via one or two rank-$n_b$ GEMMs.
+\end{enumerate}
+The total arithmetic work is unchanged, but the trailing GEMM achieves
+far higher arithmetic intensity---the $4{\times}8$ micro-kernel sustains
+${\sim}32$ flops per cache line versus ${\sim}4$ for a rank-1 GEMV
+update---and the panel's Level-2 work is confined to a narrow
+$m{\times}n_b$ strip that fits in L1/L2 cache.
+
+Table~\ref{tab:level3-conversion} summarises the conversions.
+
+\begin{table}[h]
+\centering
+\caption{Level-2 to Level-3 conversions across rounds.}
+\label{tab:level3-conversion}
+\small
+\begin{tabular}{llll}
+\toprule
+\textbf{Round} & \textbf{Operation} & \textbf{LAPACK analogue} & \textbf{Impact} \\
+\midrule
+15 & Tridiagonalisation  & \texttt{DLATRD} & eigenSH $1.05\times$ at 100 \\
+17 & QR Q-accumulation   & \texttt{DLARFT}/\texttt{DLARFB} & QR $0.022\times$ \\
+20e & LU factorisation   & \texttt{DGETRF} & LU $0.47\times$ \\
+20e & Cholesky            & \texttt{DPOTRF} & Cholesky $0.51\times$ \\
+22a & Bidiagonalisation  & \texttt{DGEBRD}/\texttt{DLABRD} & SVD 200 $0.73\times$ \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+The one operation that resists this conversion is the bidiagonal/tridiagonal
+QR iteration phase: each Givens rotation depends on the previous one's
+output, preventing batching.  The D\&C approach (Rounds~20d, 21) addresses
+this differently, replacing the sequential Givens sweeps with
+GEMM-dominated merge steps---a complementary strategy that achieves
+the same goal of shifting work from scalar to SIMD-friendly operations.
 
 \subsection{Numerical Quality vs.\ Performance: The SVD Tradeoff}
 \label{sec:svd-tradeoff}
@@ -5471,9 +5586,8 @@ Round~22 state.
   nine benchmarked categories at $200{\times}200$ and above}, and in
   eight of nine at $100{\times}100$.  EigenSH is $1.04\times$ faster at
   $100{\times}100$ and $1.6\times$ faster at $200{\times}200$; SVD is
-  $1.1\times$ faster at $200{\times}200$ and $1.6\times$ faster at
-  $500{\times}500$; SVD is $1.4\times$ faster at $200{\times}200$;
-  LU solve is $2.1\times$ faster at $100{\times}100$.
+  $1.4\times$ faster at $200{\times}200$ and $1.6\times$ faster at
+  $500{\times}500$; LU solve is $2.1\times$ faster at $100{\times}100$.
   Offers compile-time dimensional safety via \texttt{KnownNat},
   zero FFI dependencies (pure Haskell with GHC SIMD primops), and
   user-controllable parallelism via massiv's computation strategies.
@@ -5534,6 +5648,37 @@ The following items from the previous roadmap have been completed:
   kernel with 2D grid partitioning for $\geq 4$ threads.  Reduces
   per-thread $B$ working set by $\sqrt{p}$.  No impact on
   single-threaded benchmarks.
+\end{enumerate}
+
+%% ------------------------------------------------------------------
+\subsection{Implemented in Rounds~21--22}
+
+Beyond the Round~20 roadmap items, Rounds~21--22 addressed the SVD
+deficit with four additional optimisations:
+
+\begin{enumerate}
+\setcounter{enumi}{7}
+\item \textbf{D\&C bidiagonal SVD for \texttt{svdGKP}}
+  (Section~\ref{sec:round21}, Sub-round 21a): Replaces bidiagonal QR
+  iteration with divide-and-conquer using the Gu--Eisenstat secular
+  equation solver (reused from the tridiagonal D\&C).
+  \texttt{svdGKP} improved by ${\sim}20\text{--}25\%$ at all sizes.
+\item \textbf{D\&C eigensolver dispatch in \texttt{svdAtAP}}
+  (Sub-round 21b): Switching from QR iteration to D\&C for the
+  $A^\top A$ eigendecomposition at $n \geq 50$.  The single most
+  impactful SVD change since Round~6: SVD $100{\times}100$ from
+  $1.59\times$ to $1.37\times$; $200{\times}200$ from $1.17\times$
+  to $0.89\times$; $500{\times}500$ from $0.77\times$ to
+  $0.61\times$.
+\item \textbf{BLAS-3 panel bidiagonalisation}
+  (Section~\ref{sec:round22}, Sub-round 22a): DLABRD-style blocked
+  bidiagonalisation with X/Y accumulators and rank-$n_b$ GEMM trailing
+  updates.  Primary impact at $200{\times}200$: $0.89\times \to
+  0.73\times$.
+\item \textbf{SVD pipeline tuning} (Sub-rounds 22b--22d):
+  Tridiagonalisation crossover $128 \to 64$, GEMM packing crossover
+  $256 \to 128$, pre-scaled V U-recovery with DoubleX4\# SIMD.
+  Incremental gains across sizes.
 \end{enumerate}
 
 %% ------------------------------------------------------------------
@@ -5598,8 +5743,8 @@ hardware (Apple M-series, Intel Golden Cove, etc.).
 
 \paragraph{Current state.}
 GEMM tile size $\mathtt{bs} = 64$ (Kernel.hs) and tridiagonalisation
-panel size $\mathtt{nb} = \min(48, \max(16, n/4))$ (Symmetric.hs)
-are tuned on AMD Zen~4 (32\,KB L1d, 512\,KB L2).  These are
+panel size $\mathtt{nb} = \min(64, \max(16, n/4))$ (Symmetric.hs, tuned
+in Round~22b) are tuned on AMD Zen~4 (32\,KB L1d, 512\,KB L2).  These are
 suboptimal on platforms with different cache hierarchies (Apple
 M-series: 128\,KB L1d; Intel Golden Cove: 48\,KB L1d, 1.25\,MB L2).
 
@@ -5693,11 +5838,17 @@ testing is required.
 \footnotesize
 \begin{tabular}{cl@{\;\;}c@{\;\;}c@{\;\;}c@{\;\;}c}
 \toprule
-\textbf{\#} & \textbf{Optimisation} & \textbf{Status} & \textbf{Expected gain} & \textbf{Primary beneficiary} & \textbf{Blocker} \\
+\textbf{\#} & \textbf{Optimisation} & \textbf{Status} & \textbf{Measured gain} & \textbf{Primary beneficiary} & \textbf{Blocker} \\
 \midrule
 \multicolumn{6}{l}{\textit{Implemented in Round~20}} \\
 1 & GEMM micro-panel packing      & Done (20g)  & $0.092 \to 0.084\times$   & GEMM ($n \geq 256$)           & --- \\
 2 & 2D parallel GEMM tiling       & Done (20h)  & Parallel scaling           & Parallel GEMM ($\geq 4$ thr.) & --- \\
+\midrule
+\multicolumn{6}{l}{\textit{Implemented in Rounds~21--22}} \\
+8 & D\&C bidiag SVD (\texttt{svdGKP})  & Done (21a)  & ${\sim}20\%$ svdGKP & SVD (all sizes)   & --- \\
+9 & D\&C eigen dispatch (\texttt{svdAtAP}) & Done (21b)  & SVD $1.59 \to 1.37\times$ & SVD ($n \geq 50$) & --- \\
+10 & BLAS-3 panel bidiag           & Done (22a)  & SVD 200 $0.89 \to 0.73\times$ & SVD ($n \geq 128$) & --- \\
+11 & SVD pipeline tuning           & Done (22b--d) & Incremental               & SVD (all sizes)   & --- \\
 \midrule
 \multicolumn{6}{l}{\textit{Remaining --- deferred for low impact at benchmarked sizes}} \\
 3 & Cache/panel auto-tuning       & Ready   & $1.05\text{--}1.20\times$ & All (other hardware)           & None \\
@@ -5763,16 +5914,24 @@ micro-optimisation, remaining $2\text{--}3\times$ slower than
 Closing the remaining gap therefore has two avenues:
 \begin{enumerate}
 \item[(a)] \textbf{Make \texttt{svdGKP} competitive with LAPACK's
-  \texttt{dgesdd}:} This requires a faster bidiagonalisation
-  (BLAS-3 panel bidiagonalisation analogous to \texttt{DGEBRD},
-  which accumulates Householder reflectors in blocks rather than
-  one-at-a-time) and further optimisation of the D\&C bidiagonal SVD
-  merge step.  This is the path that preserves numerical quality.
+  \texttt{dgesdd}:} Round~22a implemented BLAS-3 panel
+  bidiagonalisation (DLABRD-style), and Round~21a implemented D\&C
+  bidiagonal SVD.  The remaining bottleneck is the constant factor of
+  the D\&C merge step (secular equation solve + Gu--Eisenstat
+  eigenvector construction per merge level) and the bidiagonal QR base
+  case for $n \leq 25$.  Further micro-optimisation of the merge step
+  (e.g.\ SIMD secular equation evaluation, batched deflation) could
+  close the remaining $2\text{--}3\times$ gap between \texttt{svdGKP}
+  and \texttt{svdAtAP}.  This is the path that preserves numerical
+  quality.
 \item[(b)] \textbf{Reduce the constant factor of \texttt{svdAtAP}:}
-  E.g.\ via more efficient tridiagonalisation, GEMM packing at
-  smaller sizes, or a cheaper $U$-recovery step.  This improves
-  benchmark numbers but does not address the condition-number
-  squaring limitation.
+  Rounds~22b--22d implemented the most accessible wins: tridiagonalisation
+  parameter tuning, GEMM packing at smaller sizes, and pre-scaled V
+  U-recovery.  Remaining opportunities include packing the $A$-panel
+  in GEMM (reducing TLB pressure at $n > 256$), and further tuning the
+  panel tridiagonalisation for the specific $n = 100$ working set.
+  These improve benchmark numbers but do not address the
+  condition-number squaring limitation.
 \end{enumerate}
 
 A hybrid dispatch---selecting \texttt{svdGKP} for ill-conditioned
@@ -5976,6 +6135,52 @@ slower than svdAtAP).  Results: \textbf{Cholesky $2.1\times$
 faster than hmatrix/LAPACK} ($0.48\times$, improved from $0.63\times$);
 SVD $500{\times}500$ improved to $0.76\times$ (from $0.90\times$);
 eigenSH $500{\times}500$ tightened to $0.47\times$ (from $0.51\times$).
+
+\paragraph{Round~19 (eigenvalue/SVD convergence).}
+Row-major QR dispatch, adaptive panel thresholds, stall detection, and
+aggressive early deflation brought eigenSH to parity at $100{\times}100$
+($1.00\times$) and $1.4\times$ faster at $200{\times}200$ ($0.69\times$).
+SVD $200{\times}200$ reached parity ($0.98\times$, improved from
+$1.53\times$).  These gains came primarily from reducing the iteration
+count in QR eigenvalue convergence rather than from faster per-iteration
+work.
+
+\paragraph{Round~20 (algorithmic deepening).}
+Eight sub-rounds: fused DSYRK kernel, column-major SIMD Givens for
+bidiagonal QR, blocked bidiagonalisation with WY accumulation, D\&C
+eigensolver stabilisation via Gu--Eisenstat perturbation-based
+deflation, panel LU and Cholesky factorisation, double-shift QR, GEMM
+micro-panel packing, and 2D parallel GEMM tiling.  \textbf{LU solve
+$2.1\times$ faster} than hmatrix/LAPACK ($0.47\times$, from
+$0.68\times$); \textbf{GEMM $11.9\times$ faster} at $500{\times}500$
+($0.084\times$) via packing; SVD deficit reduced to $1.59\times$ at
+$100{\times}100$; eigenSH passed parity at $100{\times}100$
+($0.96\times$) and reached $0.49\times$ at $500{\times}500$.
+
+\paragraph{Round~21 (D\&C SVD breakthrough).}
+Two changes to the SVD pipeline: (1)~D\&C bidiagonal SVD for
+\texttt{svdGKP}, reusing the tridiagonal D\&C's secular equation
+infrastructure on squared singular values (${\sim}20\%$ improvement);
+(2)~switching \texttt{svdAtAP}'s eigendecomposition from QR iteration to
+the D\&C eigensolver for $n \geq 50$, which converts scalar Givens
+eigenvector accumulation into $O(\log n)$ GEMM-dominated merge levels.
+The dispatch change was the most impactful SVD optimisation since
+Round~6: \textbf{SVD $200{\times}200$ moved from $1.17\times$ deficit to
+$0.89\times$} (faster than LAPACK); \textbf{SVD $500{\times}500$ from
+$0.77\times$ to $0.61\times$} ($1.6\times$ faster); SVD
+$100{\times}100$ deficit reduced from $1.59\times$ to $1.37\times$.
+
+\paragraph{Round~22 (BLAS-3 pipeline tuning).}
+Four complementary SVD pipeline optimisations: DLABRD-style panel
+bidiagonalisation for \texttt{svdGKP} (converting Level-2
+bidiagonalisation to Level-3 for $n \geq 128$); tridiagonalisation
+parameter tuning (crossover $128 \to 64$, max panel $48 \to 64$);
+GEMM packing crossover lowered ($256 \to 128$); and pre-scaled V
+U-recovery with DoubleX4\# SIMD for \texttt{svdAtAP}.
+\textbf{SVD $200{\times}200$ from $0.89\times$ to $0.73\times$}
+($37\%$ faster than LAPACK); SVD $50{\times}50$ improved from
+$1.82\times$ to $1.73\times$.  SVD $100{\times}100$ and
+$500{\times}500$ held steady.
 
 \paragraph{Summary.}
 Of the nine benchmarked operation categories, \texttt{linear-massiv}
