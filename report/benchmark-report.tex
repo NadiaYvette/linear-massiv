@@ -4980,16 +4980,23 @@ dense GEMM calls to the fast $4{\times}8$ micro-kernel.  Since our
 GEMM is $6\text{--}12\times$ faster than OpenBLAS, the GEMM phase
 is disproportionately cheap, making D\&C the better choice at $n \geq 50$.
 
-\paragraph{Condition number squaring.}  The D\&C bidiag SVD operates
-on squared singular values $d_i^2$, which squares the condition number:
+\paragraph{Condition number squaring and numerical quality.}
+The D\&C bidiag SVD operates on squared singular values $d_i^2$,
+which squares the condition number:
 $\kappa^2 = (\sigma_{\max}/\sigma_{\min})^2$.  For ill-conditioned
 matrices ($\kappa > 10^8$), significant digits are lost.  The
 Gu--Eisenstat formula with log-space computation and perturbation-based
-deflation mitigate this for most practical cases.  The
-\texttt{svdAtAP} path is also affected (eigendecomposition of $A^\top A$
-inherently squares the condition number), so this is not a new
-limitation introduced by D\&C---it is inherent to the $A^\top A$
-approach.
+deflation mitigate this for most practical cases.  More fundamentally,
+the \texttt{svdAtAP} path \emph{itself} suffers from condition-number
+squaring: forming $A^\top A$ gives $\kappa(A^\top A) = \kappa(A)^2$,
+so roughly half the significant digits are lost before eigendecomposition
+begins.  This is not a new limitation introduced by the D\&C---it is
+inherent to the $A^\top A$ approach.  The numerically proper algorithm
+avoids forming $A^\top A$ entirely, instead computing the SVD via
+orthogonal bidiagonalisation (the \texttt{svdGKP} path).  LAPACK's
+\texttt{dgesdd} and \texttt{dgesvd} use this proper approach.  See
+Section~\ref{sec:svd-tradeoff} for a detailed discussion of this
+performance-vs-quality tradeoff.
 
 After Round~21, \texttt{linear-massiv} achieves parity or better in
 \textbf{all nine operation categories at $200{\times}200$ and above},
@@ -5192,6 +5199,60 @@ at $500{\times}500$, making it the most impactful SVD optimisation
 since Round~6.  The lesson: algorithmic choice depends not just on
 asymptotic complexity but on the \emph{relative efficiency} of the
 sub-operations on the target platform.
+
+\subsection{Numerical Quality vs.\ Performance: The SVD Tradeoff}
+\label{sec:svd-tradeoff}
+
+The most widely-accepted SVD algorithm---used by LAPACK's
+\texttt{dgesdd} and \texttt{dgesvd}---avoids forming $A^\top A$
+entirely.  Instead, it reduces $A$ to upper bidiagonal form $B$ via
+orthogonal Householder reflections ($A = U_0 B V_0^\top$), then
+computes the SVD of $B$ directly.  Because every transformation is
+orthogonal, the condition number is preserved throughout:
+$\kappa(B) = \kappa(A)$.  This is \texttt{svdGKP} in
+\texttt{linear-massiv}.
+
+The faster \texttt{svdAtAP} path takes the numerically inferior
+approach: it forms $A^\top A$ explicitly and eigendecomposes it.
+This \emph{squares} the condition number---$\kappa(A^\top A) =
+\kappa(A)^2$---so roughly half the significant digits are lost before
+the eigendecomposition even begins.  For a matrix with
+$\kappa(A) = 10^8$ (not uncommon in scientific computing),
+$\kappa(A^\top A) = 10^{16}$, which exceeds double-precision's
+${\sim}15.9$ decimal digits, leaving essentially no accuracy in the
+small singular values.
+
+The performance hierarchy is therefore inverted relative to the
+numerical quality hierarchy:
+
+\begin{center}
+\begin{tabular}{lcc}
+\toprule
+\textbf{Path} & \textbf{Numerical quality} & \textbf{Performance} \\
+\midrule
+\texttt{svdGKP} (Golub--Kahan) & Best ($\kappa$ preserved) & Slower ($2\text{--}3\times$ at 100) \\
+\texttt{svdAtAP} ($A^\top A$ eigen) & Worst ($\kappa^2$) & Faster (default) \\
+LAPACK \texttt{dgesdd} & Best ($\kappa$ preserved) & Reference \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+LAPACK achieves both numerical quality \emph{and} performance because
+its Golub--Kahan path has been optimised for decades with highly-tuned
+Fortran BLAS-3 bidiagonalisation routines (\texttt{DGEBRD},
+\texttt{DBDSDC}).  The remaining $1.37\times$ SVD deficit at
+$100{\times}100$ therefore reflects two compounding factors:
+(a)~\texttt{svdAtAP}'s $A^\top A$ approach is faster but numerically
+inferior, and (b)~the numerically proper \texttt{svdGKP} path has not
+yet reached LAPACK's level of bidiagonalisation micro-optimisation.
+
+\paragraph{Practical implications.}
+For well-conditioned problems ($\kappa < 10^6$), the $A^\top A$
+pathway loses at most a few digits and is acceptable.  For
+ill-conditioned problems, users should prefer \texttt{svdGKP} despite
+its higher cost, or use iterative refinement.  A future default
+dispatch could select the path based on a cheap condition-number
+estimate (e.g.\ from the diagonal of $R$ in a QR factorisation of $A$).
 
 \subsection{The Parallelism Payoff}
 
@@ -5599,14 +5660,39 @@ Three empirically eliminated targets remain excluded:
   ratios.
 \end{itemize}
 
-The remaining SVD deficit ($1.37\times$ at $100{\times}100$) is
-primarily attributable to the $A^\top A$ eigendecomposition pathway's
-condition-number squaring and the cost of two GEMMs ($A^\top A$
-formation and $U = A V \Sigma^{-1}$).  Further improvement would require
-either (a)~making \texttt{svdGKP} competitive with \texttt{svdAtAP}
-(requires a fundamentally faster bidiagonalisation), or (b)~reducing the
-constant factor of the $A^\top A$ pathway (e.g.\ via a more efficient
-tridiagonalisation or GEMM packing at smaller sizes).
+The remaining SVD deficit ($1.37\times$ at $100{\times}100$) reflects
+a fundamental tradeoff between performance and numerical quality
+(Section~\ref{sec:svd-tradeoff}).  The fastest path (\texttt{svdAtAP})
+uses the numerically inferior $A^\top A$ eigendecomposition, which
+squares the condition number.  LAPACK achieves both speed and numerical
+soundness because its Golub--Kahan bidiagonalisation path
+(\texttt{DGEBRD} + \texttt{DBDSDC}) has been micro-optimised over
+decades with Fortran BLAS-3 routines.  \texttt{linear-massiv}'s
+numerically proper path (\texttt{svdGKP}) implements the same algorithm
+but has not yet reached LAPACK's level of bidiagonalisation
+micro-optimisation, remaining $2\text{--}3\times$ slower than
+\texttt{svdAtAP}.
+
+Closing the remaining gap therefore has two avenues:
+\begin{enumerate}
+\item[(a)] \textbf{Make \texttt{svdGKP} competitive with LAPACK's
+  \texttt{dgesdd}:} This requires a faster bidiagonalisation
+  (BLAS-3 panel bidiagonalisation analogous to \texttt{DGEBRD},
+  which accumulates Householder reflectors in blocks rather than
+  one-at-a-time) and further optimisation of the D\&C bidiagonal SVD
+  merge step.  This is the path that preserves numerical quality.
+\item[(b)] \textbf{Reduce the constant factor of \texttt{svdAtAP}:}
+  E.g.\ via more efficient tridiagonalisation, GEMM packing at
+  smaller sizes, or a cheaper $U$-recovery step.  This improves
+  benchmark numbers but does not address the condition-number
+  squaring limitation.
+\end{enumerate}
+
+A hybrid dispatch---selecting \texttt{svdGKP} for ill-conditioned
+matrices (detected via a cheap condition-number estimate from the
+diagonal of $R$ in a preliminary QR factorisation) and
+\texttt{svdAtAP} for well-conditioned ones---would provide both
+numerical robustness and performance.
 
 \paragraph{Not recommended at current benchmark sizes.}
 Strassen/Winograd multiplication (not blocked, but breakeven at
