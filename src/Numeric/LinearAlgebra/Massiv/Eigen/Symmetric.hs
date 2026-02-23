@@ -21,6 +21,21 @@ module Numeric.LinearAlgebra.Massiv.Eigen.Symmetric
   , symmetricEigenPPar
   , symmetricEigenPDC
   , jacobiEigen
+  -- * D&C secular equation infrastructure (for bidiagonal SVD reuse)
+  , secularSolve
+  , secularSolveOne
+  , deflatePartition
+  , dcEigenvectors
+  , secularFuncSplit
+  , secularFuncAndDeriv
+  , sumZSq
+  , farPoleSum
+  , farPoleSumSkip
+  , readRawD
+  , writeRawD
+  , readRawI
+  , writeRawI
+  , indexRawD
   ) where
 
 import qualified Data.Massiv.Array as M
