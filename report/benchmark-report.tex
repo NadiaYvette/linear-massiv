@@ -4998,9 +4998,85 @@ orthogonal bidiagonalisation (the \texttt{svdGKP} path).  LAPACK's
 Section~\ref{sec:svd-tradeoff} for a detailed discussion of this
 performance-vs-quality tradeoff.
 
-After Round~21, \texttt{linear-massiv} achieves parity or better in
+After Round~22, \texttt{linear-massiv} achieves parity or better in
 \textbf{all nine operation categories at $200{\times}200$ and above},
-with the sole remaining deficit being SVD at $100{\times}100$ ($1.37\times$).
+with the sole remaining deficit being SVD at $100{\times}100$ ($1.38\times$).
+
+\section{Round~22: BLAS-3 Panel Bidiagonalisation and SVD Pipeline Tuning}
+\label{sec:round22}
+
+Round~22 applies four complementary optimisations to the SVD pipeline
+and its supporting infrastructure.
+
+\subsection{Sub-round 22a: BLAS-3 Panel Bidiagonalisation}
+
+The bidiagonalisation phase of \texttt{svdGKP} previously used a
+column-by-column Level-2 approach: each Householder reflector was
+applied immediately to the full trailing matrix via rank-1 updates.
+This has poor cache behaviour for large matrices because each update
+modifies the entire trailing submatrix, evicting useful data from cache.
+
+Round~22 introduces a DLABRD-style panel bidiagonalisation
+(GVL4~\S5.4.3) that processes $n_b$ columns at a time.  Within each
+panel, left and right Householder reflectors are computed while
+maintaining X and Y accumulator matrices that track the deferred
+trailing update.  After the panel, the trailing submatrix
+$A[k_0{+}n_b{:}m,\; k_0{+}n_b{:}n]$ is corrected via two rank-$n_b$
+GEMMs:
+\[
+  A_{\text{trail}} \mathrel{{-}{=}} V_L \cdot Y^\top + X \cdot V_R^\top
+\]
+This converts the $O(mn^2)$ bidiagonalisation work from Level-2 (GEMV)
+to Level-3 (GEMM) for the trailing update, with only $O(n_b \cdot mn)$
+Level-2 work within the panel.  The crossover is set at $n = 128$,
+with panel size $n_b = \min(32, \max(8, n/6))$.
+
+\subsection{Sub-round 22b: Tridiagonalisation Parameter Tuning}
+
+The panel tridiagonalisation (DLATRD-style) had conservative thresholds:
+panel crossover at $n = 128$ and maximum panel size 48.  Round~22
+lowers the crossover to $n = 64$ and raises the maximum panel size to
+64.  This enables the Level-3 panel approach for the $100{\times}100$
+eigendecomposition in \texttt{svdAtAP} (previously forced to Level-2)
+and gives larger panels at $n = 200\text{--}500$ for better GEMM
+amortisation.
+
+\subsection{Sub-round 22c: GEMM Packing Crossover}
+
+The GEMM micro-panel packing threshold was lowered from $n = 256$ to
+$n = 128$, enabling packed GEMM for medium-sized matrices that appear
+in the SVD and eigenvalue pipelines.
+
+\subsection{Sub-round 22d: Pre-Scaled V U-Recovery}
+
+The U-matrix recovery in \texttt{svdAtAP} previously computed
+$AV$ via GEMM and then column-scaled by $1/\sigma_j$ in a
+separate pass.  Round~22 pre-scales $V$ before the GEMM:
+$V_{\text{scaled}}[i,j] = V[i,j] / \sigma_j$, then computes
+$U = A \cdot V_{\text{scaled}}$ in a single GEMM.  For square
+matrices ($m = n$), the result is written directly into U,
+eliminating the intermediate $m{\times}n$ buffer.  The column
+scaling uses DoubleX4\# SIMD with a scalar tail loop.
+
+\subsection{Results}
+
+\begin{center}
+\begin{tabular}{lrrrl}
+\toprule
+\textbf{Size} & \textbf{hmatrix} & \textbf{lm (R22)} & \textbf{Ratio} & \textbf{vs.\ R21} \\
+\midrule
+SVD $50{\times}50$    & 465\,\textmu s & 805\,\textmu s & $1.73\times$ & $\downarrow$ 1.82 \\
+SVD $100{\times}100$  & 2.92\,ms  & 4.02\,ms  & $\mathbf{1.38\times}$ & $\approx$ 1.37 \\
+SVD $200{\times}200$  & 24.0\,ms  & 17.6\,ms  & $\mathbf{0.73\times}$ & $\downarrow$ 0.89 \\
+SVD $500{\times}500$  & 345\,ms   & 212\,ms   & $\mathbf{0.61\times}$ & $\approx$ 0.61 \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+The largest improvement is at $200{\times}200$: $0.89\times \to 0.73\times$
+($18\%$ improvement), now $37\%$ faster than hmatrix/LAPACK.  The
+$50{\times}50$ deficit improved from $1.82\times$ to $1.73\times$.
+SVD~$100{\times}100$ and $500{\times}500$ held steady.
 
 %% ####################################################################
 \part{Synthesis and Future Directions}
@@ -5012,13 +5088,13 @@ with the sole remaining deficit being SVD at $100{\times}100$ ($1.37\times$).
 
 \subsection{Consolidated Results}
 
-Table~\ref{tab:final-results} presents the final Round~21 benchmark
+Table~\ref{tab:final-results} presents the final Round~22 benchmark
 results across all fourteen benchmarked operation/size combinations.
 
 \begin{table}[h]
 \centering
 \caption{Final performance: \texttt{linear-massiv} vs.\ \texttt{hmatrix}
-(OpenBLAS/LAPACK), Round~21.  Ratios $< 1$ indicate \texttt{linear-massiv}
+(OpenBLAS/LAPACK), Round~22.  Ratios $< 1$ indicate \texttt{linear-massiv}
 is faster.}
 \label{tab:final-results}
 \begin{tabular}{lrrrc}
@@ -5036,22 +5112,21 @@ QR $100{\times}100$         & 140\,ms   & 2.75\,ms       & $0.020\times$ & $50.9
 eigenSH $100{\times}100$    & 2.63\,ms  & 2.54\,ms       & $0.96\times$ & $1.04\times$ \\
 eigenSH $200{\times}200$    & 16.1\,ms  & 10.1\,ms       & $0.63\times$ & $1.6\times$ \\
 eigenSH $500{\times}500$    & 240\,ms   & 118\,ms        & $0.49\times$ & $2.0\times$ \\
-SVD $100{\times}100$        & 3.23\,ms  & 4.41\,ms       & $\mathbf{1.37\times}$ & --- \\
-SVD $200{\times}200$        & 25.4\,ms  & 22.7\,ms       & $\mathbf{0.89\times}$ & $1.1\times$ \\
-SVD $500{\times}500$        & 346\,ms   & 212\,ms        & $\mathbf{0.61\times}$ & $1.6\times$ \\
+SVD $100{\times}100$        & 2.92\,ms  & 4.02\,ms       & $\mathbf{1.38\times}$ & --- \\
+SVD $200{\times}200$        & 24.0\,ms  & 17.6\,ms       & $\mathbf{0.73\times}$ & $1.4\times$ \\
+SVD $500{\times}500$        & 345\,ms   & 212\,ms        & $\mathbf{0.61\times}$ & $1.6\times$ \\
 \bottomrule
 \end{tabular}
 \end{table}
 
 At $500{\times}500$---the largest benchmarked size---\texttt{linear-massiv}
 outperforms \texttt{hmatrix} (OpenBLAS/LAPACK) in \textbf{all nine
-operation categories}.  Round~21's D\&C eigensolver dispatch in
-\texttt{svdAtAP} produced the largest SVD improvement since Round~6:
-SVD $200{\times}200$ moved from a $1.17\times$ deficit to $0.89\times$
-(now faster than LAPACK); SVD $500{\times}500$ improved from
-$0.77\times$ to $0.61\times$ ($1.6\times$ faster than LAPACK).  The
-sole remaining deficit is SVD at $100{\times}100$ ($1.37\times$, reduced
-from $1.59\times$).
+operation categories}.  Round~22's BLAS-3 panel bidiagonalisation and
+pipeline tuning produced the largest SVD improvement at $200{\times}200$:
+from $0.89\times$ to $0.73\times$ ($37\%$ faster than LAPACK).
+SVD $500{\times}500$ holds at $0.61\times$ ($1.6\times$ faster than
+LAPACK).  The sole remaining deficit is SVD at $100{\times}100$
+($1.38\times$).
 
 \subsection{Performance Trajectory}
 
@@ -5065,20 +5140,20 @@ optimisation narrowed and ultimately inverted the gap.
 selected rounds.  Values $< 1$ indicate linear-massiv is faster.}
 \label{tab:trajectory}
 \small
-\begin{tabular}{l@{\quad}r@{\quad}r@{\quad}r@{\quad}r@{\quad}r@{\quad}r@{\quad}r@{\quad}r@{\quad}r}
+\begin{tabular}{l@{\quad}r@{\quad}r@{\quad}r@{\quad}r@{\quad}r@{\quad}r@{\quad}r@{\quad}r@{\quad}r@{\quad}r}
 \toprule
-\textbf{Operation} & \textbf{R1} & \textbf{R3} & \textbf{R6} & \textbf{R10} & \textbf{R17} & \textbf{R18} & \textbf{R19} & \textbf{R20} & \textbf{R21} \\
+\textbf{Operation} & \textbf{R1} & \textbf{R3} & \textbf{R6} & \textbf{R10} & \textbf{R17} & \textbf{R18} & \textbf{R19} & \textbf{R20} & \textbf{R21} & \textbf{R22} \\
 \midrule
-GEMM $100{\times}100$    & $329\times$     & $0.50\times$ & $0.50\times$ & ---          & $0.16\times$ & $0.15\times$ & $0.15\times$ & $0.17\times$ & $=$ \\
-LU solve $100{\times}100$ & $295\times$    & ---          & $0.37\times$ & $0.37\times$ & $0.68\times$ & $0.68\times$ & $0.68\times$ & $0.47\times$ & $=$ \\
-Cholesky $100{\times}100$ & $240\times$    & ---          & $0.34\times$ & $0.34\times$ & $0.63\times$ & $0.48\times$ & $0.48\times$ & $0.51\times$ & $=$ \\
-QR $100{\times}100$       & ${\approx}260\times$ & ---    & $0.13\times$ & ---          & $0.022\times$& $0.021\times$ & $0.021\times$ & $0.020\times$ & $=$ \\
-eigenSH $100{\times}100$  & $897\times$    & ---          & $0.93\times$ & $0.97\times$ & $1.04\times$ & $1.18\times$ & $1.00\times$ & $0.96\times$ & $=$ \\
-eigenSH $200{\times}200$  & ---            & ---          & ---          & ---          & ---          & $1.19\times$ & $0.69\times$ & $0.63\times$ & $=$ \\
-SVD $100{\times}100$      & $887\times$    & ---          & $3.28\times$ & $2.38\times$ & $1.80\times$ & $1.78\times$ & $1.86\times$ & $1.59\times$ & $\mathbf{1.37\times}$ \\
-SVD $200{\times}200$      & ---            & ---          & ---          & ---          & ---          & $1.53\times$ & $0.98\times$ & $1.17\times$ & $\mathbf{0.89\times}$ \\
-eigenSH $500{\times}500$  & ---            & ---          & ---          & ---          & $0.51\times$ & $0.47\times$ & $0.48\times$ & $0.49\times$ & $=$ \\
-SVD $500{\times}500$      & ---            & ---          & ---          & ---          & $0.90\times$ & $0.76\times$ & $0.82\times$ & $0.77\times$ & $\mathbf{0.61\times}$ \\
+GEMM $100{\times}100$    & $329\times$     & $0.50\times$ & $0.50\times$ & ---          & $0.16\times$ & $0.15\times$ & $0.15\times$ & $0.17\times$ & $=$ & $=$ \\
+LU solve $100{\times}100$ & $295\times$    & ---          & $0.37\times$ & $0.37\times$ & $0.68\times$ & $0.68\times$ & $0.68\times$ & $0.47\times$ & $=$ & $=$ \\
+Cholesky $100{\times}100$ & $240\times$    & ---          & $0.34\times$ & $0.34\times$ & $0.63\times$ & $0.48\times$ & $0.48\times$ & $0.51\times$ & $=$ & $=$ \\
+QR $100{\times}100$       & ${\approx}260\times$ & ---    & $0.13\times$ & ---          & $0.022\times$& $0.021\times$ & $0.021\times$ & $0.020\times$ & $=$ & $=$ \\
+eigenSH $100{\times}100$  & $897\times$    & ---          & $0.93\times$ & $0.97\times$ & $1.04\times$ & $1.18\times$ & $1.00\times$ & $0.96\times$ & $=$ & $=$ \\
+eigenSH $200{\times}200$  & ---            & ---          & ---          & ---          & ---          & $1.19\times$ & $0.69\times$ & $0.63\times$ & $=$ & $=$ \\
+SVD $100{\times}100$      & $887\times$    & ---          & $3.28\times$ & $2.38\times$ & $1.80\times$ & $1.78\times$ & $1.86\times$ & $1.59\times$ & $1.37\times$ & $\mathbf{1.38\times}$ \\
+SVD $200{\times}200$      & ---            & ---          & ---          & ---          & ---          & $1.53\times$ & $0.98\times$ & $1.17\times$ & $0.89\times$ & $\mathbf{0.73\times}$ \\
+eigenSH $500{\times}500$  & ---            & ---          & ---          & ---          & $0.51\times$ & $0.47\times$ & $0.48\times$ & $0.49\times$ & $=$ & $=$ \\
+SVD $500{\times}500$      & ---            & ---          & ---          & ---          & $0.90\times$ & $0.76\times$ & $0.82\times$ & $0.77\times$ & $0.61\times$ & $\mathbf{0.61\times}$ \\
 \bottomrule
 \end{tabular}
 \end{table}
@@ -5116,13 +5191,20 @@ The trajectory reveals five distinct phases:
   $200{\times}200$ moved from $1.17\times$ deficit to $0.89\times$
   (faster than LAPACK); SVD $500{\times}500$ from $0.77\times$ to
   $0.61\times$.  All nine categories now faster at $200{\times}200$.
+\item \textbf{Round~22 (BLAS-3 pipeline tuning):} DLABRD-style panel
+  bidiagonalisation for \texttt{svdGKP}, tridiagonalisation parameter
+  tuning (crossover $128 \to 64$, max panel $48 \to 64$), GEMM packing
+  crossover lowered ($256 \to 128$), and pre-scaled V U-recovery for
+  \texttt{svdAtAP}.  SVD $200{\times}200$ improved from $0.89\times$
+  to $0.73\times$ ($37\%$ faster than LAPACK); SVD $50{\times}50$
+  from $1.82\times$ to $1.73\times$.
 \end{enumerate}
 
 %% ====================================================================
 \section{Lessons Learned}
 \label{sec:lessons}
 
-The twenty-one rounds of optimisation yield several cross-cutting
+The twenty-two rounds of optimisation yield several cross-cutting
 observations about high-performance numerical computing in Haskell.
 
 \subsection{The ByteArray\# Breakthrough}
@@ -5240,7 +5322,7 @@ LAPACK \texttt{dgesdd} & Best ($\kappa$ preserved) & Reference \\
 LAPACK achieves both numerical quality \emph{and} performance because
 its Golub--Kahan path has been optimised for decades with highly-tuned
 Fortran BLAS-3 bidiagonalisation routines (\texttt{DGEBRD},
-\texttt{DBDSDC}).  The remaining $1.37\times$ SVD deficit at
+\texttt{DBDSDC}).  The remaining $1.38\times$ SVD deficit at
 $100{\times}100$ therefore reflects two compounding factors:
 (a)~\texttt{svdAtAP}'s $A^\top A$ approach is faster but numerically
 inferior, and (b)~the numerically proper \texttt{svdGKP} path has not
@@ -5364,9 +5446,9 @@ performance in the inner kernels.
 \section{When to Use Each Library}
 \label{sec:when-to-use}
 
-The twenty-one rounds of optimisation have substantially changed the
+The twenty-two rounds of optimisation have substantially changed the
 competitive landscape.  The following recommendations reflect the
-Round~21 state.
+Round~22 state.
 
 \begin{description}
 \item[\texttt{linear}] Best for $2\text{--}4$ dimensional vectors and
@@ -5378,8 +5460,8 @@ Round~21 state.
 \item[\texttt{hmatrix}] Still relevant for SVD at $n \leq 100$, where
   LAPACK's direct bidiagonalisation retains an advantage over
   \texttt{linear-massiv}'s $A^\top A$ eigendecomposition approach
-  ($1.37\times$ at $100{\times}100$).  At $200{\times}200$ and above,
-  \texttt{linear-massiv} is now faster.
+  ($1.38\times$ at $100{\times}100$).  At $200{\times}200$ and above,
+  \texttt{linear-massiv} is now faster ($0.73\times$).
   Also appropriate when existing codebases depend on its API, or when the
   full breadth of LAPACK routines (sparse solvers, banded systems,
   generalised eigenproblems) is needed---operations that
@@ -5390,7 +5472,8 @@ Round~21 state.
   eight of nine at $100{\times}100$.  EigenSH is $1.04\times$ faster at
   $100{\times}100$ and $1.6\times$ faster at $200{\times}200$; SVD is
   $1.1\times$ faster at $200{\times}200$ and $1.6\times$ faster at
-  $500{\times}500$; LU solve is $2.1\times$ faster at $100{\times}100$.
+  $500{\times}500$; SVD is $1.4\times$ faster at $200{\times}200$;
+  LU solve is $2.1\times$ faster at $100{\times}100$.
   Offers compile-time dimensional safety via \texttt{KnownNat},
   zero FFI dependencies (pure Haskell with GHC SIMD primops), and
   user-controllable parallelism via massiv's computation strategies.
@@ -5403,19 +5486,21 @@ Round~21 state.
 \section{Future Optimisation Opportunities}
 \label{sec:future-optimisations}
 
-After twenty-one rounds of optimisation, \texttt{linear-massiv}
+After twenty-two rounds of optimisation, \texttt{linear-massiv}
 outperforms hmatrix (OpenBLAS/LAPACK) in all nine categories at
-$200{\times}200$ and above.  Rounds~20--21 implemented seven of the
-nine optimisations proposed after Round~19, plus the D\&C bidiagonal SVD
-and D\&C eigensolver dispatch that closed the SVD gap at $n \geq 200$.
-The sole remaining deficit is SVD at $100{\times}100$ ($1.37\times$).
+$200{\times}200$ and above.  Rounds~20--22 implemented seven of the
+nine optimisations proposed after Round~19, plus the D\&C bidiagonal SVD,
+D\&C eigensolver dispatch, BLAS-3 panel bidiagonalisation, and pipeline
+tuning that closed the SVD gap at $n \geq 200$.
+The sole remaining deficit is SVD at $100{\times}100$ ($1.38\times$).
 
-The roadmap below is revised to reflect the post-Round~21 state.
+The roadmap below is revised to reflect the post-Round~22 state.
 Items~1--7 from the previous roadmap are implemented
 (Section~\ref{sec:round20}); the D\&C bidiagonal SVD and eigensolver
-dispatch are implemented in Section~\ref{sec:round21}.  Remaining
-opportunities focus on infrastructure scaling and future GHC
-capabilities.
+dispatch are implemented in Section~\ref{sec:round21}; BLAS-3 panel
+bidiagonalisation and pipeline tuning are implemented in
+Section~\ref{sec:round22}.  Remaining opportunities focus on
+infrastructure scaling and future GHC capabilities.
 
 %% ------------------------------------------------------------------
 \subsection{Implemented in Round~20}
@@ -5632,8 +5717,9 @@ AVX-512 hardware and empirical testing of LLVM's register allocator
 behaviour with 512-bit types (Section~\ref{sec:future-avx512}).
 
 Of the original nine proposed optimisations, seven were implemented in
-Round~20 (Sub-rounds 20a--20h), and Round~21 added D\&C bidiagonal SVD
-and D\&C eigensolver dispatch.  The two remaining items (cache
+Round~20 (Sub-rounds 20a--20h), Round~21 added D\&C bidiagonal SVD
+and D\&C eigensolver dispatch, and Round~22 added BLAS-3 panel
+bidiagonalisation and pipeline tuning.  The two remaining items (cache
 auto-tuning and AVX-512) are deferred for practical reasons, not
 technical blockers.
 
@@ -5645,10 +5731,11 @@ Three empirically eliminated targets remain excluded:
   $20\text{--}30\%$ regression.  This is a GHC/LLVM code generator
   limitation, not an algorithmic one.
 \item \textbf{Raw \texttt{svdGKP} as drop-in default} ---
-  \textit{partially addressed in Round~21.}  The D\&C bidiagonal SVD
-  (Round~21a) improved \texttt{svdGKP} by ${\sim}20\%$, but it remains
-  $2\text{--}3\times$ slower than \texttt{svdAtAP} due to higher
-  constant factors in the bidiagonalisation + D\&C merge pipeline.
+  \textit{partially addressed in Rounds~21--22.}  The D\&C bidiagonal SVD
+  (Round~21a) and BLAS-3 panel bidiagonalisation (Round~22a) improved
+  \texttt{svdGKP}, but it remains $2\text{--}3\times$ slower than
+  \texttt{svdAtAP} due to higher constant factors in the
+  bidiagonalisation + D\&C merge pipeline.
 \item \textbf{D\&C eigensolver crossover below $n = 1000$} ---
   \textit{addressed in Round~21.}  The D\&C eigensolver is now used
   directly in \texttt{svdAtAP} for $n \geq 50$ (Round~21b), where it
@@ -5660,7 +5747,7 @@ Three empirically eliminated targets remain excluded:
   ratios.
 \end{itemize}
 
-The remaining SVD deficit ($1.37\times$ at $100{\times}100$) reflects
+The remaining SVD deficit ($1.38\times$ at $100{\times}100$) reflects
 a fundamental tradeoff between performance and numerical quality
 (Section~\ref{sec:svd-tradeoff}).  The fastest path (\texttt{svdAtAP})
 uses the numerically inferior $A^\top A$ eigendecomposition, which
@@ -5709,7 +5796,7 @@ not expected to yield gains at the sizes benchmarked here.
 \label{sec:conclusion}
 
 We have benchmarked three Haskell linear algebra libraries across nine
-categories of numerical operations through twenty-one rounds of optimisation.
+categories of numerical operations through twenty-two rounds of optimisation.
 The consolidated results (Section~\ref{sec:final-summary}) and
 cross-cutting lessons (Section~\ref{sec:lessons}) synthesise the key
 findings; the per-round summaries below preserve the chronological
@@ -5898,7 +5985,7 @@ single-threaded and parallel), dot product ($0.25\times$),
 matrix--vector multiply ($0.44\times$), LU solve ($0.47\times$),
 Cholesky solve ($0.51\times$), QR factorisation ($0.020\times$),
 eigenvalue decomposition ($0.49\text{--}0.96\times$), and SVD
-($0.61\text{--}1.37\times$).  At $500{\times}500$---the largest
+($0.61\text{--}1.38\times$).  At $500{\times}500$---the largest
 benchmark size---every category is faster than hmatrix/LAPACK, with
 SVD $1.6\times$ faster ($0.61\times$).
 
@@ -5917,12 +6004,14 @@ the key is to push the abstraction boundary below the hot loop via raw
 primops, while retaining type-safe APIs at the library boundary.
 Section~\ref{sec:future-optimisations} identifies two remaining
 optimisation opportunities (cache auto-tuning and AVX-512) that target
-scaling to other hardware and future GHC capabilities.  Round~21's
-D\&C eigensolver dispatch in \texttt{svdAtAP} proved the most impactful
-single change for SVD since Round~6: the D\&C's GEMM-dominated
-eigenvector accumulation leverages the $6\text{--}12\times$ faster GEMM
-kernel, making it dramatically cheaper than QR iteration's scalar
-Givens sweeps.
+scaling to other hardware and future GHC capabilities.  Rounds~21--22
+produced the most impactful SVD improvements since Round~6: the D\&C
+eigensolver dispatch (Round~21) and BLAS-3 panel bidiagonalisation
+(Round~22) leverage the $6\text{--}12\times$ faster GEMM kernel,
+converting scalar Givens sweeps and Level-2 Householder updates into
+GEMM-dominated computation.  SVD $200{\times}200$ moved from
+$1.17\times$ deficit (Round~20) to $0.73\times$ ($37\%$ faster than
+LAPACK).
 
 %% ====================================================================
 \begin{thebibliography}{9}

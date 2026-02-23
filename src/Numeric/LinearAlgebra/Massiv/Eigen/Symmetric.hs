@@ -176,7 +176,7 @@ tridiagonalizeP a =
       -- Phase 1: In-place Householder tridiagonalisation
       -- For n < panelCrossover: per-column Level-2 (rank-2 update per step)
       -- For n >= panelCrossover: DLATRD-style panel factorisation (Level-3 SYR2K)
-      panelCrossover = 128
+      panelCrossover = 64
       (betaList, tArr) = M.withMArrayST (unMatrix a) $ \mt -> do
         let !mbaT = unwrapMutableByteArray mt
             !offT = unwrapMutableByteArrayOffset mt
@@ -188,7 +188,7 @@ tridiagonalizeP a =
             betas <- mapM (\k -> tridiagStepP mbaT offT nn mbaV mbaP mbaW k) [0..nn-3]
             pure betas
           else do
-            let !nb = min 48 (max 16 (nn `div` 4))
+            let !nb = min 64 (max 16 (nn `div` 4))
                 !numRef = nn - 2  -- number of Householder reflectors
             -- V_panel (nn × nb) and W_panel (nn × nb) for deferred rank-2 updates
             mbaVp <- newByteArray (nn * nb * 8)

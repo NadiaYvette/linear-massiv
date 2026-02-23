@@ -54,7 +54,7 @@ import GHC.ST (ST(..))
 
 import Numeric.LinearAlgebra.Massiv.Types
 import Numeric.LinearAlgebra.Massiv.Internal
-import Numeric.LinearAlgebra.Massiv.BLAS.Level3 (matMul, matMulP, transpose, matMulAtAP)
+import Numeric.LinearAlgebra.Massiv.BLAS.Level3 (matMul, transpose, matMulAtAP)
 -- matvecP no longer needed: U-matrix now computed via single GEMM
 import Numeric.LinearAlgebra.Massiv.Eigen.Symmetric
   ( symmetricEigen, symmetricEigenP, symmetricEigenPDC
@@ -199,69 +199,91 @@ svdAtAP a =
             !(I# pj#) = indexPermArray permBA j
             ev = case indexDoubleArray# baEV# (offEV# +# pj#) of v_ -> D# v_
         in if ev > 0 then sqrt ev else 0
-      -- Compute U = A·V via single GEMM, then scale columns by 1/σ_j
-      !av = matMulP a v  -- m×n result via SIMD GEMM
-      u = createMatrix @m @m @M.P $ \mu -> do
-        let !baAV  = unwrapByteArray (unMatrix av)
-            !offAV = unwrapByteArrayOffset (unMatrix av)
-            !mbaU  = unwrapMutableByteArray mu
-            !offU  = unwrapMutableByteArrayOffset mu
-            !(MutableByteArray mbaU#) = mbaU
-            !(I# offU#) = offU
-            !(I# mm#) = mm
-            !(I# nn#) = nn
-            !nn4 = nn - (nn `rem` 4)
-            !(I# nn4#) = nn4
-            !(I# mmxmm#) = mm * mm
-        -- Zero-initialise only the padding region U[i, nn..mm-1] when mm > nn.
-        -- The SIMD loop below fills all U[i, 0..nn-1], so no zeroing needed there.
-        when (mm > nn) $
-          ST $ \s0 ->
-            let goZ i s
-                  | isTrue# (i >=# mm#) = s
-                  | otherwise =
-                      let goCol j s1
-                            | isTrue# (j >=# mm#) = s1
-                            | otherwise = case writeDoubleArray# mbaU# (offU# +# i *# mm# +# j) 0.0## s1 of
-                                            s2 -> goCol (j +# 1#) s2
-                      in goZ (i +# 1#) (goCol nn# s)
-            in (# goZ 0# s0, () #)
-        -- Pre-compute invSigma vector, then freeze for immutable SIMD reads
+      -- Compute U = A · V · diag(1/σ) via pre-scaled V and single GEMM.
+      -- This avoids the intermediate m×n AV matrix and a separate scaling pass.
+      -- V_scaled[i,j] = V[i,j] / σ_j (zero for σ_j ≤ ε).
+      !vScaled = createMatrix @n @n @M.P @Double $ \mvs -> do
+        let !baV   = unwrapByteArray (unMatrix v)
+            !offVs = unwrapByteArrayOffset (unMatrix v)
+            !mbaVS = unwrapMutableByteArray mvs
+            !offVS = unwrapMutableByteArrayOffset mvs
+        -- Pre-compute invSigma
         mbaInvS <- newByteArray (nn * 8)
         forM_ [0..nn-1] $ \j -> do
           let sj = sigma !. j
           writeRawD mbaInvS 0 j (if sj > 1e-14 then 1.0 / sj else 0.0)
         !(ByteArray baInvS#) <- unsafeFreezeByteArray mbaInvS
-        -- Row-oriented SIMD column-scaling: U[i,j] = invSigma[j] * AV[i,j]
-        -- Both AV[i,0..nn-1] and U[i,0..nn-1] are contiguous in row-major layout
-        let !(ByteArray baAV#) = baAV
-            !(I# offAV#) = offAV
-        -- SIMD row loop (immutable reads for AV and invSigma, mutable writes for U)
+        -- Scale each column: V_scaled[i,j] = V[i,j] * invSigma[j]
+        let !(ByteArray baV#) = baV
+            !(I# offVs#) = offVs
+            !(MutableByteArray mbaVS#) = mbaVS
+            !(I# offVS#) = offVS
+            !(I# nnV#) = nn
+            !nn4 = nn - (nn `rem` 4)
+            !(I# nn4#) = nn4
         ST $ \s0 ->
           let goRow i s
-                | isTrue# (i >=# mm#) = s
+                | isTrue# (i >=# nnV#) = s
                 | otherwise =
-                    let !avRowOff = offAV# +# i *# nn#
-                        !uRowOff  = offU# +# i *# mm#
-                        -- SIMD phase: process 4 columns at a time
+                    let !srcOff = offVs# +# i *# nnV#
+                        !dstOff = offVS# +# i *# nnV#
                         goSimd j s1
                           | isTrue# (j >=# nn4#) = s1
                           | otherwise =
-                              let avV  = indexDoubleArrayAsDoubleX4# baAV# (avRowOff +# j)
-                                  isV  = indexDoubleArrayAsDoubleX4# baInvS# j
-                                  !prod = timesDoubleX4# avV isV
-                              in case writeDoubleArrayAsDoubleX4# mbaU# (uRowOff +# j) prod s1 of
+                              let vv = indexDoubleArrayAsDoubleX4# baV# (srcOff +# j)
+                                  sv = indexDoubleArrayAsDoubleX4# baInvS# j
+                                  !p  = timesDoubleX4# vv sv
+                              in case writeDoubleArrayAsDoubleX4# mbaVS# (dstOff +# j) p s1 of
                                    s2 -> goSimd (j +# 4#) s2
-                        -- Scalar cleanup for remainder columns
                         goScalar j s1
-                          | isTrue# (j >=# nn#) = s1
+                          | isTrue# (j >=# nnV#) = s1
                           | otherwise =
-                              let avVal = indexDoubleArray# baAV# (avRowOff +# j)
-                                  isVal = indexDoubleArray# baInvS# j
-                              in case writeDoubleArray# mbaU# (uRowOff +# j) (avVal *## isVal) s1 of
+                              let vVal = indexDoubleArray# baV# (srcOff +# j)
+                                  sVal = indexDoubleArray# baInvS# j
+                              in case writeDoubleArray# mbaVS# (dstOff +# j) (vVal *## sVal) s1 of
                                    s2 -> goScalar (j +# 1#) s2
                     in goRow (i +# 1#) (goScalar nn4# (goSimd 0# s))
           in (# goRow 0# s0, () #)
+      -- U = A · V_scaled: GEMM writes m×n result directly.
+      -- For mm == nn (square), GEMM writes directly into U.
+      -- For mm > nn (rectangular), GEMM writes into temp then copy columns.
+      u = createMatrix @m @m @M.P $ \mu -> do
+        let !mbaU  = unwrapMutableByteArray mu
+            !offU  = unwrapMutableByteArrayOffset mu
+            !(I# mm#) = mm
+        -- Zero all of U
+        rawZeroDoubles mbaU offU (mm * mm)
+        let !baA  = unwrapByteArray (unMatrix a)
+            !offA = unwrapByteArrayOffset (unMatrix a)
+            !baVS = unwrapByteArray (unMatrix vScaled)
+            !offVS = unwrapByteArrayOffset (unMatrix vScaled)
+        if mm == nn
+          then
+            -- Direct GEMM into U (stride mm == nn, so layout matches)
+            rawGemmKernel baA offA baVS offVS mbaU offU mm nn nn
+          else do
+            -- GEMM into temp (m×n), then copy columns into U (m×m)
+            mbaTemp <- newByteArray (mm * nn * 8)
+            rawZeroDoubles mbaTemp 0 (mm * nn)
+            rawGemmKernel baA offA baVS offVS mbaTemp 0 mm nn nn
+            baTemp <- unsafeFreezeByteArray mbaTemp
+            -- Copy: U[i, 0..nn-1] = temp[i, 0..nn-1]
+            let !(ByteArray baT#) = baTemp
+                !(MutableByteArray mbaU#) = mbaU
+                !(I# offU#) = offU
+                !(I# nn#) = nn
+            ST $ \s0 ->
+              let goCopy i s
+                    | isTrue# (i >=# mm#) = s
+                    | otherwise =
+                        let goCol j s1
+                              | isTrue# (j >=# nn#) = s1
+                              | otherwise =
+                                  let !val = indexDoubleArray# baT# (i *# nn# +# j)
+                                  in case writeDoubleArray# mbaU# (offU# +# i *# mm# +# j) val s1 of
+                                       s2 -> goCol (j +# 1#) s2
+                        in goCopy (i +# 1#) (goCol 0# s)
+              in (# goCopy 0# s0, () #)
         -- Fix zero singular values: set diagonal U[j,j] = 1.0
         forM_ [0..nn-1] $ \j -> do
           let sj = sigma !. j
@@ -352,8 +374,8 @@ svdGKP (MkMatrix a_) = runST $ do
   mbaBetaL <- newByteArray (nn * 8)  -- left Householder betas
   mbaBetaR <- newByteArray (nn * 8)  -- right Householder betas
 
-  -- Phase 1: Bidiagonalise A in-place
-  bidiagonalizeP mbaA offA mm nn mbaBetaL mbaBetaR
+  -- Phase 1: Bidiagonalise A in-place (BLAS-3 panel for large, Level-2 for small)
+  bidiagonalizePPanel mbaA offA mm nn mbaBetaL mbaBetaR
 
   -- Extract diagonal d and superdiagonal e from bidiagonalised A
   mbaD <- newByteArray (nn * 8)
@@ -674,6 +696,464 @@ bidiagonalizeP mbaA offA mm nn mbaBetaL mbaBetaR = do
       else
         when (k < nn - 1) $ writeRawD mbaBetaR 0 k 0
 {-# NOINLINE bidiagonalizeP #-}
+
+-- | BLAS-3 panel bidiagonalisation (DLABRD-style, GVL4 §5.4.3).
+-- Processes nb columns at a time, deferring trailing updates via X, Y
+-- accumulators and applying them as rank-nb GEMMs.
+-- Falls back to Level-2 bidiagonalizeP for n < panelBidiagCrossover.
+bidiagonalizePPanel :: MutableByteArray s -> Int -> Int -> Int
+                    -> MutableByteArray s -> MutableByteArray s -> ST s ()
+bidiagonalizePPanel mbaA offA mm nn mbaBetaL mbaBetaR
+  | nn < panelBidiagCrossover = bidiagonalizeP mbaA offA mm nn mbaBetaL mbaBetaR
+  | otherwise = do
+      let !nb = min 32 (max 8 (nn `div` 6))
+      -- Allocate accumulators: X (mm × nb), Y (nn × nb), row-major
+      mbaX <- newByteArray (mm * nb * 8)
+      mbaY <- newByteArray (nn * nb * 8)
+      -- Temp vectors for dot products
+      mbaZL <- newByteArray (nb * 8)  -- V_L^T * v or Y^T * u
+      mbaZX <- newByteArray (nb * 8)  -- X^T * v or V_R^T * u
+      -- Buffers for trailing GEMM
+      mbaVLbuf <- newByteArray (mm * nb * 8)
+      mbaYTbuf <- newByteArray (nb * nn * 8)
+      mbaXbuf  <- newByteArray (mm * nb * 8)
+      mbaVRTbuf <- newByteArray (nb * nn * 8)
+      mbaTrail <- newByteArray (mm * nn * 8)
+
+      let goPanel !k0
+            | k0 >= nn - 1 = pure ()
+            | otherwise = do
+                let !bs = min nb (nn - 1 - k0)
+                if bs < 2  -- last column: use Level-2
+                  then bidiagLastCols mbaA offA mm nn mbaBetaL mbaBetaR k0
+                  else do
+                    rawZeroDoubles mbaX 0 (mm * bs)
+                    rawZeroDoubles mbaY 0 (nn * bs)
+                    -- Panel phase
+                    panelBidiagStep mbaA offA mm nn mbaBetaL mbaBetaR
+                                    mbaX mbaY mbaZL mbaZX k0 bs
+                    -- Trailing update
+                    let !remR = mm - k0 - bs
+                        !remC = nn - k0 - bs
+                    when (remR > 0 && remC > 0) $
+                      applyTrailingUpdate mbaA offA mm nn mbaX mbaY
+                                          mbaVLbuf mbaYTbuf mbaXbuf mbaVRTbuf mbaTrail
+                                          k0 bs remR remC
+                    goPanel (k0 + bs)
+      goPanel 0
+  where
+    panelBidiagCrossover = 128
+{-# NOINLINE bidiagonalizePPanel #-}
+
+-- | Finish remaining columns with Level-2 bidiagonalisation.
+bidiagLastCols :: MutableByteArray s -> Int -> Int -> Int
+               -> MutableByteArray s -> MutableByteArray s -> Int -> ST s ()
+bidiagLastCols mbaA offA mm nn mbaBetaL mbaBetaR k0 = do
+  forM_ [k0..nn-1] $ \k -> do
+    -- Left Householder
+    if k < mm - 1
+      then do
+        sigma <- rawMutSumSqColumn mbaA offA nn (k+1) mm k
+        x0 <- readRawD mbaA offA (k * nn + k)
+        if sigma < 1e-300
+          then writeRawD mbaBetaL 0 k 0
+          else do
+            let mu = sqrt (x0 * x0 + sigma)
+                v0 = if x0 <= 0 then x0 - mu else -sigma / (x0 + mu)
+                beta = 2 * v0 * v0 / (sigma + v0 * v0)
+            forM_ [k+1..mm-1] $ \i -> do
+              aik <- readRawD mbaA offA (i * nn + k)
+              writeRawD mbaA offA (i * nn + k) (aik / v0)
+            writeRawD mbaA offA (k * nn + k) mu
+            writeRawD mbaBetaL 0 k beta
+            forM_ [k+1..nn-1] $ \col ->
+              rawMutHouseholderApply mbaA offA nn beta k mm col
+      else writeRawD mbaBetaL 0 k 0
+    -- Right Householder
+    if k < nn - 2
+      then do
+        sigma <- rawMutSumSqRow mbaA offA nn k (k+2) nn
+        x0 <- readRawD mbaA offA (k * nn + (k+1))
+        if sigma < 1e-300
+          then writeRawD mbaBetaR 0 k 0
+          else do
+            let mu = sqrt (x0 * x0 + sigma)
+                v0 = if x0 <= 0 then x0 - mu else -sigma / (x0 + mu)
+                beta = 2 * v0 * v0 / (sigma + v0 * v0)
+            forM_ [k+2..nn-1] $ \j -> do
+              akj <- readRawD mbaA offA (k * nn + j)
+              writeRawD mbaA offA (k * nn + j) (akj / v0)
+            writeRawD mbaA offA (k * nn + (k+1)) mu
+            writeRawD mbaBetaR 0 k beta
+            forM_ [k+1..mm-1] $ \row ->
+              rawMutHouseholderApplyRow mbaA offA nn beta k (k+1) nn row
+      else when (k < nn - 1) $ writeRawD mbaBetaR 0 k 0
+
+-- | DLABRD-style panel step: compute bs left/right Householder reflectors
+-- starting at column k0, maintaining X and Y accumulators.
+-- After this, A_eff[i,c] = A[i,c] - V_L[i,:]*Y[c,:]^T - X[i,:]*V_R[c,:]^T
+-- for all i >= k0+bs, c >= k0+bs.
+panelBidiagStep :: MutableByteArray s -> Int -> Int -> Int
+                -> MutableByteArray s -> MutableByteArray s
+                -> MutableByteArray s -> MutableByteArray s
+                -> MutableByteArray s -> MutableByteArray s
+                -> Int -> Int -> ST s ()
+panelBidiagStep mbaA offA mm nn mbaBetaL mbaBetaR mbaX mbaY mbaZL mbaZX k0 bs = do
+  forM_ [0..bs-1] $ \j -> do
+    let !k = k0 + j
+
+    -- ================================================================
+    -- PART A: Left Householder on column k
+    -- ================================================================
+
+    -- Step A1: Read corrected column k into A (in-place correction for rows k..m-1).
+    -- A_corr[i,k] = A[i,k] - sum_{l<j} V_L[i,l]*Y[k,l] - sum_{l<j} X[i,l]*V_R[k,l]
+    when (j > 0) $
+      forM_ [k..mm-1] $ \i -> do
+        aik <- readRawD mbaA offA (i * nn + k)
+        -- V_L[i,l] * Y[k,l] sum
+        cVLY <- panelDot_VLY mbaA offA nn mbaY bs k0 i k j
+        -- X[i,l] * V_R[k,l] sum
+        cXVR <- panelDot_XVR mbaA offA nn mbaX bs k0 i k j
+        writeRawD mbaA offA (i * nn + k) (aik - cVLY - cXVR)
+
+    -- Step A2: Left Householder from corrected column k, rows k..m-1
+    if k < mm - 1
+      then do
+        sigma <- rawMutSumSqColumn mbaA offA nn (k+1) mm k
+        x0 <- readRawD mbaA offA (k * nn + k)
+        if sigma < 1e-300
+          then do
+            writeRawD mbaBetaL 0 k 0
+            -- Zero Y column j
+            forM_ [0..nn-1] $ \c -> writeRawD mbaY 0 (c * bs + j) 0
+          else do
+            let mu = sqrt (x0 * x0 + sigma)
+                v0 = if x0 <= 0 then x0 - mu else -sigma / (x0 + mu)
+                beta = 2 * v0 * v0 / (sigma + v0 * v0)
+            -- Normalise and store HH vector in column k
+            forM_ [k+1..mm-1] $ \i -> do
+              aik <- readRawD mbaA offA (i * nn + k)
+              writeRawD mbaA offA (i * nn + k) (aik / v0)
+            writeRawD mbaA offA (k * nn + k) mu
+            writeRawD mbaBetaL 0 k beta
+
+            -- Step A3: Compute Y column j
+            -- Precompute zL[l] = V_L[:,l]^T * v for l = 0..j-1
+            forM_ [0..j-1] $ \l -> do
+              d <- dotVL_v mbaA offA nn k0 k mm l
+              writeRawD mbaZL 0 l d
+            -- Precompute zX[l] = X[:,l]^T * v for l = 0..j-1
+            forM_ [0..j-1] $ \l -> do
+              d <- dotX_v mbaA offA nn mbaX bs k mm l
+              writeRawD mbaZX 0 l d
+            -- Y[c, j] = beta * (A^T*v[c] - sum_l Y[c,l]*zL[l] - sum_l V_R[c,l]*zX[l])
+            forM_ [0..k] $ \c -> writeRawD mbaY 0 (c * bs + j) 0
+            forM_ [k+1..nn-1] $ \c -> do
+              atv <- dotAT_v mbaA offA nn k mm c
+              ycorr <- dotAccum mbaY bs c mbaZL j
+              vrcorr <- dotVR_zX mbaA offA nn k0 mbaZX c j
+              writeRawD mbaY 0 (c * bs + j) (beta * (atv - ycorr - vrcorr))
+      else do
+        writeRawD mbaBetaL 0 k 0
+        forM_ [0..nn-1] $ \c -> writeRawD mbaY 0 (c * bs + j) 0
+
+    -- ================================================================
+    -- PART B: Correct row k, then right Householder (if applicable)
+    -- ================================================================
+
+    -- Step B1: ALWAYS correct row k for columns k+1..n-1.
+    -- This is needed both for the right HH (if k < nn-2) and for the
+    -- superdiagonal entry e[k] = A[k, k+1] and trailing column values.
+    -- A_eff[k,c] = A[k,c] - sum_{l<=j} V_L[k,l]*Y[c,l] - sum_{l<j} X[k,l]*V_R[c,l]
+    when (k < nn - 1) $
+      forM_ [k+1..nn-1] $ \c -> do
+        akc <- readRawD mbaA offA (k * nn + c)
+        cVLY <- panelDot_VLY mbaA offA nn mbaY bs k0 k c (j+1)
+        cXVR <- panelDot_XVR mbaA offA nn mbaX bs k0 k c j
+        writeRawD mbaA offA (k * nn + c) (akc - cVLY - cXVR)
+
+    -- Step B2: Right Householder from corrected row k (only if k < nn-2)
+    if k < nn - 2
+      then do
+        sigma <- rawMutSumSqRow mbaA offA nn k (k+2) nn
+        x0 <- readRawD mbaA offA (k * nn + (k+1))
+        if sigma < 1e-300
+          then do
+            writeRawD mbaBetaR 0 k 0
+            forM_ [0..mm-1] $ \i -> writeRawD mbaX 0 (i * bs + j) 0
+          else do
+            let mu = sqrt (x0 * x0 + sigma)
+                v0 = if x0 <= 0 then x0 - mu else -sigma / (x0 + mu)
+                gamma = 2 * v0 * v0 / (sigma + v0 * v0)
+            forM_ [k+2..nn-1] $ \c -> do
+              akc <- readRawD mbaA offA (k * nn + c)
+              writeRawD mbaA offA (k * nn + c) (akc / v0)
+            writeRawD mbaA offA (k * nn + (k+1)) mu
+            writeRawD mbaBetaR 0 k gamma
+
+            -- Step B3: Compute X column j
+            -- Precompute zL'[l] = Y[:,l]^T * u for l = 0..j
+            forM_ [0..j] $ \l -> do
+              d <- dotY_u mbaA offA nn mbaY bs k l
+              writeRawD mbaZL 0 l d
+            -- Precompute zX'[l] = V_R[:,l]^T * u for l = 0..j-1
+            forM_ [0..j-1] $ \l -> do
+              d <- dotVR_u mbaA offA nn k0 k l
+              writeRawD mbaZX 0 l d
+            -- X[i, j] = gamma * (A*u[i] - sum_l V_L[i,l]*zL'[l] - sum_l X[i,l]*zX'[l])
+            forM_ [0..k] $ \i -> writeRawD mbaX 0 (i * bs + j) 0
+            forM_ [k+1..mm-1] $ \i -> do
+              au <- dotA_u mbaA offA nn k i
+              vlcorr <- dotVL_zL mbaA offA nn k0 mbaZL i (j+1)
+              xcorr <- dotX_zX mbaX bs mbaZX i j
+              writeRawD mbaX 0 (i * bs + j) (gamma * (au - vlcorr - xcorr))
+      else do
+        when (k < nn - 1) $ writeRawD mbaBetaR 0 k 0
+        forM_ [0..mm-1] $ \i -> writeRawD mbaX 0 (i * bs + j) 0
+
+-- Helper: sum_l V_L[i,l]*Y[c,l] for l = 0..nL-1
+panelDot_VLY :: MutableByteArray s -> Int -> Int -> MutableByteArray s -> Int
+             -> Int -> Int -> Int -> Int -> ST s Double
+panelDot_VLY mbaA offA nn mbaY bs k0 i c nL = go 0 0
+  where
+    go !l !acc
+      | l >= nL = pure acc
+      | otherwise = do
+          let !kl = k0 + l
+          vl <- if i == kl then pure 1.0
+                else if i > kl then readRawD mbaA offA (i * nn + kl)
+                else pure 0.0
+          ycl <- readRawD mbaY 0 (c * bs + l)
+          go (l+1) (acc + vl * ycl)
+
+-- Helper: sum_l X[i,l]*V_R[c,l] for l = 0..nR-1
+panelDot_XVR :: MutableByteArray s -> Int -> Int -> MutableByteArray s -> Int
+             -> Int -> Int -> Int -> Int -> ST s Double
+panelDot_XVR mbaA offA nn mbaX bs k0 i c nR = go 0 0
+  where
+    go !l !acc
+      | l >= nR = pure acc
+      | otherwise = do
+          xil <- readRawD mbaX 0 (i * bs + l)
+          let !kl = k0 + l
+          vr <- if c == kl + 1 then pure 1.0
+                else if c > kl + 1 then readRawD mbaA offA (kl * nn + c)
+                else pure 0.0
+          go (l+1) (acc + xil * vr)
+
+-- Helper: V_L[:,l]^T * v where v = [1, A[k+1:m-1, k]]
+dotVL_v :: MutableByteArray s -> Int -> Int -> Int -> Int -> Int -> Int -> ST s Double
+dotVL_v mbaA offA nn k0 k mm l = do
+  -- v[i-k]: v[0]=1, v[i-k]=A[i,k] for i>k
+  -- V_L[i,l]: 1 if i==kl, A[i,kl] if i>kl, 0 if i<kl
+  -- Since k >= k0+j and l < j, kl < k, so V_L[k,l] = A[k,kl]
+  vlk <- readRawD mbaA offA (k * nn + kl)
+  go (k+1) vlk
+  where
+    !kl = k0 + l
+    go !i !acc
+      | i >= mm = pure acc
+      | otherwise = do
+          vli <- readRawD mbaA offA (i * nn + kl)
+          vi  <- readRawD mbaA offA (i * nn + k)
+          go (i+1) (acc + vli * vi)
+
+-- Helper: X[:,l]^T * v where v = [1, A[k+1:m-1, k]]
+dotX_v :: MutableByteArray s -> Int -> Int -> MutableByteArray s -> Int
+       -> Int -> Int -> Int -> ST s Double
+dotX_v mbaA offA nn mbaX bs k mm l = do
+  xkl <- readRawD mbaX 0 (k * bs + l)
+  go (k+1) xkl
+  where
+    go !i !acc
+      | i >= mm = pure acc
+      | otherwise = do
+          xil <- readRawD mbaX 0 (i * bs + l)
+          vi  <- readRawD mbaA offA (i * nn + k)
+          go (i+1) (acc + xil * vi)
+
+-- Helper: A^T * v at column c, where v = [1, A[k+1:m-1, k]]
+dotAT_v :: MutableByteArray s -> Int -> Int -> Int -> Int -> Int -> ST s Double
+dotAT_v mbaA offA nn k mm c = do
+  akc <- readRawD mbaA offA (k * nn + c)
+  go (k+1) akc
+  where
+    go !i !acc
+      | i >= mm = pure acc
+      | otherwise = do
+          aic <- readRawD mbaA offA (i * nn + c)
+          vi  <- readRawD mbaA offA (i * nn + k)
+          go (i+1) (acc + aic * vi)
+
+-- Helper: sum_l Y[c,l]*zL[l] for l = 0..nL-1
+dotAccum :: MutableByteArray s -> Int -> Int -> MutableByteArray s -> Int -> ST s Double
+dotAccum mbaY bs c mbaZL nL = go 0 0
+  where
+    go !l !acc
+      | l >= nL = pure acc
+      | otherwise = do
+          ycl <- readRawD mbaY 0 (c * bs + l)
+          zl  <- readRawD mbaZL 0 l
+          go (l+1) (acc + ycl * zl)
+
+-- Helper: sum_l V_R[c,l]*zX[l] for l = 0..nR-1
+dotVR_zX :: MutableByteArray s -> Int -> Int -> Int -> MutableByteArray s
+         -> Int -> Int -> ST s Double
+dotVR_zX mbaA offA nn k0 mbaZX c nR = go 0 0
+  where
+    go !l !acc
+      | l >= nR = pure acc
+      | otherwise = do
+          let !kl = k0 + l
+          vr <- if c == kl + 1 then pure 1.0
+                else if c > kl + 1 then readRawD mbaA offA (kl * nn + c)
+                else pure 0.0
+          zx <- readRawD mbaZX 0 l
+          go (l+1) (acc + vr * zx)
+
+-- Helper: Y[:,l]^T * u where u = [1, A[k, k+2:n-1]]
+dotY_u :: MutableByteArray s -> Int -> Int -> MutableByteArray s -> Int
+       -> Int -> Int -> ST s Double
+dotY_u mbaA offA nn mbaY bs k l = do
+  yk1l <- readRawD mbaY 0 ((k+1) * bs + l)
+  go (k+2) yk1l
+  where
+    go !c !acc
+      | c >= nn = pure acc
+      | otherwise = do
+          ycl <- readRawD mbaY 0 (c * bs + l)
+          uc  <- readRawD mbaA offA (k * nn + c)
+          go (c+1) (acc + ycl * uc)
+
+-- Helper: V_R[:,l]^T * u where u = [1, A[k, k+2:n-1]]
+dotVR_u :: MutableByteArray s -> Int -> Int -> Int -> Int -> Int -> ST s Double
+dotVR_u mbaA offA nn k0 k l = do
+  -- u[c-k-1]: u[0]=1 at c=k+1, u[c-k-1]=A[k,c] for c>k+1
+  -- V_R[c,l]: 1 if c==kl+1, A[kl,c] if c>kl+1, 0 if c<=kl
+  -- We need sum_{c=k+1}^{n-1} V_R[c,l] * u[c-k-1]
+  -- Since k > kl (k=k0+j, l<j), V_R[k+1,l] = A[kl, k+1] (if k+1 > kl+1, i.e., k > kl)
+  vrkp1 <- if k + 1 == kl + 1 then pure 1.0
+            else readRawD mbaA offA (kl * nn + (k+1))
+  go (k+2) vrkp1
+  where
+    !kl = k0 + l
+    go !c !acc
+      | c >= nn = pure acc
+      | otherwise = do
+          vrc <- if c == kl + 1 then pure 1.0
+                 else readRawD mbaA offA (kl * nn + c)
+          uc  <- readRawD mbaA offA (k * nn + c)
+          go (c+1) (acc + vrc * uc)
+
+-- Helper: A * u at row i, where u = [1, A[k, k+2:n-1]]
+dotA_u :: MutableByteArray s -> Int -> Int -> Int -> Int -> ST s Double
+dotA_u mbaA offA nn k i = do
+  aikp1 <- readRawD mbaA offA (i * nn + (k+1))
+  go (k+2) aikp1
+  where
+    go !c !acc
+      | c >= nn = pure acc
+      | otherwise = do
+          aic <- readRawD mbaA offA (i * nn + c)
+          uc  <- readRawD mbaA offA (k * nn + c)
+          go (c+1) (acc + aic * uc)
+
+-- Helper: sum_l V_L[i,l]*zL[l] for l = 0..nL-1
+dotVL_zL :: MutableByteArray s -> Int -> Int -> Int -> MutableByteArray s
+         -> Int -> Int -> ST s Double
+dotVL_zL mbaA offA nn k0 mbaZL i nL = go 0 0
+  where
+    go !l !acc
+      | l >= nL = pure acc
+      | otherwise = do
+          let !kl = k0 + l
+          vl <- if i == kl then pure 1.0
+                else if i > kl then readRawD mbaA offA (i * nn + kl)
+                else pure 0.0
+          zl <- readRawD mbaZL 0 l
+          go (l+1) (acc + vl * zl)
+
+-- Helper: sum_l X[i,l]*zX[l] for l = 0..nR-1
+dotX_zX :: MutableByteArray s -> Int -> MutableByteArray s -> Int -> Int -> ST s Double
+dotX_zX mbaX bs mbaZX i nR = go 0 0
+  where
+    go !l !acc
+      | l >= nR = pure acc
+      | otherwise = do
+          xil <- readRawD mbaX 0 (i * bs + l)
+          zx  <- readRawD mbaZX 0 l
+          go (l+1) (acc + xil * zx)
+
+-- | Apply trailing GEMM update after a panel step.
+-- A[k0+bs:m, k0+bs:n] -= V_L_trail * Y_trail^T + X_trail * V_R_trail^T
+applyTrailingUpdate :: MutableByteArray s -> Int -> Int -> Int
+                    -> MutableByteArray s -> MutableByteArray s
+                    -> MutableByteArray s -> MutableByteArray s
+                    -> MutableByteArray s -> MutableByteArray s
+                    -> MutableByteArray s
+                    -> Int -> Int -> Int -> Int -> ST s ()
+applyTrailingUpdate mbaA offA _mm nn mbaX mbaY
+                    mbaVLbuf mbaYTbuf mbaXbuf mbaVRTbuf mbaTrail
+                    k0 bs remR remC = do
+  let !trailRowStart = k0 + bs
+      !trailColStart = k0 + bs
+
+  -- Copy A_trail to contiguous buffer (remR × remC)
+  forM_ [0..remR-1] $ \i ->
+    forM_ [0..remC-1] $ \c -> do
+      val <- readRawD mbaA offA ((trailRowStart + i) * nn + trailColStart + c)
+      writeRawD mbaTrail 0 (i * remC + c) val
+
+  -- Build V_L_trail (remR × bs): V_L[trailRowStart+i, l] for i=0..remR-1, l=0..bs-1
+  -- For all trail rows, i >= trailRowStart > k0+l, so V_L[i,l] = A[i, k0+l]
+  forM_ [0..remR-1] $ \i ->
+    forM_ [0..bs-1] $ \l ->
+      readRawD mbaA offA ((trailRowStart + i) * nn + (k0 + l)) >>=
+        writeRawD mbaVLbuf 0 (i * bs + l)
+
+  -- Build Y_trail^T (bs × remC): Y_trail^T[l, c] = Y[trailColStart+c, l]
+  forM_ [0..bs-1] $ \l ->
+    forM_ [0..remC-1] $ \c ->
+      readRawD mbaY 0 ((trailColStart + c) * bs + l) >>=
+        writeRawD mbaYTbuf 0 (l * remC + c)
+
+  -- GEMM 1: trail -= V_L_trail * Y_trail^T
+  -- Negate V_L_trail: nVL = -V_L_trail
+  rawNegateDoubles mbaVLbuf 0 (remR * bs)
+  baVL <- unsafeFreezeByteArray mbaVLbuf
+  baYT <- unsafeFreezeByteArray mbaYTbuf
+  rawGemmKernel baVL 0 baYT 0 mbaTrail 0 remR bs remC
+
+  -- Build X_trail (remR × bs): X[trailRowStart+i, l]
+  forM_ [0..remR-1] $ \i ->
+    forM_ [0..bs-1] $ \l ->
+      readRawD mbaX 0 ((trailRowStart + i) * bs + l) >>=
+        writeRawD mbaXbuf 0 (i * bs + l)
+
+  -- Build V_R_trail^T (bs × remC): V_R_trail^T[l, c] = V_R[trailColStart+c, l]
+  -- V_R[c, l] = 1 if c==k0+l+1, A[k0+l, c] if c>k0+l+1, 0 if c<=k0+l
+  -- Must handle implicit 1: when trailColStart+c == k0+l+1 (i.e., l=bs-1, c=0)
+  forM_ [0..bs-1] $ \l ->
+    forM_ [0..remC-1] $ \c -> do
+      let !globalC = trailColStart + c
+          !kl = k0 + l
+      val <- if globalC == kl + 1 then pure 1.0
+             else if globalC > kl + 1 then readRawD mbaA offA (kl * nn + globalC)
+             else pure 0.0
+      writeRawD mbaVRTbuf 0 (l * remC + c) val
+
+  -- GEMM 2: trail -= X_trail * V_R_trail^T
+  rawNegateDoubles mbaXbuf 0 (remR * bs)
+  baX  <- unsafeFreezeByteArray mbaXbuf
+  baVRT <- unsafeFreezeByteArray mbaVRTbuf
+  rawGemmKernel baX 0 baVRT 0 mbaTrail 0 remR bs remC
+
+  -- Copy trail back to A
+  forM_ [0..remR-1] $ \i ->
+    forM_ [0..remC-1] $ \c -> do
+      val <- readRawD mbaTrail 0 (i * remC + c)
+      writeRawD mbaA offA ((trailRowStart + i) * nn + trailColStart + c) val
 
 -- | Implicit-shift bidiagonal QR iteration (GVL4 Algorithm 8.6.2).
 -- Operates on diagonal d and superdiagonal e of an upper bidiagonal matrix.
