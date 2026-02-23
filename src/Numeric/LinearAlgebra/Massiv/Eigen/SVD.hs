@@ -414,7 +414,7 @@ svdGKP (MkMatrix a_) = runST $ do
             rawMutQAccum mbaU offU mm baA offFA nn betaK k mm row
     else do
       -- Blocked WY: batch nb Householder vectors at a time
-      let !nbU = min 32 nn
+      let !nbU = min 48 nn
       mbaYU  <- newByteArray (mm * nbU * 8)
       mbaTfU <- newByteArray (nbU * nbU * 8)
       mbaW1U <- newByteArray (mm * nbU * 8)
@@ -512,7 +512,7 @@ svdGKP (MkMatrix a_) = runST $ do
     else when (nn >= 3) $ do
       -- Blocked WY for right reflectors
       let !nRefl = nn - 2  -- right reflectors 0..nn-3
-          !nbV = min 32 nRefl
+          !nbV = min 48 nRefl
       mbaYV  <- newByteArray (nn * nbV * 8)
       mbaTfV <- newByteArray (nbV * nbV * 8)
       mbaW1V <- newByteArray (nn * nbV * 8)
@@ -742,7 +742,7 @@ bidiagonalizePPanel mbaA offA mm nn mbaBetaL mbaBetaR
                     goPanel (k0 + bs)
       goPanel 0
   where
-    panelBidiagCrossover = 128
+    panelBidiagCrossover = 64
 {-# NOINLINE bidiagonalizePPanel #-}
 
 -- | Finish remaining columns with Level-2 bidiagonalisation.
@@ -1559,7 +1559,7 @@ writeRawD (MutableByteArray mba) (I# off) (I# i) (D# v) = ST $ \s ->
 -- | Small-subproblem threshold for D&C bidiagonal SVD.
 -- Subproblems at or below this size use bidiag QR iteration.
 dcBidiagThreshold :: Int
-dcBidiagThreshold = 25
+dcBidiagThreshold = 32
 
 -- | Direct 2×2 upper bidiagonal SVD.
 -- Given [[d0, e0], [0, d1]], compute singular values and rotation angles.

@@ -156,7 +156,7 @@ rawGemmKernel ba offA bb offB mc offC m k n
 -- | Crossover threshold for GEMM packing.  Below this, the unpacked
 -- BI-outer kernel is used; above it, the packed-B BK-outer kernel.
 gemmPackCrossover :: Int
-gemmPackCrossover = 128
+gemmPackCrossover = 96
 {-# INLINE gemmPackCrossover #-}
 
 -- | @rawGemmBISlice@ computes C[biStart..biEnd-1, :] += A[biStart..biEnd-1, :] * B.

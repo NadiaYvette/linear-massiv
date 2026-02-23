@@ -188,7 +188,7 @@ tridiagonalizeP a =
             betas <- mapM (\k -> tridiagStepP mbaT offT nn mbaV mbaP mbaW k) [0..nn-3]
             pure betas
           else do
-            let !nb = min 64 (max 16 (nn `div` 4))
+            let !nb = min 64 (max 16 (nn `div` 3))
                 !numRef = nn - 2  -- number of Householder reflectors
             -- V_panel (nn × nb) and W_panel (nn × nb) for deferred rank-2 updates
             mbaVp <- newByteArray (nn * nb * 8)
@@ -1669,15 +1669,32 @@ secularFuncAndDeriv mbaD offD mbaZ offZ rho nn lam = do
             then go (i+1) fAcc fpAcc  -- skip near-pole
             else go (i+1) (fAcc + zi2 / diff) (fpAcc + zi2 / (diff * diff))
 
--- | Sum of squares of z vector.
+-- | Sum of squares of z vector.  SIMD-accelerated with DoubleX4# accumulator.
 sumZSq :: MutableByteArray s -> Int -> Int -> ST s Double
-sumZSq mbaZ offZ nn = go 0 0
+sumZSq mbaZ offZ nn
+  | nn < 4    = goScalar 0 0.0
+  | otherwise = do
+      baZ <- unsafeFreezeByteArray mbaZ
+      let !(ByteArray baZ#) = baZ
+          !(I# offZ#) = offZ
+          !nn4 = nn - (nn `rem` 4)
+          z4 = broadcastDoubleX4# 0.0##
+          goSimd !i acc4
+            | i >= nn4 = do
+                let !(# a, b, c, d #) = unpackDoubleX4# acc4
+                goScalar nn4 (D# a + D# b + D# c + D# d)
+            | otherwise =
+                let !(I# ii) = i
+                    zv = indexDoubleArrayAsDoubleX4# baZ# (offZ# +# ii)
+                    !p = timesDoubleX4# zv zv
+                in goSimd (i + 4) (plusDoubleX4# acc4 p)
+      goSimd (0 :: Int) z4
   where
-    go i !acc
+    goScalar i !acc
       | i >= nn = pure acc
       | otherwise = do
           zi <- readRawD mbaZ offZ i
-          go (i+1) (acc + zi * zi)
+          goScalar (i+1) (acc + zi * zi)
 
 -- | Sum of z[i]^2 / (d[i] - dj) for i in [0..skip-1], skipping near-zero denominators.
 farPoleSum :: MutableByteArray s -> Int -> MutableByteArray s -> Int

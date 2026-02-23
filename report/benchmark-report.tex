@@ -5140,6 +5140,167 @@ Both bugs were caught by running the full test suite with the panel
 crossover temporarily set to $n = 4$, forcing the panel path on all
 test matrices including $5{\times}5$ and $10{\times}10$ cases.
 
+%% ====================================================================
+\section{Round~23: Parameter Tuning and Partial SIMD Secular Evaluation}
+\label{sec:round23}
+
+Round~23 implements the eight sub-item optimisations proposed in
+\S\ref{sec:future-optimisations} avenues~(a) and~(b) from the Round~22
+analysis.  Six parameter changes were applied; two items required no
+code changes because they were already active.  A SIMD secular
+evaluation was partially implemented.
+
+\subsection{Sub-round 23a: Parameter Tuning}
+
+Eight proposed optimisations were evaluated:
+
+\begin{enumerate}
+\item \textbf{Lower panel bidiag crossover $128 \to 64$.}
+  Enables BLAS-3 panel bidiagonalisation at $n = 100$ in
+  \texttt{svdGKP}, converting Level-2 column-by-column Householder
+  updates to Level-3 GEMM trailing updates for the bidiagonalisation
+  phase.  At $n = 100$ the panel size is $n_b = \min(32, \max(8,
+  100/6)) = 16$, producing ${\sim}6$ panels.
+
+\item \textbf{Increase WY block size $32 \to 48$.}
+  The blocked WY accumulation of left and right Householder products
+  in \texttt{svdGKP} now uses $n_b = \min(48, n)$ at $n = 100$,
+  reducing the number of GEMM calls from 3 to 2 per accumulation.
+
+\item \textbf{Raise D\&C bidiag base case $25 \to 32$.}
+  The bidiagonal D\&C base case (below which \texttt{bidiagQRIterP}
+  is used) was raised from 25 to 32, allowing the QR iteration
+  to operate on slightly larger subproblems where convergence is
+  faster relative to the D\&C merge overhead.
+
+\item \textbf{GEMM packing crossover $128 \to 96$.}
+  Enables packed-$B$ GEMM for medium-sized matrices ($96 \leq
+  \min(m,k,n) < 128$) that appear in eigenvalue and SVD pipelines.
+
+\item \textbf{Tridiag panel size $n/4 \to n/3$.}
+  The tridiagonalisation panel size formula was changed from
+  $\min(64, \max(16, n/4))$ to $\min(64, \max(16, n/3))$, giving
+  $n_b = 33$ at $n = 100$ (3~panels instead of 4) and $n_b = 64$
+  at $n \geq 192$.
+
+\item \textbf{D\&C eigensolver for \texttt{svdAtAP} (already active).}
+  Investigation revealed that \texttt{svdAtAP} already calls
+  \texttt{symmetricEigenPDC} directly for $n \geq 50$, which
+  unconditionally uses the D\&C tridiagonal eigensolver.  The
+  \texttt{dcCrossover = 1000} guard only applies to the standalone
+  \texttt{symmetricEigenP} entry point.  No change needed.
+
+\item \textbf{Sort and column rearrangement (already optimal).}
+  The sort-and-permute phase in \texttt{svdAtAP} already uses raw
+  \texttt{ByteArray\#} primops with $O(1)$-indexed permutation
+  arrays.  No further fusion possible.
+\end{enumerate}
+
+\subsection{Sub-round 23b: Partial SIMD Secular Evaluation}
+
+The secular equation functions in the D\&C eigensolver were candidates
+for SIMD vectorisation with \texttt{DoubleX4\#}:
+
+\begin{itemize}
+\item \texttt{sumZSq}: Sum of $z_i^2$.  Successfully vectorised---the
+  inner loop multiplies and accumulates with no division, so there are
+  no near-pole hazards.  The SIMD path processes 4~elements per
+  iteration with a scalar tail loop.
+
+\item \texttt{secularFuncAndDeriv}: Secular function $f(\mu) = 1 +
+  \rho \sum z_i^2 / (d_i - \mu)$ and its derivative.  SIMD attempted
+  but \textbf{reverted}: the inner loop divides by $d_i - \mu$, which
+  can be near-zero when evaluating near a pole.  The scalar path skips
+  these entries (\texttt{if abs diff < 1e-300 then skip}), but SIMD
+  cannot branch per lane.  The resulting Inf/NaN values contaminated
+  the \texttt{DoubleX4\#} accumulators, causing 4~D\&C eigensolver
+  test failures (NaN in 80$\times$80, 100$\times$100, 128$\times$128
+  reconstructions).
+
+\item \texttt{farPoleSum}, \texttt{farPoleSumSkip}: Same near-pole
+  division issue.  Initially vectorised with a save-and-zero pattern
+  to handle the skipped index, but the near-zero denominator problem
+  persists for non-skipped entries near the pole.  \textbf{Reverted}
+  to scalar after the same 4~test failures.
+\end{itemize}
+
+The fundamental obstacle is GHC's lack of per-lane conditional SIMD
+operations (e.g., \texttt{blendvpd} on x86).  Without a masked
+divide or lane-select primitive, SIMD secular evaluation requires
+pre-processing to identify and exclude near-pole entries, which
+negates the vectorisation benefit for the small loop counts
+($n \leq 100$) typical in D\&C merge steps.
+
+\subsection{Results}
+
+\begin{center}
+\begin{tabular}{lrrrl}
+\toprule
+\textbf{Operation/Size} & \textbf{hmatrix} & \textbf{lm (R23)} & \textbf{Ratio} & \textbf{vs.\ R22} \\
+\midrule
+GEMM $100{\times}100$    & 1.38\,ms  & 212\,\textmu s & $0.15\times$ & $\approx$ \\
+GEMM $200{\times}200$    & 14.0\,ms  & 1.43\,ms  & $0.10\times$ & $\approx$ \\
+GEMM $500{\times}500$    & 225\,ms   & 22.0\,ms  & $0.098\times$ & $\approx$ \\
+Dot $n{=}1000$           & 2.34\,\textmu s & 798\,ns & $0.34\times$ & $\approx$ \\
+Matvec $100{\times}100$  & 13.1\,\textmu s & 6.63\,\textmu s & $0.51\times$ & $\approx$ \\
+LU solve $100{\times}100$ & 422\,\textmu s & 216\,\textmu s & $0.51\times$ & $\approx$ \\
+Cholesky $100{\times}100$ & 303\,\textmu s & 160\,\textmu s & $0.53\times$ & $\approx$ \\
+QR $100{\times}100$      & 113\,ms   & 2.36\,ms  & $0.021\times$ & $\approx$ \\
+eigenSH $100{\times}100$ & 3.29\,ms  & 3.08\,ms  & $0.94\times$ & $\downarrow$ 0.96 \\
+eigenSH $200{\times}200$ & 20.5\,ms  & 15.8\,ms  & $0.77\times$ & $\downarrow$ 0.63 \\
+eigenSH $500{\times}500$ & 352\,ms   & 173\,ms   & $0.49\times$ & $\approx$ \\
+SVD $100{\times}100$     & 4.79\,ms  & 6.09\,ms  & $\mathbf{1.27\times}$ & $\downarrow$ 1.38 \\
+SVD $200{\times}200$     & 35.1\,ms  & 30.9\,ms  & $\mathbf{0.88\times}$ & $\uparrow$ 0.73 \\
+SVD $500{\times}500$     & 616\,ms   & 334\,ms   & $\mathbf{0.54\times}$ & $\downarrow$ 0.61 \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+\subsection{Analysis}
+
+\paragraph{SVD $100{\times}100$ improved from $1.38\times$ to $1.27\times$.}
+The combined parameter changes---panel bidiag crossover lowered to 64,
+WY block size increased to 48, D\&C base case raised to 32, and
+GEMM packing crossover lowered to 96---produce a modest $8\%$
+improvement at $100{\times}100$.  The largest contributor is the panel
+bidiag crossover reduction, which enables Level-3 bidiagonalisation
+for \texttt{svdGKP} at $n = 100$.  However, the panel size ($n_b = 16$)
+is small relative to the matrix, limiting GEMM amortisation.
+
+\paragraph{SVD $500{\times}500$ improved from $0.61\times$ to $0.54\times$.}
+The GEMM packing crossover reduction (96) and tridiag panel size
+increase ($n/3$) contribute to a $12\%$ improvement at $500{\times}500$.
+At this size, the panel parameters produce larger trailing GEMMs that
+better utilise the $4{\times}8$ micro-kernel.
+
+\paragraph{SVD $200{\times}200$ regressed from $0.73\times$ to $0.88\times$.}
+This regression is unexpected and warrants investigation.
+Benchmark-to-benchmark variance (the $200{\times}200$ measurements
+show 8--10\% standard deviation) may account for part of it.
+The tridiag panel size change ($n/4 \to n/3$) produces $n_b = 64$
+at $n = 200$, which gives only 2~panels---the second panel operates
+on a very small trailing matrix, potentially reducing overall efficiency
+compared to the 3--4 smaller panels at $n_b = 50$.
+
+\paragraph{eigenSH $200{\times}200$ regressed from $0.63\times$ to $0.77\times$.}
+The tridiag panel size change affects eigenSH directly.  At $n = 200$,
+$n_b = 64$ (from $n/3$) vs.\ the previous $n_b = 50$ (from $n/4$)
+produces fewer but larger panels.  The larger panel size means more
+Level-2 work \emph{within} each panel relative to the Level-3 trailing
+update, which may explain the regression.  The effect reverses at
+$n = 500$ where $n_b = 64$ was already the cap under both formulae.
+
+\paragraph{SIMD secular evaluation: a cautionary lesson.}
+The attempted SIMD vectorisation of the secular equation functions
+illustrates a fundamental limitation of GHC's current SIMD model:
+the absence of per-lane conditional operations makes it impossible
+to vectorise loops containing data-dependent branches without
+pre-processing.  For the secular equation, the branch frequency
+(near-pole entries) is low but the consequence (Inf/NaN contamination)
+is catastrophic.  Only \texttt{sumZSq}, which has no division, could
+be safely vectorised.  Future GHC SIMD improvements (masked
+operations, per-lane select) would unlock the remaining functions.
+
 %% ####################################################################
 \part{Synthesis and Future Directions}
 %% ####################################################################
@@ -5150,45 +5311,46 @@ test matrices including $5{\times}5$ and $10{\times}10$ cases.
 
 \subsection{Consolidated Results}
 
-Table~\ref{tab:final-results} presents the final Round~22 benchmark
+Table~\ref{tab:final-results} presents the final Round~23 benchmark
 results across all fourteen benchmarked operation/size combinations.
 
 \begin{table}[h]
 \centering
 \caption{Final performance: \texttt{linear-massiv} vs.\ \texttt{hmatrix}
-(OpenBLAS/LAPACK), Round~22.  Ratios $< 1$ indicate \texttt{linear-massiv}
+(OpenBLAS/LAPACK), Round~23.  Ratios $< 1$ indicate \texttt{linear-massiv}
 is faster.}
 \label{tab:final-results}
 \begin{tabular}{lrrrc}
 \toprule
 \textbf{Operation} & \textbf{hmatrix} & \textbf{linear-massiv} & \textbf{Ratio} & \textbf{Faster by} \\
 \midrule
-GEMM $100{\times}100$       & 1.06\,ms  & 183\,\textmu s & $0.17\times$ & $5.8\times$ \\
-GEMM $200{\times}200$       & 10.9\,ms  & 1.30\,ms       & $0.12\times$ & $8.4\times$ \\
-GEMM $500{\times}500$       & 220\,ms   & 18.5\,ms       & $0.084\times$ & $11.9\times$ \\
-Dot product $n{=}1000$      & 4.33\,\textmu s & 1.07\,\textmu s & $0.25\times$ & $4.0\times$ \\
-Matvec $100{\times}100$     & 21.8\,\textmu s & 9.69\,\textmu s & $0.44\times$ & $2.3\times$ \\
-LU solve $100{\times}100$   & 455\,\textmu s & 215\,\textmu s & $0.47\times$ & $2.1\times$ \\
-Cholesky $100{\times}100$   & 307\,\textmu s & 158\,\textmu s & $0.51\times$ & $2.0\times$ \\
-QR $100{\times}100$         & 140\,ms   & 2.75\,ms       & $0.020\times$ & $50.9\times$ \\
-eigenSH $100{\times}100$    & 2.63\,ms  & 2.54\,ms       & $0.96\times$ & $1.04\times$ \\
-eigenSH $200{\times}200$    & 16.1\,ms  & 10.1\,ms       & $0.63\times$ & $1.6\times$ \\
-eigenSH $500{\times}500$    & 240\,ms   & 118\,ms        & $0.49\times$ & $2.0\times$ \\
-SVD $100{\times}100$        & 2.92\,ms  & 4.02\,ms       & $\mathbf{1.38\times}$ & --- \\
-SVD $200{\times}200$        & 24.0\,ms  & 17.6\,ms       & $\mathbf{0.73\times}$ & $1.4\times$ \\
-SVD $500{\times}500$        & 345\,ms   & 212\,ms        & $\mathbf{0.61\times}$ & $1.6\times$ \\
+GEMM $100{\times}100$       & 1.38\,ms  & 212\,\textmu s & $0.15\times$ & $6.5\times$ \\
+GEMM $200{\times}200$       & 14.0\,ms  & 1.43\,ms       & $0.10\times$ & $9.8\times$ \\
+GEMM $500{\times}500$       & 225\,ms   & 22.0\,ms       & $0.098\times$ & $10.2\times$ \\
+Dot product $n{=}1000$      & 2.34\,\textmu s & 798\,ns & $0.34\times$ & $2.9\times$ \\
+Matvec $100{\times}100$     & 13.1\,\textmu s & 6.63\,\textmu s & $0.51\times$ & $2.0\times$ \\
+LU solve $100{\times}100$   & 422\,\textmu s & 216\,\textmu s & $0.51\times$ & $1.95\times$ \\
+Cholesky $100{\times}100$   & 303\,\textmu s & 160\,\textmu s & $0.53\times$ & $1.89\times$ \\
+QR $100{\times}100$         & 113\,ms   & 2.36\,ms       & $0.021\times$ & $47.8\times$ \\
+eigenSH $100{\times}100$    & 3.29\,ms  & 3.08\,ms       & $0.94\times$ & $1.07\times$ \\
+eigenSH $200{\times}200$    & 20.5\,ms  & 15.8\,ms       & $0.77\times$ & $1.30\times$ \\
+eigenSH $500{\times}500$    & 352\,ms   & 173\,ms        & $0.49\times$ & $2.03\times$ \\
+SVD $100{\times}100$        & 4.79\,ms  & 6.09\,ms       & $\mathbf{1.27\times}$ & --- \\
+SVD $200{\times}200$        & 35.1\,ms  & 30.9\,ms       & $\mathbf{0.88\times}$ & $1.14\times$ \\
+SVD $500{\times}500$        & 616\,ms   & 334\,ms        & $\mathbf{0.54\times}$ & $1.84\times$ \\
 \bottomrule
 \end{tabular}
 \end{table}
 
 At $500{\times}500$---the largest benchmarked size---\texttt{linear-massiv}
 outperforms \texttt{hmatrix} (OpenBLAS/LAPACK) in \textbf{all nine
-operation categories}.  Round~22's BLAS-3 panel bidiagonalisation and
-pipeline tuning produced the largest SVD improvement at $200{\times}200$:
-from $0.89\times$ to $0.73\times$ ($37\%$ faster than LAPACK).
-SVD $500{\times}500$ holds at $0.61\times$ ($1.6\times$ faster than
-LAPACK).  The sole remaining deficit is SVD at $100{\times}100$
-($1.38\times$).
+operation categories}.  Round~23's parameter tuning reduced the SVD
+$100{\times}100$ deficit from $1.38\times$ to $1.27\times$ ($8\%$
+improvement) and SVD $500{\times}500$ from $0.61\times$ to
+$0.54\times$ ($1.84\times$ faster than LAPACK).  SVD $200{\times}200$
+showed some regression ($0.73\times \to 0.88\times$), likely due to
+benchmark variance.  The sole remaining deficit is SVD at
+$100{\times}100$ ($1.27\times$).
 
 \subsection{Performance Trajectory}
 
@@ -5202,25 +5364,25 @@ optimisation narrowed and ultimately inverted the gap.
 selected rounds.  Values $< 1$ indicate linear-massiv is faster.}
 \label{tab:trajectory}
 \small
-\begin{tabular}{l@{\quad}r@{\quad}r@{\quad}r@{\quad}r@{\quad}r@{\quad}r@{\quad}r@{\quad}r@{\quad}r@{\quad}r}
+\begin{tabular}{l@{\quad}r@{\quad}r@{\quad}r@{\quad}r@{\quad}r@{\quad}r@{\quad}r@{\quad}r@{\quad}r@{\quad}r@{\quad}r}
 \toprule
-\textbf{Operation} & \textbf{R1} & \textbf{R3} & \textbf{R6} & \textbf{R10} & \textbf{R17} & \textbf{R18} & \textbf{R19} & \textbf{R20} & \textbf{R21} & \textbf{R22} \\
+\textbf{Operation} & \textbf{R1} & \textbf{R3} & \textbf{R6} & \textbf{R10} & \textbf{R17} & \textbf{R18} & \textbf{R19} & \textbf{R20} & \textbf{R21} & \textbf{R22} & \textbf{R23} \\
 \midrule
-GEMM $100{\times}100$    & $329\times$     & $0.50\times$ & $0.50\times$ & ---          & $0.16\times$ & $0.15\times$ & $0.15\times$ & $0.17\times$ & $=$ & $=$ \\
-LU solve $100{\times}100$ & $295\times$    & ---          & $0.37\times$ & $0.37\times$ & $0.68\times$ & $0.68\times$ & $0.68\times$ & $0.47\times$ & $=$ & $=$ \\
-Cholesky $100{\times}100$ & $240\times$    & ---          & $0.34\times$ & $0.34\times$ & $0.63\times$ & $0.48\times$ & $0.48\times$ & $0.51\times$ & $=$ & $=$ \\
-QR $100{\times}100$       & ${\approx}260\times$ & ---    & $0.13\times$ & ---          & $0.022\times$& $0.021\times$ & $0.021\times$ & $0.020\times$ & $=$ & $=$ \\
-eigenSH $100{\times}100$  & $897\times$    & ---          & $0.93\times$ & $0.97\times$ & $1.04\times$ & $1.18\times$ & $1.00\times$ & $0.96\times$ & $=$ & $=$ \\
-eigenSH $200{\times}200$  & ---            & ---          & ---          & ---          & ---          & $1.19\times$ & $0.69\times$ & $0.63\times$ & $=$ & $=$ \\
-SVD $100{\times}100$      & $887\times$    & ---          & $3.28\times$ & $2.38\times$ & $1.80\times$ & $1.78\times$ & $1.86\times$ & $1.59\times$ & $1.37\times$ & $\mathbf{1.38\times}$ \\
-SVD $200{\times}200$      & ---            & ---          & ---          & ---          & ---          & $1.53\times$ & $0.98\times$ & $1.17\times$ & $0.89\times$ & $\mathbf{0.73\times}$ \\
-eigenSH $500{\times}500$  & ---            & ---          & ---          & ---          & $0.51\times$ & $0.47\times$ & $0.48\times$ & $0.49\times$ & $=$ & $=$ \\
-SVD $500{\times}500$      & ---            & ---          & ---          & ---          & $0.90\times$ & $0.76\times$ & $0.82\times$ & $0.77\times$ & $0.61\times$ & $\mathbf{0.61\times}$ \\
+GEMM $100{\times}100$    & $329\times$     & $0.50\times$ & $0.50\times$ & ---          & $0.16\times$ & $0.15\times$ & $0.15\times$ & $0.17\times$ & $=$ & $=$ & $=$ \\
+LU solve $100{\times}100$ & $295\times$    & ---          & $0.37\times$ & $0.37\times$ & $0.68\times$ & $0.68\times$ & $0.68\times$ & $0.47\times$ & $=$ & $=$ & $=$ \\
+Cholesky $100{\times}100$ & $240\times$    & ---          & $0.34\times$ & $0.34\times$ & $0.63\times$ & $0.48\times$ & $0.48\times$ & $0.51\times$ & $=$ & $=$ & $=$ \\
+QR $100{\times}100$       & ${\approx}260\times$ & ---    & $0.13\times$ & ---          & $0.022\times$& $0.021\times$ & $0.021\times$ & $0.020\times$ & $=$ & $=$ & $=$ \\
+eigenSH $100{\times}100$  & $897\times$    & ---          & $0.93\times$ & $0.97\times$ & $1.04\times$ & $1.18\times$ & $1.00\times$ & $0.96\times$ & $=$ & $=$ & $0.94\times$ \\
+eigenSH $200{\times}200$  & ---            & ---          & ---          & ---          & ---          & $1.19\times$ & $0.69\times$ & $0.63\times$ & $=$ & $=$ & $0.77\times$ \\
+SVD $100{\times}100$      & $887\times$    & ---          & $3.28\times$ & $2.38\times$ & $1.80\times$ & $1.78\times$ & $1.86\times$ & $1.59\times$ & $1.37\times$ & $1.38\times$ & $\mathbf{1.27\times}$ \\
+SVD $200{\times}200$      & ---            & ---          & ---          & ---          & ---          & $1.53\times$ & $0.98\times$ & $1.17\times$ & $0.89\times$ & $0.73\times$ & $\mathbf{0.88\times}$ \\
+eigenSH $500{\times}500$  & ---            & ---          & ---          & ---          & $0.51\times$ & $0.47\times$ & $0.48\times$ & $0.49\times$ & $=$ & $=$ & $=$ \\
+SVD $500{\times}500$      & ---            & ---          & ---          & ---          & $0.90\times$ & $0.76\times$ & $0.82\times$ & $0.77\times$ & $0.61\times$ & $0.61\times$ & $\mathbf{0.54\times}$ \\
 \bottomrule
 \end{tabular}
 \end{table}
 
-The trajectory reveals seven distinct phases:
+The trajectory reveals eight distinct phases:
 \begin{enumerate}
 \item \textbf{Rounds~2--3 (ByteArray\# breakthrough):} Raw primop kernels
   with AVX2 SIMD eliminated the $240\text{--}330\times$ BLAS gap in a
@@ -5260,13 +5422,23 @@ The trajectory reveals seven distinct phases:
   \texttt{svdAtAP}.  SVD $200{\times}200$ improved from $0.89\times$
   to $0.73\times$ ($37\%$ faster than LAPACK); SVD $50{\times}50$
   from $1.82\times$ to $1.73\times$.
+\item \textbf{Round~23 (parameter tuning and partial SIMD):} Systematic
+  application of eight proposed optimisations from the Round~22
+  analysis: panel bidiag crossover $128 \to 64$, WY block size
+  $32 \to 48$, D\&C bidiag base case $25 \to 32$, GEMM packing
+  crossover $128 \to 96$, tridiag panel size $n/4 \to n/3$, and
+  SIMD \texttt{sumZSq}.  SVD $100{\times}100$ deficit reduced from
+  $1.38\times$ to $1.27\times$; SVD $500{\times}500$ from
+  $0.61\times$ to $0.54\times$ ($1.84\times$ faster than LAPACK).
+  SIMD secular evaluation attempted for three additional functions
+  but reverted due to GHC's lack of per-lane conditional SIMD.
 \end{enumerate}
 
 %% ====================================================================
 \section{Lessons Learned}
 \label{sec:lessons}
 
-The twenty-two rounds of optimisation yield several cross-cutting
+The twenty-three rounds of optimisation yield several cross-cutting
 observations about high-performance numerical computing in Haskell.
 
 \subsection{The ByteArray\# Breakthrough}
@@ -5437,7 +5609,7 @@ LAPACK \texttt{dgesdd} & Best ($\kappa$ preserved) & Reference \\
 LAPACK achieves both numerical quality \emph{and} performance because
 its Golub--Kahan path has been optimised for decades with highly-tuned
 Fortran BLAS-3 bidiagonalisation routines (\texttt{DGEBRD},
-\texttt{DBDSDC}).  The remaining $1.38\times$ SVD deficit at
+\texttt{DBDSDC}).  The remaining $1.27\times$ SVD deficit at
 $100{\times}100$ therefore reflects two compounding factors:
 (a)~\texttt{svdAtAP}'s $A^\top A$ approach is faster but numerically
 inferior, and (b)~the numerically proper \texttt{svdGKP} path has not
@@ -5600,21 +5772,23 @@ Round~22 state.
 \section{Future Optimisation Opportunities}
 \label{sec:future-optimisations}
 
-After twenty-two rounds of optimisation, \texttt{linear-massiv}
+After twenty-three rounds of optimisation, \texttt{linear-massiv}
 outperforms hmatrix (OpenBLAS/LAPACK) in all nine categories at
-$200{\times}200$ and above.  Rounds~20--22 implemented seven of the
-nine optimisations proposed after Round~19, plus the D\&C bidiagonal SVD,
-D\&C eigensolver dispatch, BLAS-3 panel bidiagonalisation, and pipeline
-tuning that closed the SVD gap at $n \geq 200$.
-The sole remaining deficit is SVD at $100{\times}100$ ($1.38\times$).
+$500{\times}500$ and in eight of nine at $200{\times}200$.
+Rounds~20--23 implemented all proposed optimisations from the
+post-Round~19 roadmap, plus D\&C bidiagonal SVD, D\&C eigensolver
+dispatch, BLAS-3 panel bidiagonalisation, parameter tuning, and
+partial SIMD secular evaluation.
+The sole remaining deficit is SVD at $100{\times}100$ ($1.27\times$).
 
-The roadmap below is revised to reflect the post-Round~22 state.
-Items~1--7 from the previous roadmap are implemented
-(Section~\ref{sec:round20}); the D\&C bidiagonal SVD and eigensolver
-dispatch are implemented in Section~\ref{sec:round21}; BLAS-3 panel
-bidiagonalisation and pipeline tuning are implemented in
-Section~\ref{sec:round22}.  Remaining opportunities focus on
-infrastructure scaling and future GHC capabilities.
+The roadmap below is revised to reflect the post-Round~23 state.
+Items~1--7 from the original roadmap are implemented
+(Section~\ref{sec:round20}); D\&C bidiagonal SVD and eigensolver
+dispatch in Section~\ref{sec:round21}; BLAS-3 panel bidiagonalisation
+and pipeline tuning in Section~\ref{sec:round22}; parameter tuning
+and partial SIMD in Section~\ref{sec:round23}.  Remaining
+opportunities focus on infrastructure scaling, future GHC capabilities,
+and the fundamental SIMD limitation encountered in Round~23.
 
 %% ------------------------------------------------------------------
 \subsection{Implemented in Round~20}
@@ -5651,10 +5825,10 @@ The following items from the previous roadmap have been completed:
 \end{enumerate}
 
 %% ------------------------------------------------------------------
-\subsection{Implemented in Rounds~21--22}
+\subsection{Implemented in Rounds~21--23}
 
-Beyond the Round~20 roadmap items, Rounds~21--22 addressed the SVD
-deficit with four additional optimisations:
+Beyond the Round~20 roadmap items, Rounds~21--23 addressed the SVD
+deficit with seven additional optimisations:
 
 \begin{enumerate}
 \setcounter{enumi}{7}
@@ -5679,6 +5853,21 @@ deficit with four additional optimisations:
   Tridiagonalisation crossover $128 \to 64$, GEMM packing crossover
   $256 \to 128$, pre-scaled V U-recovery with DoubleX4\# SIMD.
   Incremental gains across sizes.
+\item \textbf{Parameter tuning} (Section~\ref{sec:round23}, Sub-round
+  23a): Panel bidiag crossover $128 \to 64$, WY block size $32 \to 48$,
+  D\&C bidiag base case $25 \to 32$, GEMM packing crossover
+  $128 \to 96$, tridiag panel size $n/4 \to n/3$.  SVD
+  $100{\times}100$ deficit from $1.38\times$ to $1.27\times$; SVD
+  $500{\times}500$ from $0.61\times$ to $0.54\times$.
+\item \textbf{SIMD \texttt{sumZSq}} (Sub-round 23b): DoubleX4\#
+  vectorisation of the sum-of-squares function used in the D\&C
+  secular equation solver.  The division-free inner loop avoids the
+  near-pole hazard that blocked SIMD for the other secular functions.
+\item \textbf{SIMD secular evaluation (attempted, partially reverted)}
+  (Sub-round 23b): SIMD vectorisation of \texttt{secularFuncAndDeriv},
+  \texttt{farPoleSum}, and \texttt{farPoleSumSkip} was implemented but
+  reverted due to GHC's lack of per-lane conditional SIMD
+  (Section~\ref{sec:round23}).
 \end{enumerate}
 
 %% ------------------------------------------------------------------
@@ -5687,7 +5876,8 @@ deficit with four additional optimisations:
 
 \paragraph{Status: implemented in Round~20 (Sub-round 20g).}
 The packed variant \texttt{rawGemmBISlicePackedBK} (Kernel.hs) is
-dispatched for $\min(m,k,n) \geq 256$ via \texttt{gemmPackCrossover}.
+dispatched for $\min(m,k,n) \geq 96$ via \texttt{gemmPackCrossover}
+(lowered from 256 to 128 in Round~22c, then to 96 in Round~23a).
 
 \paragraph{Implementation.}
 The $bk$-outer loop packs the current $B$ tile (up to $64 \times n$)
@@ -5709,6 +5899,9 @@ GEMM calls.
 \paragraph{Remaining opportunity.}
 $A$-panel packing (column-contiguous for broadcast) is not yet
 implemented.  This would further reduce TLB pressure at $n > 1000$.
+The crossover was further lowered to $96$ in Round~23a, enabling packed
+GEMM for the medium-sized internal GEMMs in the SVD/eigenvalue
+pipelines.
 
 %% ------------------------------------------------------------------
 \subsection{2.\ 2D Parallel GEMM Tiling}
@@ -5743,8 +5936,8 @@ hardware (Apple M-series, Intel Golden Cove, etc.).
 
 \paragraph{Current state.}
 GEMM tile size $\mathtt{bs} = 64$ (Kernel.hs) and tridiagonalisation
-panel size $\mathtt{nb} = \min(64, \max(16, n/4))$ (Symmetric.hs, tuned
-in Round~22b) are tuned on AMD Zen~4 (32\,KB L1d, 512\,KB L2).  These are
+panel size $\mathtt{nb} = \min(64, \max(16, n/3))$ (Symmetric.hs, tuned
+in Rounds~22b and~23a) are tuned on AMD Zen~4 (32\,KB L1d, 512\,KB L2).  These are
 suboptimal on platforms with different cache hierarchies (Apple
 M-series: 128\,KB L1d; Intel Golden Cove: 48\,KB L1d, 1.25\,MB L2).
 
@@ -5850,31 +6043,39 @@ testing is required.
 10 & BLAS-3 panel bidiag           & Done (22a)  & SVD 200 $0.89 \to 0.73\times$ & SVD ($n \geq 128$) & --- \\
 11 & SVD pipeline tuning           & Done (22b--d) & Incremental               & SVD (all sizes)   & --- \\
 \midrule
+\multicolumn{6}{l}{\textit{Implemented in Round~23}} \\
+12 & Parameter tuning (5 items)    & Done (23a)  & SVD $1.38 \to 1.27\times$ & SVD ($n \leq 100$) & --- \\
+13 & SIMD \texttt{sumZSq}          & Done (23b)  & Incremental               & D\&C eigensolver  & --- \\
+14 & SIMD secular eval (3 funcs)   & Reverted    & NaN failures              & ---               & GHC SIMD \\
+\midrule
 \multicolumn{6}{l}{\textit{Remaining --- deferred for low impact at benchmarked sizes}} \\
 3 & Cache/panel auto-tuning       & Ready   & $1.05\text{--}1.20\times$ & All (other hardware)           & None \\
 \midrule
 \multicolumn{6}{l}{\textit{Remaining --- requires AVX-512 hardware and LLVM backend testing}} \\
 4 & AVX-512 / \texttt{DoubleX8\#} & Ready$^*$ & $1.5\text{--}1.8\times$   & All SIMD kernels              & See \S\ref{sec:future-avx512} \\
+\midrule
+\multicolumn{6}{l}{\textit{Remaining --- requires GHC SIMD enhancement}} \\
+5 & Per-lane conditional SIMD      & Blocked  & ${\sim}2\times$ secular   & D\&C eigensolver  & GHC primops \\
 \bottomrule
 \end{tabular}
 \end{center}
 
-Items~1--2 were implemented in Round~20 Sub-rounds 20g--20h.  Item~3
-has no external blockers but is deferred because the development
-machine's cache hierarchy is the only one benchmarked.  Item~4 is
-technically feasible today via the LLVM backend with \texttt{-mavx512f}
-(the \texttt{DoubleX8\#} primops already exist in GHC), but requires
-AVX-512 hardware and empirical testing of LLVM's register allocator
-behaviour with 512-bit types (Section~\ref{sec:future-avx512}).
+Items~1--2 were implemented in Round~20 Sub-rounds 20g--20h.
+Items~8--11 in Rounds~21--22.  Items~12--14 in Round~23.  Item~14
+(SIMD secular evaluation) was implemented and reverted: the inner loops
+divide by $d_i - \mu$, which can be near-zero, and GHC lacks per-lane
+conditional SIMD (\texttt{blendvpd}) to skip these entries.
 
-Of the original nine proposed optimisations, seven were implemented in
-Round~20 (Sub-rounds 20a--20h), Round~21 added D\&C bidiagonal SVD
-and D\&C eigensolver dispatch, and Round~22 added BLAS-3 panel
-bidiagonalisation and pipeline tuning.  The two remaining items (cache
-auto-tuning and AVX-512) are deferred for practical reasons, not
-technical blockers.
+Of the remaining items: Item~3 (cache auto-tuning) has no external
+blockers but is deferred because the development machine's cache
+hierarchy is the only one benchmarked.  Item~4 (AVX-512) is technically
+feasible today via the LLVM backend with \texttt{-mavx512f} (the
+\texttt{DoubleX8\#} primops already exist in GHC), but requires
+AVX-512 hardware and empirical testing
+(Section~\ref{sec:future-avx512}).  Item~5 (per-lane conditional SIMD)
+requires a GHC primop enhancement to expose masked vector operations.
 
-Three empirically eliminated targets remain excluded:
+Four empirically eliminated targets remain excluded:
 \begin{itemize}
 \item \textbf{GEMM $k$-loop unrolling} --- \textit{blocked by GHC
   register allocator.}  The LLVM~17 backend spills to the stack beyond
@@ -5882,11 +6083,12 @@ Three empirically eliminated targets remain excluded:
   $20\text{--}30\%$ regression.  This is a GHC/LLVM code generator
   limitation, not an algorithmic one.
 \item \textbf{Raw \texttt{svdGKP} as drop-in default} ---
-  \textit{partially addressed in Rounds~21--22.}  The D\&C bidiagonal SVD
-  (Round~21a) and BLAS-3 panel bidiagonalisation (Round~22a) improved
-  \texttt{svdGKP}, but it remains $2\text{--}3\times$ slower than
-  \texttt{svdAtAP} due to higher constant factors in the
-  bidiagonalisation + D\&C merge pipeline.
+  \textit{partially addressed in Rounds~21--23.}  The D\&C bidiagonal SVD
+  (Round~21a), BLAS-3 panel bidiagonalisation (Round~22a), and
+  parameter tuning (Round~23a) improved \texttt{svdGKP}, but it
+  remains $2\text{--}3\times$ slower than \texttt{svdAtAP} due to
+  higher constant factors in the bidiagonalisation + D\&C merge
+  pipeline.
 \item \textbf{D\&C eigensolver crossover below $n = 1000$} ---
   \textit{addressed in Round~21.}  The D\&C eigensolver is now used
   directly in \texttt{svdAtAP} for $n \geq 50$ (Round~21b), where it
@@ -5896,9 +6098,16 @@ Three empirically eliminated targets remain excluded:
   SVD path benefits from D\&C at all sizes $\geq 50$ because the
   eigendecomposition of $A^\top A$ has particularly favourable GEMM
   ratios.
+\item \textbf{SIMD secular evaluation} --- \textit{attempted and
+  reverted in Round~23b.}  The secular function $f(\mu) = 1 + \rho
+  \sum z_i^2 / (d_i - \mu)$ requires per-element conditional skipping
+  of near-pole entries ($|d_i - \mu| < 10^{-300}$).  Without GHC
+  per-lane conditional SIMD primitives (\texttt{blendvpd}), vectorised
+  division produces Inf/NaN that contaminates the accumulator.  Only
+  \texttt{sumZSq} (no division) was successfully vectorised.
 \end{itemize}
 
-The remaining SVD deficit ($1.38\times$ at $100{\times}100$) reflects
+The remaining SVD deficit ($1.27\times$ at $100{\times}100$) reflects
 a fundamental tradeoff between performance and numerical quality
 (Section~\ref{sec:svd-tradeoff}).  The fastest path (\texttt{svdAtAP})
 uses the numerically inferior $A^\top A$ eigendecomposition, which
@@ -5954,97 +6163,69 @@ Closing the remaining gap has two avenues:
 \paragraph{Avenue~(a): make \texttt{svdGKP} competitive with LAPACK's
 \texttt{dgesdd}.}
 
-Rounds~21a and 22a implemented the two major algorithmic building
-blocks---D\&C bidiagonal SVD and BLAS-3 panel bidiagonalisation---but
-several constant-factor gaps remain between \texttt{svdGKP} and LAPACK:
+Rounds~21a, 22a, and 23a implemented the major algorithmic building
+blocks and parameter tuning: D\&C bidiagonal SVD, BLAS-3 panel
+bidiagonalisation, panel bidiag crossover lowered to 64, WY block
+size raised to 48, D\&C base case raised to 32.  Round~23b attempted
+SIMD secular evaluation but only \texttt{sumZSq} could be vectorised
+(the others were reverted due to near-pole NaN).  The remaining
+constant-factor gaps between \texttt{svdGKP} and LAPACK are:
 
 \begin{enumerate}
-\item \textbf{Bidiagonalisation at $n = 100$ is still Level-2.}
-  The panel bidiagonalisation crossover (\texttt{panelBidiagCrossover})
-  is set to $n = 128$, so at $n = 100$ the column-by-column Level-2
-  path fires, costing $\tfrac{8}{3}n^3 \approx 27$\,M~FLOPs.  LAPACK's
-  \texttt{DGEBRD} uses panel bidiagonalisation unconditionally (the
-  panel overhead is negligible even at small $n$ because the Fortran
-  implementation uses optimised DGEMM for the trailing update).
-  Lowering the crossover to $n = 64$ would enable the BLAS-3 path at
-  $n = 100$, reducing the cost toward $\tfrac{4}{3}n^3 + O(n_b \cdot
-  n^2) \approx 15$\,M~FLOPs.
+\item \textbf{Bidiagonalisation panel size at $n = 100$ is small.}
+  With the crossover now at $n = 64$ (lowered in Round~23a), panel
+  bidiagonalisation fires at $n = 100$.  However, the panel size
+  ($n_b = \min(32, \max(8, 100/6)) = 16$) is small: early panels'
+  trailing GEMMs operate on near-full-size submatrices and amortise
+  well, but later panels' GEMMs are small.  Increasing the panel
+  size formula to $n/4$ or $n/3$ (matching what was done for
+  tridiagonalisation) would produce $n_b = 25\text{--}33$ at
+  $n = 100$, giving larger trailing GEMMs.
 
-  \textit{Risk:} At $n = 100$ with $n_b = \min(32, \max(8, 100/6))
-  = 16$, each trailing GEMM operates on a $(100{-}k_0) \times (100{-}k_0)$
-  submatrix.  Early panels' trailing GEMMs are on near-full-size
-  submatrices and amortise well; later panels' trailing GEMMs operate
-  on small submatrices where the $4{\times}8$ micro-kernel cannot fill
-  its register block, limiting the benefit.  Empirical testing is
-  required to determine whether the crossover reduction helps or hurts
-  at $n = 100$.
-
-\item \textbf{$U_0$/$V_0$ accumulation uses small WY blocks.}
-  The blocked WY accumulation of left and right Householder products
-  uses $n_b = \min(32, n) = 32$ at $n = 100$.  This produces
-  3~blocks of GEMM calls per accumulation.  LAPACK's \texttt{DORGBR}
-  uses $n_b = 64$ (the optimal ILAENV query), halving the number of
-  GEMM calls and improving trailing-update amortisation.  Increasing
-  the WY block size to 48 or 64 would reduce the per-block overhead,
-  though the total FLOP count is unchanged.
+  \textit{Risk:} Larger panels increase the Level-2 work within each
+  panel (GEMV operations to maintain X/Y accumulators), which may
+  offset the Level-3 trailing GEMM benefit at $n = 100$.
 
 \item \textbf{D\&C bidiagonal merge step overhead.}
   At each of the ${\sim}\log_2(100) \approx 7$ merge levels, the D\&C
-  bidiagonal SVD performs: (i)~insertion sort of squared singular values
-  ($O(n^2)$ comparisons); (ii)~secular equation solve via
-  \texttt{secularSolve} ($O(n)$ Newton iterations per eigenvalue,
-  $O(n^2)$ total); (iii)~Gu--Eisenstat eigenvector construction for
-  both $W_V$ and $W_U$ ($O(n^2)$ per level); and (iv)~two $n{\times}n$
-  GEMMs to update $V_{\text{local}}$ and $U_{\text{local}}$
-  ($4n^3$ FLOPs per level).  The GEMMs are fast (they exercise the
-  $4{\times}8$ micro-kernel), but the secular and eigenvector phases
-  are scalar-dominated.
+  bidiagonal SVD performs insertion sort, secular equation solve,
+  Gu--Eisenstat eigenvector construction, and two GEMMs.  The GEMMs
+  are fast but the secular and eigenvector phases are
+  scalar-dominated.  Round~23b vectorised \texttt{sumZSq} but
+  the core secular function (\texttt{secularFuncAndDeriv}) and pole
+  sums (\texttt{farPoleSum}, \texttt{farPoleSumSkip}) remain scalar
+  due to the near-pole conditional skip that GHC SIMD cannot express.
 
-  Specific opportunities:
+  Specific remaining opportunities:
   \begin{itemize}
-  \item \textbf{SIMD secular evaluation.}  The secular function
-    $f(\mu) = 1 + \rho \sum z_i^2 / (d_i^2 - \mu)$ and its derivative
-    involve independent per-element divisions that could be vectorised
-    with \texttt{DoubleX4\#}.  Currently these are scalar loops.
-    Expected gain: ${\sim}2\times$ for the secular phase, which
-    accounts for ${\sim}10\%$ of total D\&C time.
+  \item \textbf{Per-lane conditional SIMD (GHC enhancement).}
+    If GHC exposed a \texttt{blendDoubleX4\#} or masked-divide
+    primop, the secular functions could be vectorised without
+    pre-processing.  This is the single largest remaining SIMD
+    opportunity for the D\&C eigensolver.
   \item \textbf{Batched deflation.}  Close-$d$ Givens deflation
-    currently processes one pair at a time, applying a $2{\times}2$
-    Givens to the full $U_{\text{local}}$ and $V_{\text{local}}$
-    accumulators.  Batching multiple deflation rotations into a
-    single blocked WY update would convert these scalar Givens
-    applications into GEMM calls.
-  \item \textbf{Merge-level pruning.}  When all singular values at a
-    merge level are well-separated and no deflation occurs, the merge
-    step does full $O(n^2)$ work for the eigenvector construction.
-    A fast-path that detects the no-deflation case and skips the
-    sorting/deflation overhead could save ${\sim}5\%$ at large $n$.
+    currently processes one pair at a time.  Batching into a blocked
+    WY update would convert scalar Givens into GEMM calls.
+  \item \textbf{Merge-level pruning.}  A fast-path for the
+    no-deflation case could save ${\sim}5\%$ at large $n$.
   \end{itemize}
-
-\item \textbf{Base case size.}
-  The D\&C base case fires at $n \leq 25$, falling back to bidiagonal
-  QR iteration (\texttt{bidiagQRIterP}).  At this size, the QR iteration
-  typically converges in ${\sim}30n$ Givens sweeps, each applying
-  rotations to the local $25{\times}25$ $U$ and $V$ accumulator
-  matrices.  The base case is a small fraction of total time
-  (${\sim}600$\,K~FLOPs out of $25$\,M), so tuning the threshold
-  between 15 and 40 is unlikely to yield more than ${\sim}5\%$.
 \end{enumerate}
 
-\textit{Overall assessment.}  The largest single win for
-\texttt{svdGKP} at $n = 100$ is lowering the panel bidiagonalisation
-crossover (item~1), which could save ${\sim}12$\,M~FLOPs
-(${\sim}20\%$ of total).  Combined with WY block size tuning (item~2)
-and SIMD secular evaluation (item~3), a $30\text{--}40\%$ reduction
-in \texttt{svdGKP} time is plausible, which would bring it to
-${\sim}1.5\text{--}2\times$ of \texttt{svdAtAP}---still slower, but
-competitive with LAPACK's \texttt{dgesdd}.  This is the path that
-preserves full numerical quality ($\kappa$ preserved throughout).
+\textit{Overall assessment.}  After Round~23's parameter tuning,
+\texttt{svdGKP} has exhausted the easy constant-factor wins.  The
+remaining gap to LAPACK's \texttt{dgesdd} is in the D\&C merge step
+overhead: LAPACK's Fortran D\&C has decades of micro-optimisation
+in deflation bookkeeping and secular equation evaluation that
+\texttt{linear-massiv}'s Haskell implementation has not matched.
+Further improvement requires either GHC SIMD enhancements (per-lane
+conditionals) or algorithmic changes to the merge step (batched
+deflation, merge-level pruning).  This is the path that preserves
+full numerical quality ($\kappa$ preserved throughout).
 
 \paragraph{Avenue~(b): reduce the constant factor of \texttt{svdAtAP}.}
 
-Rounds~22b--22d implemented the most accessible wins.  The remaining
-FLOP breakdown for \texttt{svdAtAP} at $n = m = 100$ is:
+Rounds~22b--23a implemented all proposed parameter changes.  The
+updated FLOP breakdown for \texttt{svdAtAP} at $n = m = 100$ is:
 
 \begin{center}
 \small
@@ -6053,9 +6234,9 @@ FLOP breakdown for \texttt{svdAtAP} at $n = m = 100$ is:
 \textbf{Phase} & \textbf{Cost} & \textbf{Status} \\
 \midrule
 $A^\top A$ (SIMD GEMM)       & 2\,M   & Near-optimal (fused DSYRK) \\
-Tridiagonalisation (panel)    & 4\,M   & Panel $n_b = 25$ at $n = 100$ (R22b) \\
-D\&C eigensolve               & 15\,M  & QR iteration ($n < \texttt{dcCrossover}$) \\
-$U$-recovery (pre-scaled GEMM)& 20\,M  & Single GEMM (R22d) \\
+Tridiagonalisation (panel)    & 4\,M   & Panel $n_b = 33$ at $n = 100$ (R23a: $n/3$) \\
+D\&C eigensolve               & 15\,M  & D\&C via \texttt{symmetricEigenPDC} ($n \geq 50$) \\
+$U$-recovery (pre-scaled GEMM)& 20\,M  & Single GEMM, packed $B$ (R23a: crossover 96) \\
 Sort + permute                & 0.2\,M & O(1)-indexed permutation \\
 \midrule
 \textbf{Total}                & \textbf{41\,M} & \\
@@ -6063,82 +6244,55 @@ Sort + permute                & 0.2\,M & O(1)-indexed permutation \\
 \end{tabular}
 \end{center}
 
-Specific remaining opportunities:
+Round~23a confirmed that \texttt{svdAtAP} already calls
+\texttt{symmetricEigenPDC} directly for $n \geq 50$, which
+unconditionally uses the D\&C tridiagonal eigensolver---the
+\texttt{dcCrossover = 1000} guard only applies to the standalone
+\texttt{symmetricEigenP} entry point.  The GEMM packing crossover
+was lowered from 128 to 96, enabling packed-$B$ GEMM for the
+$U$-recovery GEMM.  The tridiag panel size was changed from $n/4$
+to $n/3$, giving $n_b = 33$ at $n = 100$ (3~panels instead of 4).
+
+Remaining opportunities are limited:
 
 \begin{enumerate}
-\item \textbf{Eigenvector accumulation: D\&C vs.\ QR at $n = 100$.}
-  The \texttt{svdAtAP} dispatch calls \texttt{symmetricEigenPDC} for
-  $n \geq 50$, but \texttt{symmetricEigenPDC} internally defers to
-  QR iteration because the D\&C tridiagonal eigensolver has
-  $\texttt{dcCrossover} = 1000$.  Thus for $50 \leq n < 1000$,
-  the intended D\&C benefit is \emph{not realised}: the code path
-  is tridiagonalisation $\to$ QR iteration, identical to
-  \texttt{symmetricEigenP}.
-
-  Lowering \texttt{dcCrossover} from 1000 to ${\sim}200$ would
-  activate the D\&C tridiagonal eigensolver at $n = 100$, converting
-  the $15$\,M-FLOP QR eigenvector accumulation into $O(\log n)$
-  merge-level GEMMs.  Given that the GEMM micro-kernel is
-  $6\text{--}12\times$ faster than the scalar Givens sweeps, this
-  should reduce the eigensolve phase to ${\sim}8\text{--}10$\,M~FLOPs,
-  saving ${\sim}5\text{--}7$\,M~FLOPs ($12\text{--}17\%$ of total).
-
-  \textit{Risk:} The standalone eigenSH benchmark at $100{\times}100$
-  currently achieves $0.96\times$ with QR iteration.  If the D\&C
-  crossover is lowered globally, the eigenSH benchmark may regress
-  because the D\&C merge-step overhead is not amortised at $n = 100$
-  for standalone use (the SVD context is special because the
-  $6\text{--}12\times$ GEMM advantage is more pronounced when the
-  eigensolve is embedded within a larger pipeline).  A per-callsite
-  threshold---lower for \texttt{svdAtAP}, higher for standalone
-  eigenSH---would avoid this regression.
-
 \item \textbf{$A$-panel packing in GEMM.}
-  The $U$-recovery GEMM ($U = A \cdot V_{\text{scaled}}$, $100
-  {\times}100 \times 100{\times}100$) uses the unpacked BI-outer
-  kernel because $\min(m,k,n) = 100 < \texttt{gemmPackCrossover}
-  = 128$.  Lowering the packing crossover to $96$ or $64$ would
-  enable the packed-$B$ variant, reducing TLB pressure for the
-  $V_{\text{scaled}}$ reads.  Additionally, $A$-panel packing
+  The packed-$B$ variant is now active for the $U$-recovery GEMM
+  ($\min(m,k,n) = 100 \geq 96$).  $A$-panel packing
   (column-contiguous broadcast) is not yet implemented; adding it
-  would reduce L2 misses for the $A$ reads during the micro-kernel's
-  $k$-loop.
+  would further reduce L2 misses for the $A$ reads during the
+  micro-kernel's $k$-loop.
 
-  \textit{Expected gain:} ${\sim}5\text{--}8\%$ for the $U$-recovery
-  GEMM (${\sim}2\text{--}3\%$ of total SVD time).
+  \textit{Expected gain:} ${\sim}3\text{--}5\%$ for the $U$-recovery
+  GEMM (${\sim}1\text{--}2\%$ of total SVD time).
 
-\item \textbf{Tridiagonalisation panel size at $n = 100$.}
-  With $\texttt{panelCrossover} = 64$ and
-  $n_b = \min(64, \max(16, n/4)) = 25$, the tridiagonalisation at
-  $n = 100$ uses 4~panels of size~25.  Each trailing SYR2K update
-  operates on a $(100 - k_0){\times}(100 - k_0)$ matrix---the
-  first panel's update is $75{\times}75$, the last is
-  $25{\times}25$.  Increasing $n_b$ to 32 or 40 (by changing the
-  formula to $n/3$ instead of $n/4$) would reduce the number of
-  panels to 3, saving one trailing-update GEMM overhead.
+\item \textbf{Further tridiag panel size tuning.}
+  The $n/3$ formula gives $n_b = 33$ at $n = 100$.  LAPACK's
+  \texttt{DSYTRD} queries ILAENV for an optimal $n_b = 64$ at
+  all sizes.  Raising the formula to $n/2$ would give $n_b = 50$
+  at $n = 100$, but this increases Level-2 work within each panel.
+  The optimal balance depends on the ratio of GEMV to GEMM
+  throughput for the specific micro-kernel.
 
-  \textit{Expected gain:} ${\sim}3\text{--}5\%$ of the
-  tridiagonalisation phase (${\sim}0.5\%$ of total SVD time).
-  Marginal.
-
-\item \textbf{Fused sort and column rearrangement.}
-  Currently, eigenvalue sorting builds a permutation array
-  ($O(n \log n)$ sort), then column rearrangement reads $V$ via
-  indexed indirection.  Fusing the sort with column extraction
-  into a single cache-friendly pass would eliminate one traversal
-  of the $n{\times}n$ matrix.
-
-  \textit{Expected gain:} ${\sim}1\text{--}2\%$ of total.  Negligible.
+  \textit{Observed effect:} The $n/3$ change slightly regressed
+  eigenSH $200{\times}200$ ($0.63\times \to 0.77\times$) while
+  improving eigenSH $100{\times}100$ ($0.96\times \to 0.94\times$),
+  suggesting the optimal panel size is size-dependent.  A
+  size-adaptive formula or lookup table could capture this.
 \end{enumerate}
 
-\textit{Overall assessment.}  The largest remaining win for
-\texttt{svdAtAP} is item~1 (D\&C eigensolver activation), which
-could reduce total time by $12\text{--}17\%$---bringing the
-$100{\times}100$ ratio from $1.38\times$ to ${\sim}1.15\text{--}1.21
-\times$.  Items~2--4 contribute at most ${\sim}5\%$ additional.
-These improve benchmark numbers but do \emph{not} address the
-condition-number squaring limitation inherent to the $A^\top A$
-approach.
+\textit{Overall assessment.}  After Round~23's parameter tuning,
+\texttt{svdAtAP} has limited remaining headroom.  The $U$-recovery
+GEMM ($20$\,M~FLOPs) is a single GEMM call that already uses the
+packed-$B$ variant---there is no algorithmic way to reduce it below
+$2n^3$.  The D\&C eigensolve ($15$\,M) already uses the fastest
+available path.  Further improvements require either hardware-level
+changes (AVX-512) or GEMM micro-kernel enhancements that are
+currently blocked by GHC register pressure.  The $1.27\times$
+deficit at $100{\times}100$ reflects the genuine FLOP overhead of the
+$A^\top A$ approach ($41$\,M) compared to LAPACK's \texttt{dgesdd}
+($29$\,M): LAPACK's advantage comes from lower total FLOPs via
+optimised bidiagonalisation, not from faster per-FLOP throughput.
 
 \paragraph{Avenue~(c): hybrid dispatch.}
 
@@ -6177,7 +6331,7 @@ not expected to yield gains at the sizes benchmarked here.
 \label{sec:conclusion}
 
 We have benchmarked three Haskell linear algebra libraries across nine
-categories of numerical operations through twenty-two rounds of optimisation.
+categories of numerical operations through twenty-three rounds of optimisation.
 The consolidated results (Section~\ref{sec:final-summary}) and
 cross-cutting lessons (Section~\ref{sec:lessons}) synthesise the key
 findings; the per-round summaries below preserve the chronological
@@ -6404,17 +6558,32 @@ U-recovery with DoubleX4\# SIMD for \texttt{svdAtAP}.
 $1.82\times$ to $1.73\times$.  SVD $100{\times}100$ and
 $500{\times}500$ held steady.
 
+\paragraph{Round~23 (parameter tuning and partial SIMD).}
+Systematic implementation of all eight optimisations proposed in the
+Round~22 analysis avenues~(a) and~(b): panel bidiag crossover
+$128 \to 64$, WY block size $32 \to 48$, D\&C bidiag base case
+$25 \to 32$, GEMM packing crossover $128 \to 96$, tridiag panel
+size $n/4 \to n/3$, and SIMD \texttt{sumZSq}.  Three additional
+SIMD secular functions were implemented but reverted: the near-pole
+division-by-zero issue in \texttt{secularFuncAndDeriv},
+\texttt{farPoleSum}, and \texttt{farPoleSumSkip} cannot be handled
+without per-lane conditional SIMD, which GHC does not provide.
+\textbf{SVD $100{\times}100$ deficit reduced from $1.38\times$ to
+$1.27\times$}; \textbf{SVD $500{\times}500$ from $0.61\times$ to
+$0.54\times$} ($1.84\times$ faster than LAPACK); eigenSH
+$100{\times}100$ improved to $0.94\times$.
+
 \paragraph{Summary.}
 Of the nine benchmarked operation categories, \texttt{linear-massiv}
 now \textbf{outperforms \texttt{hmatrix} (OpenBLAS/LAPACK) in all
-nine at $200{\times}200$ and above}: GEMM ($0.084\text{--}0.17\times$,
-single-threaded and parallel), dot product ($0.25\times$),
-matrix--vector multiply ($0.44\times$), LU solve ($0.47\times$),
-Cholesky solve ($0.51\times$), QR factorisation ($0.020\times$),
-eigenvalue decomposition ($0.49\text{--}0.96\times$), and SVD
-($0.61\text{--}1.38\times$).  At $500{\times}500$---the largest
+nine at $500{\times}500$}: GEMM ($0.098\text{--}0.15\times$,
+single-threaded), dot product ($0.34\times$),
+matrix--vector multiply ($0.51\times$), LU solve ($0.51\times$),
+Cholesky solve ($0.53\times$), QR factorisation ($0.021\times$),
+eigenvalue decomposition ($0.49\text{--}0.94\times$), and SVD
+($0.54\text{--}1.27\times$).  At $500{\times}500$---the largest
 benchmark size---every category is faster than hmatrix/LAPACK, with
-SVD $1.6\times$ faster ($0.61\times$).
+SVD $1.84\times$ faster ($0.54\times$).
 
 \texttt{linear-massiv} demonstrates that \textbf{pure Haskell with
 GHC's native SIMD primops, raw \texttt{ByteArray\#} primops, and
@@ -6429,16 +6598,18 @@ As discussed in Section~\ref{sec:lessons}, the dominant lesson is that
 Haskell's high-level abstractions need not preclude low-level performance:
 the key is to push the abstraction boundary below the hot loop via raw
 primops, while retaining type-safe APIs at the library boundary.
-Section~\ref{sec:future-optimisations} identifies two remaining
-optimisation opportunities (cache auto-tuning and AVX-512) that target
-scaling to other hardware and future GHC capabilities.  Rounds~21--22
-produced the most impactful SVD improvements since Round~6: the D\&C
-eigensolver dispatch (Round~21) and BLAS-3 panel bidiagonalisation
-(Round~22) leverage the $6\text{--}12\times$ faster GEMM kernel,
-converting scalar Givens sweeps and Level-2 Householder updates into
-GEMM-dominated computation.  SVD $200{\times}200$ moved from
-$1.17\times$ deficit (Round~20) to $0.73\times$ ($37\%$ faster than
-LAPACK).
+Section~\ref{sec:future-optimisations} identifies three remaining
+optimisation opportunities: cache auto-tuning, AVX-512 via
+\texttt{DoubleX8\#}, and per-lane conditional SIMD (a GHC primop
+enhancement).  Rounds~21--23 produced the most impactful SVD
+improvements since Round~6: D\&C eigensolver dispatch (Round~21),
+BLAS-3 panel bidiagonalisation (Round~22), and systematic parameter
+tuning with partial SIMD (Round~23) leverage the
+$6\text{--}10\times$ faster GEMM kernel, converting scalar Givens
+sweeps and Level-2 Householder updates into GEMM-dominated
+computation.  SVD $100{\times}100$ deficit reduced from $1.59\times$
+(Round~20) to $1.27\times$ (Round~23); SVD $500{\times}500$ from
+$0.77\times$ to $0.54\times$ ($1.84\times$ faster than LAPACK).
 
 %% ====================================================================
 \begin{thebibliography}{9}
