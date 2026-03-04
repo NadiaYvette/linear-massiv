@@ -58,6 +58,69 @@
 --    auditability. Benchmarks compare performance across massiv representations
 --    and parallelism strategies.
 --
+-- = Internal Architecture: Two-Layer Design
+--
+-- @linear-massiv@ uses a two-layer architecture that separates the type-safe
+-- public API from the performance-critical internal representation:
+--
+-- * __Public layer__: 'Matrix' and 'Vector' are @newtype@ wrappers around
+--   massiv's @Array r Ix2 e@, providing compile-time dimension checking via
+--   phantom @Nat@ parameters and representation polymorphism via @r@.
+--
+-- * __Internal layer__: Performance-critical inner loops (GEMM, QR,
+--   tridiagonalisation, SVD, etc.) unwrap the massiv array to a raw
+--   @ByteArray#@ \/ @MutableByteArray#@ and operate directly via GHC primops,
+--   including @DoubleX4#@ AVX2 SIMD instructions compiled through the LLVM 17
+--   backend.  Functions receive @(ByteArray, offset, stride)@ triples, enabling
+--   zero-copy submatrix views for panel factorisations.
+--
+-- This separation is essential for performance.  Benchmarks (Round 3 of the
+-- accompanying report) showed that massiv's per-element @M.readM@\/@M.write_@
+-- abstraction layer imposed a 240–330× penalty on BLAS operations relative to
+-- direct primop access, even though the underlying memory layout is identical.
+-- The raw primop layer eliminates this overhead while the @newtype@ wrapper
+-- preserves type safety at the API boundary.
+--
+-- == Why not @vector-sized@ or @linear@'s @V@?
+--
+-- The @<https://hackage.haskell.org/package/vector-sized vector-sized>@ package
+-- provides an @Unbox (Vector n a)@ instance that stores
+-- @Vector m (Vector n Double)@ as a contiguous flat @ByteArray@ of @m × n@
+-- doubles.  While the __memory layout__ is correct, contiguous memory alone is
+-- insufficient for high-performance numerical kernels:
+--
+-- * __Per-element typeclass dispatch__: Every access goes through
+--   @basicUnsafeRead@ \/ @basicUnsafeWrite@ of the @Unbox@ data family.
+--   Reading element @(i, j)@ requires indexing the outer vector to obtain a
+--   @Vector n Double@ (constructing an intermediate slice), then indexing that.
+--   @linear-massiv@ computes @off + i * stride + j@ and issues a single
+--   @readDoubleArray#@ primop.
+--
+-- * __No SIMD access__: The 4×8 GEMM micro-kernel loads 4 consecutive doubles
+--   via @indexDoubleArrayAsDoubleX4# ba# (off# +# i#)@—a direct 256-bit AVX2
+--   load from a computed byte offset.  The @Unbox@ typeclass does not expose
+--   the underlying @ByteArray#@, and GHC cannot optimise through the data
+--   family indirection to produce equivalent code.
+--
+-- * __No mutable primop access__: In-place factorisations (LU, QR,
+--   tridiagonalisation, bidiagonalisation) require @writeDoubleArray#@ on
+--   @MutableByteArray#@ with computed offsets.  The @MVector@ abstraction
+--   interposes allocation and function calls that prevent the tight unboxed
+--   loops needed for competitive performance.
+--
+-- * __No zero-copy submatrix views__: Panel factorisations pass
+--   @(ByteArray, offset, stride)@ triples to kernels, enabling zero-copy views
+--   into submatrices.  @Vector n a@ does not naturally express "this row starts
+--   at byte offset X in a larger backing array."
+--
+-- The @<https://hackage.haskell.org/package/linear linear>@ library's @V n a@
+-- uses @Vector@ from the @vector@ package internally and is designed for small
+-- fixed-size vectors (V2–V4) where GHC can fully unbox everything.  At
+-- @n = 100–500@, @V n (V m Double)@ would be a vector-of-vectors with per-row
+-- indirection—catastrophic for cache locality and SIMD vectorisation.
+-- @linear-massiv@ provides conversion functions ('fromLinearV', 'fromV2', etc.)
+-- in "Numeric.LinearAlgebra.Massiv.Linear" for interoperability.
+--
 -- = Quick Start
 --
 -- @
