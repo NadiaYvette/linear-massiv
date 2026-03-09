@@ -1,7 +1,7 @@
 cabal-version: 3.0
 name:          linear-massiv
 category:      Math, Algebra, Numerical
-version:       0.1.0.1
+version:       0.1.0.2
 author:        Nadia Chambers
 maintainer:    Nadia Yvette Chambers <nadia.yvette.chambers@gmail.com>
 synopsis:      Type-safe numerical linear algebra backed by massiv arrays
@@ -45,7 +45,7 @@ library
     Numeric.LinearAlgebra.Massiv.Linear
   build-depends:
     base >= 4.16 && < 5,
-    ghc-prim < 1.0.0,
+    ghc-prim < 1,
     massiv >= 1.0 && < 2,
     linear >= 1.21 && < 2,
     vector >= 0.12 && < 1,
@@ -65,7 +65,7 @@ library
     MultiParamTypeClasses
     StandaloneDeriving
     DerivingStrategies
-  ghc-options: -Wall -O2
+  ghc-options: -Wall -O1
 
 test-suite linear-massiv-test
   type: exitcode-stdio-1.0
@@ -132,7 +132,7 @@ benchmark linear-massiv-bench
     FlexibleContexts
     FlexibleInstances
     MultiParamTypeClasses
-  ghc-options: -Wall -O2 -threaded -rtsopts "-with-rtsopts=-N"
+  ghc-options: -Wall -O1 -threaded -rtsopts "-with-rtsopts=-N"
 
 benchmark linear-massiv-comparison
   type: exitcode-stdio-1.0
@@ -159,4 +159,4 @@ benchmark linear-massiv-comparison
     FlexibleContexts
     FlexibleInstances
     MultiParamTypeClasses
-  ghc-options: -Wall -O2 -threaded -rtsopts "-with-rtsopts=-N"
+  ghc-options: -Wall -O1 -threaded -rtsopts "-with-rtsopts=-N"
