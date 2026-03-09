@@ -49,7 +49,6 @@ module Numeric.LinearAlgebra.Massiv.Linear
   ) where
 
 import qualified Data.Massiv.Array as M
-import Data.Massiv.Array (Ix1, Ix2(..), Sz(..))
 import qualified Data.Vector as BV
 import GHC.TypeNats (KnownNat, natVal)
 import Data.Proxy (Proxy(..))

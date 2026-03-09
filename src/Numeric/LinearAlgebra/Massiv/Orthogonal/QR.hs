@@ -62,7 +62,7 @@ module Numeric.LinearAlgebra.Massiv.Orthogonal.QR
   ) where
 
 import qualified Data.Massiv.Array as M
-import Data.Massiv.Array (Ix1, Ix2(..), Sz(..), unwrapByteArray, unwrapByteArrayOffset,
+import Data.Massiv.Array (Ix2(..), unwrapByteArray, unwrapByteArrayOffset,
                           unwrapMutableByteArray, unwrapMutableByteArrayOffset)
 import GHC.TypeNats (KnownNat)
 import Control.Monad (when)
@@ -76,7 +76,7 @@ import Numeric.LinearAlgebra.Massiv.Internal
 import Numeric.LinearAlgebra.Massiv.Orthogonal.Givens
   (givensRotation)
 import Numeric.LinearAlgebra.Massiv.Internal.Kernel
-  (rawMutSumSqColumn, rawMutSumProdColumns, rawMutHouseholderApply, rawMutQAccum,
+  (rawMutSumSqColumn, rawMutHouseholderApply, rawMutQAccum,
    rawGemmKernel, rawZeroDoubles, rawNegateDoubles)
 
 -- | Full QR factorisation via Householder reflections (GVL4 Algorithm 5.2.1, p. 249).

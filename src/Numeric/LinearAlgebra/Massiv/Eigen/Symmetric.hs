@@ -787,51 +787,6 @@ symmetricEigenPDC a tol =
   in (dArr, MkMatrix qArr)
 {-# NOINLINE symmetricEigenPDC #-}
 
--- | Parallel QR loop: forks independent sub-problems when a split is found.
--- Operates in IO to enable forkIO for non-overlapping sub-problem ranges.
-rawTridiagQRLoopPar :: MutableByteArray RealWorld -> Int
-                    -> MutableByteArray RealWorld -> Int
-                    -> MutableByteArray RealWorld -> Int
-                    -> Int -> Int -> Double -> IO ()
-rawTridiagQRLoopPar mbaD offD mbaSD offSD mbaQ offQ nn maxIter tol = go 0 0 (nn - 1)
-  where
-    rd mba off i = stToIO (readRawD mba off i)
-    wr mba off i v = stToIO (writeRawD mba off i v)
-
-    go !iter !lo !hi
-      | iter >= maxIter = pure ()
-      | lo >= hi = pure ()
-      | otherwise = do
-          sdhi <- rd mbaSD offSD (hi - 1)
-          dhi1 <- rd mbaD offD (hi - 1)
-          dhi  <- rd mbaD offD hi
-          if abs sdhi <= tol * (abs dhi1 + abs dhi)
-            then do wr mbaSD offSD (hi - 1) 0; go iter lo (hi - 1)
-            else do
-              sdlo <- rd mbaSD offSD lo
-              dlo  <- rd mbaD offD lo
-              dlo1 <- rd mbaD offD (lo + 1)
-              if abs sdlo <= tol * (abs dlo + abs dlo1)
-                then do wr mbaSD offSD lo 0; go iter (lo + 1) hi
-                else do
-                  split <- stToIO $ rawFindSplit mbaD offD mbaSD offSD lo hi tol
-                  case split of
-                    Just q -> do
-                      wr mbaSD offSD q 0
-                      done <- newEmptyMVar
-                      _ <- forkIO $ do
-                        go iter lo q
-                        putMVar done ()
-                      go iter (q + 1) hi
-                      takeMVar done
-                    Nothing -> do
-                      let sp1 = sdhi
-                          delta = (dhi1 - dhi) / 2
-                          sgn = if delta >= 0 then 1 else -1
-                          shift = dhi - sp1*sp1 / (delta + sgn * sqrt (delta*delta + sp1*sp1))
-                      stToIO $ rawImplicitQRStep mbaD offD mbaSD offSD mbaQ offQ nn shift lo hi
-                      go (iter + 1) lo hi
-
 -- | Parallel QR loop with column-major Q for SIMD Givens.
 rawTridiagQRLoopParCM :: MutableByteArray RealWorld -> Int
                       -> MutableByteArray RealWorld -> Int
@@ -1500,7 +1455,7 @@ secularSolveOne mbaD offD mbaZ offZ rho j nn = do
             !mid = dj + gap * 0.5
         lam0 <- fixedWeightLoop 0 mid dj dj1 dj dj1 gap zj2 (zj1 * zj1)
         -- Polish with Newton iterations for higher accuracy
-        newtonPolish 0 lam0 dj dj1
+        newtonPolish (0::Int) lam0 dj dj1
       else do
         -- Last root when rho > 0: between d[n-1] and d[n-1] + rho*||z||²
         zn2 <- sumZSq mbaZ offZ nn

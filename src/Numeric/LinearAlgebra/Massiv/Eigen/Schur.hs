@@ -45,7 +45,6 @@ module Numeric.LinearAlgebra.Massiv.Eigen.Schur
   ) where
 
 import qualified Data.Massiv.Array as M
-import Data.Massiv.Array (Ix2(..), Sz(..))
 import GHC.TypeNats (KnownNat)
 
 import Numeric.LinearAlgebra.Massiv.Types
@@ -147,8 +146,7 @@ qrStepGivens :: forall n r e. (KnownNat n, M.Manifest r e, Floating e, Ord e)
              => Matrix n n r e -> Matrix n n r e -> e -> Int
              -> (Matrix n n r e, Matrix n n r e)
 qrStepGivens q h shift p =
-  let nn = dimVal @n
-      -- Apply shift: H ← H - σI
+  let -- Apply shift: H ← H - σI
       h_shifted = makeMatrix @n @n @r $ \i j ->
         if i == j then (h ! (i, j)) - shift else h ! (i, j)
       -- QR factorization via Givens rotations (only on the active part)
@@ -165,7 +163,6 @@ applyGivensQR :: forall n r e. (KnownNat n, M.Manifest r e, Floating e, Ord e)
               => Matrix n n r e -> Int -> ([(e, e, Int)], Matrix n n r e)
 applyGivensQR h p = foldl step ([], h) [0..p-1]
   where
-    nn = dimVal @n
     step (rots, hh) k =
       let (c, s) = givensRotation (hh ! (k, k)) (hh ! (k+1, k))
           hh' = applyGivensLeftSq c s k (k+1) hh
@@ -234,26 +231,23 @@ updateQ q rots _ = foldl (\qq (c, s, k) ->
 -- See GVL4 Section 7.5 for the definition of the real Schur form.
 eigenvalues :: forall n r e. (KnownNat n, M.Manifest r e, Floating e, Ord e)
             => Matrix n n r e -> [e]
-eigenvalues t =
-  let nn = dimVal @n
-  in go 0
-  where
-    nn = dimVal @n
-    go i
-      | i >= nn = []
-      | i == nn - 1 = [t ! (i, i)]  -- Last 1×1 block
-      | abs (t ! (i+1, i)) < 1e-12 * (abs (t ! (i, i)) + abs (t ! (i+1, i+1))) =
-          -- 1×1 block
-          t ! (i, i) : go (i + 1)
-      | otherwise =
-          -- 2×2 block: eigenvalues of [[a,b],[c,d]]
-          let a = t ! (i, i)
-              b = t ! (i, i+1)
-              c = t ! (i+1, i)
-              d = t ! (i+1, i+1)
-              tr = a + d
-              det_ = a * d - b * c
-              disc = tr * tr / 4 - det_
-          in if disc >= 0
-             then (tr / 2 + sqrt disc) : (tr / 2 - sqrt disc) : go (i + 2)
-             else tr / 2 : tr / 2 : go (i + 2)  -- Complex pair, return real parts
+eigenvalues t = go 0 where
+  nn = dimVal @n
+  go i
+    | i >= nn = []
+    | i == nn - 1 = [t ! (i, i)]  -- Last 1×1 block
+    | abs (t ! (i+1, i)) < 1e-12 * (abs (t ! (i, i)) + abs (t ! (i+1, i+1))) =
+        -- 1×1 block
+        t ! (i, i) : go (i + 1)
+    | otherwise =
+        -- 2×2 block: eigenvalues of [[a,b],[c,d]]
+        let a = t ! (i, i)
+            b = t ! (i, i+1)
+            c = t ! (i+1, i)
+            d = t ! (i+1, i+1)
+            tr = a + d
+            det_ = a * d - b * c
+            disc = tr * tr / 4 - det_
+        in if disc >= 0
+           then (tr / 2 + sqrt disc) : (tr / 2 - sqrt disc) : go (i + 2)
+           else tr / 2 : tr / 2 : go (i + 2)  -- Complex pair, return real parts

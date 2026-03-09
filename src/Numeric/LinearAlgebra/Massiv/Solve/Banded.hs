@@ -61,7 +61,7 @@ module Numeric.LinearAlgebra.Massiv.Solve.Banded
   ) where
 
 import qualified Data.Massiv.Array as M
-import Data.Massiv.Array (Ix1, Ix2(..), Sz(..))
+import Data.Massiv.Array (Ix2(..))
 import GHC.TypeNats (KnownNat)
 
 import Numeric.LinearAlgebra.Massiv.Types

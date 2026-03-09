@@ -66,7 +66,7 @@ module Numeric.LinearAlgebra.Massiv.Solve.LU
   ) where
 
 import qualified Data.Massiv.Array as M
-import Data.Massiv.Array (Ix1, Ix2(..), Sz(..), unwrapByteArray, unwrapByteArrayOffset,
+import Data.Massiv.Array (Ix1, Ix2(..), unwrapByteArray, unwrapByteArrayOffset,
                           unwrapMutableByteArray, unwrapMutableByteArrayOffset)
 import GHC.TypeNats (KnownNat)
 import Data.Ord (comparing)

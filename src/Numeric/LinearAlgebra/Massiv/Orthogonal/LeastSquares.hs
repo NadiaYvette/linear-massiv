@@ -54,7 +54,6 @@ module Numeric.LinearAlgebra.Massiv.Orthogonal.LeastSquares
   ) where
 
 import qualified Data.Massiv.Array as M
-import Data.Massiv.Array (Ix2(..), Sz(..))
 import GHC.TypeNats (KnownNat)
 
 import Numeric.LinearAlgebra.Massiv.Types
@@ -92,9 +91,7 @@ import Numeric.LinearAlgebra.Massiv.Solve.Cholesky (choleskySolve)
 leastSquaresQR :: forall m n r e. (KnownNat m, KnownNat n, M.Manifest r e, Floating e, Ord e)
                => Matrix m n r e -> Vector m r e -> Vector n r e
 leastSquaresQR a b =
-  let mm = dimVal @m
-      nn = dimVal @n
-      (q, r) = qr a
+  let (q, r) = qr a
       qt = transpose q
       -- qtb = Qᵀ·b (dimension m)
       qtb = matvec qt b

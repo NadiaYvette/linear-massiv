@@ -52,7 +52,6 @@ module Numeric.LinearAlgebra.Massiv.Orthogonal.Householder
   ) where
 
 import qualified Data.Massiv.Array as M
-import Data.Massiv.Array (Ix1, Ix2(..), Sz(..))
 import GHC.TypeNats (KnownNat)
 
 import Numeric.LinearAlgebra.Massiv.Types
@@ -122,7 +121,6 @@ applyHouseholderLeft :: forall m n r e. (KnownNat m, KnownNat n, M.Manifest r e,
                      => Vector m r e -> e -> Matrix m n r e -> Matrix m n r e
 applyHouseholderLeft v beta a =
   let mm = dimVal @m
-      c  = dimVal @n
   in makeMatrix @m @n @r $ \i j ->
     let -- w = βAᵀv, w(j) = β · Σᵢ v(i)·A(i,j)
         wj = beta * foldl' (\acc k -> acc + (v !. k) * (a ! (k, j))) 0 [0..mm-1]

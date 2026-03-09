@@ -63,12 +63,11 @@ module Numeric.LinearAlgebra.Massiv.Solve.Cholesky
   ) where
 
 import qualified Data.Massiv.Array as M
-import Data.Massiv.Array (Ix1, Ix2(..), Sz(..), unwrapByteArray, unwrapByteArrayOffset,
+import Data.Massiv.Array (Ix1, Ix2(..), unwrapByteArray, unwrapByteArrayOffset,
                           unwrapMutableByteArray, unwrapMutableByteArrayOffset)
 import GHC.TypeNats (KnownNat)
 import Control.Monad (when)
 import GHC.Exts
-import GHC.Prim
 import GHC.ST (ST(..))
 import Data.Primitive.ByteArray (ByteArray(..), MutableByteArray(..), newByteArray, unsafeFreezeByteArray)
 

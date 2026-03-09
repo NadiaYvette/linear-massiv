@@ -40,7 +40,6 @@ module Numeric.LinearAlgebra.Massiv.Eigen.Power
   ) where
 
 import qualified Data.Massiv.Array as M
-import Data.Massiv.Array (Ix2(..), Sz(..))
 import GHC.TypeNats (KnownNat)
 
 import Numeric.LinearAlgebra.Massiv.Types
@@ -170,8 +169,7 @@ rayleighQuotient a q0 maxIter tol = go 0 q0 (dot q0 (matvec a q0))
     go iter q lambda
       | iter >= maxIter = (lambda, q)
       | otherwise =
-        let nn = dimVal @n
-            aShifted = makeMatrix @n @n @r $ \i j ->
+        let aShifted = makeMatrix @n @n @r $ \i j ->
               if i == j then (a ! (i, j)) - lambda else a ! (i, j)
             z = luSolve aShifted q
             znorm = nrm2 z

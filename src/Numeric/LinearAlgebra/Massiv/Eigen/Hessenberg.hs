@@ -37,7 +37,6 @@ module Numeric.LinearAlgebra.Massiv.Eigen.Hessenberg
   ) where
 
 import qualified Data.Massiv.Array as M
-import Data.Massiv.Array (Ix1, Ix2(..), Sz(..))
 import GHC.TypeNats (KnownNat)
 
 import Numeric.LinearAlgebra.Massiv.Types

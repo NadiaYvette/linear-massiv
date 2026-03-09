@@ -70,11 +70,11 @@ import qualified Data.Massiv.Array as M
 import Data.Massiv.Array (Ix2(..), Sz(..), Comp(..), unwrapByteArray, unwrapByteArrayOffset,
                           unwrapMutableByteArray, unwrapMutableByteArrayOffset)
 import GHC.TypeNats (KnownNat)
-import GHC.Exts (Int(..), isTrue#, (>=#), (*#), (+#))
+import GHC.Exts (Int(..), isTrue#)
 import GHC.Prim
 import GHC.ST (ST(..))
 import Data.Array.Byte (MutableByteArray(..))
-import Data.Primitive.ByteArray (ByteArray(..), newByteArray, unsafeFreezeByteArray)
+import Data.Primitive.ByteArray (ByteArray(..))
 import Numeric.LinearAlgebra.Massiv.Types
 import Numeric.LinearAlgebra.Massiv.Internal
 import Control.Concurrent (forkOn, newEmptyMVar, putMVar, takeMVar, getNumCapabilities)

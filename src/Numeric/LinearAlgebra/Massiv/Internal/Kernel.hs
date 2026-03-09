@@ -73,7 +73,6 @@ module Numeric.LinearAlgebra.Massiv.Internal.Kernel
 import GHC.Exts
 import GHC.Prim
 import GHC.ST (ST(..))
-import GHC.Types (Double(..), Int(..))
 import Data.Primitive.ByteArray (ByteArray(..), MutableByteArray(..))
 
 -- --------------------------------------------------------------------------
@@ -287,8 +286,8 @@ rawGemmBIBJSlice (ByteArray ba_a) (I# off_a) (ByteArray ba_b) (I# off_b)
               !cOff1 = off_c +# (i +# 1#) *# n +# j
               !cOff2 = off_c +# (i +# 2#) *# n +# j
               !cOff3 = off_c +# (i +# 3#) *# n +# j
-          in case readDoubleArrayAsDoubleX4# mba_c cOff0 s of { (# s0, c0 #) ->
-             case readDoubleArrayAsDoubleX4# mba_c cOff1 s0 of { (# s1, c1 #) ->
+          in case readDoubleArrayAsDoubleX4# mba_c cOff0 s of { (# s0', c0 #) ->
+             case readDoubleArrayAsDoubleX4# mba_c cOff1 s0' of { (# s1, c1 #) ->
              case readDoubleArrayAsDoubleX4# mba_c cOff2 s1 of { (# s2, c2 #) ->
              case readDoubleArrayAsDoubleX4# mba_c cOff3 s2 of { (# s3, c3 #) ->
              case goK4x4 i j bk kEnd c0 c1 c2 c3 of
@@ -334,8 +333,8 @@ rawGemmBIBJSlice (ByteArray ba_a) (I# off_a) (ByteArray ba_b) (I# off_b)
               !cOff3 = off_c +# (i +# 3#) *# n +# j
           in case (# goK_s4 bk 0.0## 0.0## 0.0## 0.0## #) of
                (# (# d0, d1, d2, d3 #) #) ->
-                 case readDoubleArray# mba_c cOff0 s of { (# s0, v0 #) ->
-                 case writeDoubleArray# mba_c cOff0 (v0 +## d0) s0 of { s1 ->
+                 case readDoubleArray# mba_c cOff0 s of { (# s0', v0 #) ->
+                 case writeDoubleArray# mba_c cOff0 (v0 +## d0) s0' of { s1 ->
                  case readDoubleArray# mba_c cOff1 s1 of { (# s2, v1 #) ->
                  case writeDoubleArray# mba_c cOff1 (v1 +## d1) s2 of { s3 ->
                  case readDoubleArray# mba_c cOff2 s3 of { (# s4, v2 #) ->
@@ -350,8 +349,8 @@ rawGemmBIBJSlice (ByteArray ba_a) (I# off_a) (ByteArray ba_b) (I# off_b)
         | isTrue# (j >=# j8End) = s
         | otherwise =
           let !cOff = off_c +# i *# n +# j
-          in case readDoubleArrayAsDoubleX4# mba_c cOff s of { (# s0, c0 #) ->
-             case readDoubleArrayAsDoubleX4# mba_c (cOff +# 4#) s0 of { (# s1, c1 #) ->
+          in case readDoubleArrayAsDoubleX4# mba_c cOff s of { (# s0', c0 #) ->
+             case readDoubleArrayAsDoubleX4# mba_c (cOff +# 4#) s0' of { (# s1, c1 #) ->
              case goK1x8 i j bk kEnd c0 c1 of
                (# r0, r1 #) ->
                  case writeDoubleArrayAsDoubleX4# mba_c cOff r0 s1 of { sw0 ->
@@ -375,9 +374,9 @@ rawGemmBIBJSlice (ByteArray ba_a) (I# off_a) (ByteArray ba_b) (I# off_b)
         | isTrue# (j >=# j4End) = s
         | otherwise =
           let !cOff = off_c +# i *# n +# j
-          in case readDoubleArrayAsDoubleX4# mba_c cOff s of { (# s0, c0 #) ->
+          in case readDoubleArrayAsDoubleX4# mba_c cOff s of { (# s0', c0 #) ->
              case goK1x4 i j bk kEnd c0 of { r0 ->
-             case writeDoubleArrayAsDoubleX4# mba_c cOff r0 s0 of { s1 ->
+             case writeDoubleArrayAsDoubleX4# mba_c cOff r0 s0' of { s1 ->
              goJ4_1x4 i bk kEnd (j +# 4#) j4End s1
              }}}
 
@@ -421,7 +420,6 @@ rawGemmBISlicePackedBK (ByteArray ba_a) (I# off_a) (ByteArray ba_b) (I# off_b)
       !j8End = nPanels *# 8#
       !j4End = n -# (n `remInt#` 4#)
       -- Packed buffer: nPanels * bs * 8 doubles (each panel: kc × 8)
-      !packDoubles = nPanels *# bs *# 8#
 
       -- Fallback unpacked path (when j8End == 0, i.e. n < 8)
       goBI_unpacked bi s
@@ -462,8 +460,8 @@ rawGemmBISlicePackedBK (ByteArray ba_a) (I# off_a) (ByteArray ba_b) (I# off_b)
               !cOff1 = off_c +# (i +# 1#) *# n +# j
               !cOff2 = off_c +# (i +# 2#) *# n +# j
               !cOff3 = off_c +# (i +# 3#) *# n +# j
-          in case readDoubleArrayAsDoubleX4# mba_c cOff0 s of { (# s0, c0 #) ->
-             case readDoubleArrayAsDoubleX4# mba_c cOff1 s0 of { (# s1, c1 #) ->
+          in case readDoubleArrayAsDoubleX4# mba_c cOff0 s of { (# s0', c0 #) ->
+             case readDoubleArrayAsDoubleX4# mba_c cOff1 s0' of { (# s1, c1 #) ->
              case readDoubleArrayAsDoubleX4# mba_c cOff2 s1 of { (# s2, c2 #) ->
              case readDoubleArrayAsDoubleX4# mba_c cOff3 s2 of { (# s3, c3 #) ->
              case goKUfb4x4 i j bk kEnd c0 c1 c2 c3 of
@@ -508,8 +506,8 @@ rawGemmBISlicePackedBK (ByteArray ba_a) (I# off_a) (ByteArray ba_b) (I# off_b)
               !cOff3 = off_c +# (i +# 3#) *# n +# j
           in case (# goKSfb4 bk 0.0## 0.0## 0.0## 0.0## #) of
                (# (# d0, d1, d2, d3 #) #) ->
-                 case readDoubleArray# mba_c cOff0 s of { (# s0, v0 #) ->
-                 case writeDoubleArray# mba_c cOff0 (v0 +## d0) s0 of { s1 ->
+                 case readDoubleArray# mba_c cOff0 s of { (# s0', v0 #) ->
+                 case writeDoubleArray# mba_c cOff0 (v0 +## d0) s0' of { s1 ->
                  case readDoubleArray# mba_c cOff1 s1 of { (# s2, v1 #) ->
                  case writeDoubleArray# mba_c cOff1 (v1 +## d1) s2 of { s3 ->
                  case readDoubleArray# mba_c cOff2 s3 of { (# s4, v2 #) ->
@@ -523,9 +521,9 @@ rawGemmBISlicePackedBK (ByteArray ba_a) (I# off_a) (ByteArray ba_b) (I# off_b)
         | isTrue# (j >=# j4EndV) = s
         | otherwise =
           let !cOff = off_c +# i *# n +# j
-          in case readDoubleArrayAsDoubleX4# mba_c cOff s of { (# s0, c0 #) ->
+          in case readDoubleArrayAsDoubleX4# mba_c cOff s of { (# s0', c0 #) ->
              case goKUfb1x4 i j bk kEnd c0 of { r0 ->
-             case writeDoubleArrayAsDoubleX4# mba_c cOff r0 s0 of { s1 ->
+             case writeDoubleArrayAsDoubleX4# mba_c cOff r0 s0' of { s1 ->
              goJ4Ufb1 i bk kEnd (j +# 4#) j4EndV s1
              }}}
 
@@ -680,8 +678,8 @@ rawGemmBISlicePackedBK (ByteArray ba_a) (I# off_a) (ByteArray ba_b) (I# off_b)
            | otherwise =
              let !cOff = off_c +# i *# n +# j
                  !panOff = (j `quotInt#` 8#) *# kc *# 8#
-             in case readDoubleArrayAsDoubleX4# mba_c cOff s of { (# s0, c0 #) ->
-                case readDoubleArrayAsDoubleX4# mba_c (cOff +# 4#) s0 of { (# s1, c1 #) ->
+             in case readDoubleArrayAsDoubleX4# mba_c cOff s of { (# s0', c0 #) ->
+                case readDoubleArrayAsDoubleX4# mba_c (cOff +# 4#) s0' of { (# s1, c1 #) ->
                 case goKP1x8 i panOff bk 0# kc ba_bp c0 c1 of
                   (# r0, r1 #) ->
                     case writeDoubleArrayAsDoubleX4# mba_c cOff r0 s1 of { sw0 ->
@@ -712,8 +710,8 @@ rawGemmBISlicePackedBK (ByteArray ba_a) (I# off_a) (ByteArray ba_b) (I# off_b)
                  !cOff1 = off_c +# (i +# 1#) *# n +# j
                  !cOff2 = off_c +# (i +# 2#) *# n +# j
                  !cOff3 = off_c +# (i +# 3#) *# n +# j
-             in case readDoubleArrayAsDoubleX4# mba_c cOff0 s of { (# s0, c0 #) ->
-                case readDoubleArrayAsDoubleX4# mba_c cOff1 s0 of { (# s1, c1 #) ->
+             in case readDoubleArrayAsDoubleX4# mba_c cOff0 s of { (# s0', c0 #) ->
+                case readDoubleArrayAsDoubleX4# mba_c cOff1 s0' of { (# s1, c1 #) ->
                 case readDoubleArrayAsDoubleX4# mba_c cOff2 s1 of { (# s2, c2 #) ->
                 case readDoubleArrayAsDoubleX4# mba_c cOff3 s2 of { (# s3, c3 #) ->
                 case goKU4x4 i j bk kEnd c0 c1 c2 c3 of
@@ -759,8 +757,8 @@ rawGemmBISlicePackedBK (ByteArray ba_a) (I# off_a) (ByteArray ba_b) (I# off_b)
                  !cOff3 = off_c +# (i +# 3#) *# n +# j
              in case (# goKS4 bk 0.0## 0.0## 0.0## 0.0## #) of
                   (# (# d0, d1, d2, d3 #) #) ->
-                    case readDoubleArray# mba_c cOff0 s of { (# s0, v0 #) ->
-                    case writeDoubleArray# mba_c cOff0 (v0 +## d0) s0 of { s1 ->
+                    case readDoubleArray# mba_c cOff0 s of { (# s0', v0 #) ->
+                    case writeDoubleArray# mba_c cOff0 (v0 +## d0) s0' of { s1 ->
                     case readDoubleArray# mba_c cOff1 s1 of { (# s2, v1 #) ->
                     case writeDoubleArray# mba_c cOff1 (v1 +## d1) s2 of { s3 ->
                     case readDoubleArray# mba_c cOff2 s3 of { (# s4, v2 #) ->
@@ -775,9 +773,9 @@ rawGemmBISlicePackedBK (ByteArray ba_a) (I# off_a) (ByteArray ba_b) (I# off_b)
            | isTrue# (j >=# j4EndV) = s
            | otherwise =
              let !cOff = off_c +# i *# n +# j
-             in case readDoubleArrayAsDoubleX4# mba_c cOff s of { (# s0, c0 #) ->
+             in case readDoubleArrayAsDoubleX4# mba_c cOff s of { (# s0', c0 #) ->
                 case goKU1x4 i j bk kEnd c0 of { r0 ->
-                case writeDoubleArrayAsDoubleX4# mba_c cOff r0 s0 of { s1 ->
+                case writeDoubleArrayAsDoubleX4# mba_c cOff r0 s0' of { s1 ->
                 goJ4U1 i bk kEnd (j +# 4#) j4EndV s1
                 }}}
 
@@ -923,8 +921,8 @@ rawSyrkLowerKernel (ByteArray ba_a) (I# off_a)
               !cOff1 = off_c +# (i +# 1#) *# n +# j
               !cOff2 = off_c +# (i +# 2#) *# n +# j
               !cOff3 = off_c +# (i +# 3#) *# n +# j
-          in case readDoubleArrayAsDoubleX4# mba_c cOff0 s of { (# s0, c0 #) ->
-             case readDoubleArrayAsDoubleX4# mba_c cOff1 s0 of { (# s1, c1 #) ->
+          in case readDoubleArrayAsDoubleX4# mba_c cOff0 s of { (# s0', c0 #) ->
+             case readDoubleArrayAsDoubleX4# mba_c cOff1 s0' of { (# s1, c1 #) ->
              case readDoubleArrayAsDoubleX4# mba_c cOff2 s1 of { (# s2, c2 #) ->
              case readDoubleArrayAsDoubleX4# mba_c cOff3 s2 of { (# s3, c3 #) ->
              case goK4s i j bk kEnd c0 c1 c2 c3 of
@@ -972,8 +970,8 @@ rawSyrkLowerKernel (ByteArray ba_a) (I# off_a)
               !cOff3 = off_c +# (i +# 3#) *# n +# j
           in case (# goK_s4 bk 0.0## 0.0## 0.0## 0.0## #) of
                (# (# d0, d1, d2, d3 #) #) ->
-                 case readDoubleArray# mba_c cOff0 s of { (# s0, v0 #) ->
-                 case writeDoubleArray# mba_c cOff0 (v0 +## d0) s0 of { s1 ->
+                 case readDoubleArray# mba_c cOff0 s of { (# s0', v0 #) ->
+                 case writeDoubleArray# mba_c cOff0 (v0 +## d0) s0' of { s1 ->
                  case readDoubleArray# mba_c cOff1 s1 of { (# s2, v1 #) ->
                  case writeDoubleArray# mba_c cOff1 (v1 +## d1) s2 of { s3 ->
                  case readDoubleArray# mba_c cOff2 s3 of { (# s4, v2 #) ->
@@ -988,8 +986,8 @@ rawSyrkLowerKernel (ByteArray ba_a) (I# off_a)
         | isTrue# (j >=# j8End) = s
         | otherwise =
           let !cOff = off_c +# i *# n +# j
-          in case readDoubleArrayAsDoubleX4# mba_c cOff s of { (# s0, c0 #) ->
-             case readDoubleArrayAsDoubleX4# mba_c (cOff +# 4#) s0 of { (# s1, c1 #) ->
+          in case readDoubleArrayAsDoubleX4# mba_c cOff s of { (# s0', c0 #) ->
+             case readDoubleArrayAsDoubleX4# mba_c (cOff +# 4#) s0' of { (# s1, c1 #) ->
              case goK8s1 i j bk kEnd c0 c1 of
                (# r0, r1 #) ->
                  case writeDoubleArrayAsDoubleX4# mba_c cOff r0 s1 of { sw0 ->
@@ -1013,9 +1011,9 @@ rawSyrkLowerKernel (ByteArray ba_a) (I# off_a)
         | isTrue# (j >=# j4End) = s
         | otherwise =
           let !cOff = off_c +# i *# n +# j
-          in case readDoubleArrayAsDoubleX4# mba_c cOff s of { (# s0, c0 #) ->
+          in case readDoubleArrayAsDoubleX4# mba_c cOff s of { (# s0', c0 #) ->
              case goK4s1 i j bk kEnd c0 of { r0 ->
-             case writeDoubleArrayAsDoubleX4# mba_c cOff r0 s0 of { s1 ->
+             case writeDoubleArrayAsDoubleX4# mba_c cOff r0 s0' of { s1 ->
              goJ4s1 i bk kEnd (j +# 4#) j4End s1
              }}}
 
@@ -1051,8 +1049,8 @@ rawSyrkLowerKernel (ByteArray ba_a) (I# off_a)
       mirrorRow i j s
         | isTrue# (j >=# i) = s
         | otherwise =
-          case readDoubleArray# mba_c (off_c +# i *# n +# j) s of { (# s0, cij #) ->
-          case writeDoubleArray# mba_c (off_c +# j *# n +# i) cij s0 of { s1 ->
+          case readDoubleArray# mba_c (off_c +# i *# n +# j) s of { (# s0', cij #) ->
+          case writeDoubleArray# mba_c (off_c +# j *# n +# i) cij s0' of { s1 ->
           mirrorRow i (j +# 1#) s1
           }}
 

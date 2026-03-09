@@ -50,7 +50,6 @@ module Numeric.LinearAlgebra.Massiv.Orthogonal.Givens
   ) where
 
 import qualified Data.Massiv.Array as M
-import Data.Massiv.Array (Ix2(..), Sz(..))
 import GHC.TypeNats (KnownNat)
 
 import Numeric.LinearAlgebra.Massiv.Types

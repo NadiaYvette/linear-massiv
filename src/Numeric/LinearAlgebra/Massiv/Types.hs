@@ -59,7 +59,7 @@ module Numeric.LinearAlgebra.Massiv.Types
   , type KnownDims
   ) where
 
-import Data.Massiv.Array (Array, Ix2(..), Sz(..), Ix1, Comp(..))
+import Data.Massiv.Array (Array, Ix2(..), Ix1)
 import qualified Data.Massiv.Array as M
 import GHC.TypeNats (Nat, KnownNat, natVal, SomeNat(..), someNatVal)
 import Data.Proxy (Proxy(..))

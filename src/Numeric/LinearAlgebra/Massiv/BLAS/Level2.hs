@@ -53,7 +53,7 @@ module Numeric.LinearAlgebra.Massiv.BLAS.Level2
   ) where
 
 import qualified Data.Massiv.Array as M
-import Data.Massiv.Array (Ix2(..), Sz(..), Comp(..), unwrapByteArray, unwrapByteArrayOffset,
+import Data.Massiv.Array (unwrapByteArray, unwrapByteArrayOffset,
                           unwrapMutableByteArray, unwrapMutableByteArrayOffset)
 import GHC.TypeNats (KnownNat)
 
@@ -92,8 +92,7 @@ import Numeric.LinearAlgebra.Massiv.Internal.Kernel (rawGemv)
 gemv :: forall m n r e. (KnownNat m, KnownNat n, M.Manifest r e, Num e)
      => e -> Matrix m n r e -> Vector n r e -> e -> Vector m r e -> Vector m r e
 gemv alpha mat x beta y =
-  let r = dimVal @m
-      c = dimVal @n
+  let c = dimVal @n
   in makeVector @m @r $ \i ->
     let axi = foldl (\acc j -> acc + (mat ! (i, j)) * (x !. j)) 0 [0..c-1]
     in alpha * axi + beta * (y !. i)

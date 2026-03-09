@@ -63,9 +63,9 @@ module Numeric.LinearAlgebra.Massiv.Internal
   , zeroVector
   ) where
 
-import Data.Massiv.Array (Array, Ix2(..), Sz(..), Ix1, Comp(..), D)
+import Data.Massiv.Array (Array, Ix2(..), Ix1, Comp(..), D)
 import qualified Data.Massiv.Array as M
-import GHC.TypeNats (Nat, KnownNat, natVal, SomeNat(..), someNatVal)
+import GHC.TypeNats (KnownNat, natVal, SomeNat(..), someNatVal)
 import Data.Proxy (Proxy(..))
 import Control.Monad.ST (ST)
 
