@@ -1,7 +1,7 @@
 cabal-version: 3.0
 name:          linear-massiv
 category:      Math, Algebra, Numerical
-version:       0.1.0.3
+version:       0.1.0.4
 author:        Nadia Chambers
 maintainer:    Nadia Yvette Chambers <nadia.yvette.chambers@gmail.com>
 synopsis:      Type-safe numerical linear algebra backed by massiv arrays
@@ -17,6 +17,11 @@ description:
   to LAPACK, OpenBLAS, and GVL4.
 license:       BSD-3-Clause
 build-type:    Simple
+tested-with:   GHC == 9.14.1
+
+source-repository head
+  type: git
+  location: https://github.com/NadiaYvette/linear-massiv
 
 library
   hs-source-dirs: src
@@ -44,7 +49,7 @@ library
     Numeric.LinearAlgebra.Massiv.Internal.Kernel
     Numeric.LinearAlgebra.Massiv.Linear
   build-depends:
-    base >= 4.16 && < 5,
+    base >= 4.22 && < 5,
     ghc-prim < 1,
     massiv >= 1.0 && < 2,
     linear >= 1.21 && < 2,
