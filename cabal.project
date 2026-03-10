@@ -2,6 +2,7 @@ packages: .
 
 allow-newer: all:base, all:template-haskell, all:ghc-prim
 
+with-compiler: ghc-9.14
 benchmarks: True
 
 package linear-massiv

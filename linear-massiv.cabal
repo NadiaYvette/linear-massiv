@@ -1,7 +1,7 @@
 cabal-version: 3.0
 name:          linear-massiv
 category:      Math, Algebra, Numerical
-version:       0.1.0.4
+version:       0.1.0.5
 author:        Nadia Chambers
 maintainer:    Nadia Yvette Chambers <nadia.yvette.chambers@gmail.com>
 synopsis:      Type-safe numerical linear algebra backed by massiv arrays
