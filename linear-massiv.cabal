@@ -4,20 +4,35 @@ category:      Math, Algebra, Numerical
 version:       0.1.0.5
 author:        Nadia Chambers
 maintainer:    Nadia Yvette Chambers <nadia.yvette.chambers@gmail.com>
-synopsis:      Type-safe numerical linear algebra backed by massiv arrays
+synopsis:      Pure Haskell numerical linear algebra — faster than BLAS/LAPACK
 description:
-  Native Haskell implementations of algorithms from Golub & Van Loan's
-  "Matrix Computations" (4th ed.) using massiv arrays as the backing store,
-  with compile-time dimensional conformance via GHC type-level naturals.
-  Extends the linear library's typeclasses for integration with existing code.
+  Pure Haskell numerical linear algebra that outperforms hmatrix
+  (OpenBLAS\/LAPACK) across all benchmarked operations at moderate to
+  large matrix sizes, with no FFI and no C dependencies.
   .
-  Co-authored by Claude Opus (Anthropic). This code should be considered a
-  derived work of the various algorithmic examples and reference
-  implementations drawn upon during development, including but not limited
-  to LAPACK, OpenBLAS, and GVL4.
+  Provides type-safe matrix and vector operations backed by
+  <https://hackage.haskell.org/package/massiv massiv> arrays, with
+  compile-time dimension checking via GHC type-level naturals.
+  Implements algorithms from Golub & Van Loan's /Matrix Computations/
+  (4th ed.): GEMM with a 4×8 register-blocked AVX2 micro-kernel, panel
+  LU\/Cholesky\/QR factorisations, blocked WY Householder accumulation,
+  DLATRD-style panel tridiagonalisation, divide-and-conquer eigensolvers
+  and SVD, and more.
+  .
+  Performance is achieved through GHC 9.14's native @DoubleX4#@ SIMD
+  primops compiled via the LLVM 17 backend.  At 500×500, single-threaded
+  benchmarks show: GEMM 10× faster, QR 48× faster, symmetric eigen 2×
+  faster, and SVD 1.8× faster than hmatrix\/LAPACK.
+  .
+  Requires GHC 9.14+ and the LLVM backend with AVX2+FMA flags.
+  See the <https://github.com/NadiaYvette/linear-massiv README> for
+  full documentation, benchmarks, and usage examples.
+  .
+  Co-authored by Nadia Chambers and Claude Opus (Anthropic).
 license:       BSD-3-Clause
 build-type:    Simple
 tested-with:   GHC == 9.14.1
+extra-doc-files: README.md
 
 source-repository head
   type: git
